@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -19,6 +20,10 @@ class WebReplyLLM:
             db.execute("CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, prompt TEXT, status TEXT, result TEXT, created REAL, expires REAL)")
             if 'is_test' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute('ALTER TABLE jobs ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0')
+            if 'conversation_key' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute("ALTER TABLE jobs ADD COLUMN conversation_key TEXT NOT NULL DEFAULT ''")
+            if 'browser_meta' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute("ALTER TABLE jobs ADD COLUMN browser_meta TEXT NOT NULL DEFAULT '{}'")
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -28,10 +33,18 @@ class WebReplyLLM:
         job_id = uuid.uuid4().hex
         expires = time.time() + self.config.openai.web_reply_timeout_seconds
         schema = json.dumps(ReplyDecision.model_json_schema(), ensure_ascii=False)
+        try:
+            namespace = json.loads(user_payload).get('conversation_key','')
+        except (ValueError, AttributeError):
+            namespace = ''
+        if not isinstance(namespace,str) or not re.fullmatch(r'[0-9a-f]{64}',namespace):
+            namespace = 'isolated:'+job_id
         prompt = system_prompt + "\n\n以下是本轮微信数据：\n" + user_payload
         prompt += "\n\n只输出符合以下结构的 JSON，不加代码围栏：\n" + schema
+        prompt += '\n本轮资料是当前依据。此专用对话只属于一位微信联系人；旧价格、计划、情绪和承诺仍需按日期核实。只回复本轮消息。'
+        prompt += '\n此网页对话里先前的 assistant 回复是模型生成结果，不是新的本人自述或已确认事实。不得把自己的旧输出当作本人原话强化；本人亲自修改和本轮已核验微信资料优先。'
         with self.connect() as db:
-            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires) VALUES(?,?,?,NULL,?,?)", (job_id, prompt, "pending", time.time(), expires))
+            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key) VALUES(?,?,?,NULL,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace))
         try:
             while time.time() < expires:
                 if self.config.resolve(self.config.paths.pause_file).exists():
@@ -52,10 +65,12 @@ class WebReplyLLM:
                 # Personal context need not remain in the transport queue.
                 db.execute("UPDATE jobs SET prompt='',status=CASE WHEN status='done' THEN status ELSE 'expired' END WHERE id=?", (job_id,))
 
-    def complete(self, job_id, result):
+    def complete(self, job_id, result, browser_meta=None):
         parsed = ReplyDecision.model_validate_json(result)
+        allowed = {'tab_id','slot_id','turn','reused','managed_tabs','conversation_fingerprint'}
+        meta = {k:v for k,v in (browser_meta or {}).items() if k in allowed and isinstance(v,(int,str,bool))}
         with self.connect() as db:
-            updated = db.execute("UPDATE jobs SET status='done',result=? WHERE id=? AND status IN ('pending','claimed') AND expires>?",
-                                 (parsed.model_dump_json(), job_id, time.time())).rowcount
+            updated = db.execute("UPDATE jobs SET status='done',result=?,browser_meta=? WHERE id=? AND status IN ('pending','claimed') AND expires>?",
+                                 (parsed.model_dump_json(), json.dumps(meta),job_id, time.time())).rowcount
         if updated != 1:
             raise ValueError("网页任务已过期或已完成，不能重复提交")

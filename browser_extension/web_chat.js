@@ -1,5 +1,7 @@
-document.documentElement.dataset.wechatBridgeVersion='3';
-window.wechatWebReplyInner=async function(prompt){
+document.documentElement.dataset.wechatBridgeVersion='4';
+window.wechatWebReplyInner=async function(prompt,key,reused=false){
+ const {bridgeWorkerVersion}=await chrome.storage.local.get('bridgeWorkerVersion');
+ if(bridgeWorkerVersion!==4)throw Error('update_extension_before_input');
  const stage=s=>document.documentElement.dataset.wechatBridgeStage=s;
  stage('personalization');
  const deadline=Date.now()+140000;
@@ -14,11 +16,23 @@ window.wechatWebReplyInner=async function(prompt){
  const wait=async(fn)=>{while(Date.now()<deadline){const v=fn();if(v)return v;await sleep();}throw Error('ui timeout');};
  // Never type before these isolation checks have passed.
  if(!location.search.includes('temporary-chat=true'))throw Error('not temporary');
- let personalized=await wait(()=>find('button','个性化')||find('button','不个性化'));
- if((personalized.textContent||'').trim()==='个性化'){
-  click(personalized);click(await wait(()=>find('[role="menuitemradio"]','不个性化 此聊天不会使用记忆、插件和自定义指令')));
+ const root=document.documentElement;
+ const assistants=()=>Array.from(document.querySelectorAll('[data-message-author-role="assistant"],[data-content-search-unit-key$=":assistant"]')).filter(visible);
+ const identity=e=>e.getAttribute('data-chatgpt-search-message-ids')||e.getAttribute('data-message-id')||e.getAttribute('data-content-search-unit-key');
+ if(reused){
+  if(!root.dataset.wechatBridgeOwner||!root.dataset.wechatBridgeIsolation)throw Error('context_marker_lost_before_input');
+  if(root.dataset.wechatBridgeOwner!==key||root.dataset.wechatBridgeIsolation!=='unpersonalized')throw Error('ownership_lost_before_input');
+  const last=assistants().at(-1);
+  if(!last||identity(last)!==root.dataset.wechatBridgeLastReply)throw Error('outside_turn_before_input');
+ }else{
+  if(assistants().length)throw Error('unexpected_existing_chat');
+  let personalized=await wait(()=>find('button','个性化')||find('button','不个性化'));
+  if((personalized.textContent||'').trim()==='个性化'){
+   click(personalized);click(await wait(()=>find('[role="menuitemradio"]','不个性化 此聊天不会使用记忆、插件和自定义指令')));
+  }
+  await wait(()=>find('button','不个性化'));
+  root.dataset.wechatBridgeOwner=key;root.dataset.wechatBridgeIsolation='unpersonalized';
  }
- await wait(()=>find('button','不个性化'));
  stage('model-menu');
  const work=Array.from(document.querySelectorAll('[role="radio"],input[type="radio"]')).filter(visible).find(e=>(e.getAttribute('aria-label')||e.textContent||'').trim()==='Work');
  if(work&& (work.getAttribute('aria-checked')==='true'||work.checked))throw Error('work mode');
@@ -34,19 +48,25 @@ window.wechatWebReplyInner=async function(prompt){
  click(await wait(()=>find('button','选择 ChatGPT 模型')));
  stage('composer');
  const composer=await wait(()=>Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"][aria-label="询问 ChatGPT"]')).find(visible));
+ if(composer.textContent.trim()||find('button','停止'))throw Error('user_editing_before_input');
+ const previousReplies=new Set(assistants().map(identity));
  composer.focus();document.execCommand('insertText',false,prompt);
  const normalized=s=>s.replace(/[\s\u200B]+/g,'');
  if(normalized(composer.textContent)!==normalized(prompt))throw Error('prompt not inserted');
  click(await wait(()=>{const e=find('button','发送');return e&&!e.disabled?e:null;}));
  stage('response');
- // Only new assistant DOM in this freshly created tab; no historic conversation read.
- const response=await wait(()=>{if(find('button','停止'))return null;const a=Array.from(document.querySelectorAll('[data-message-author-role="assistant"],[data-content-search-unit-key$=":assistant"]')).filter(visible);if(!a.length)return null;const e=a[a.length-1];return e.querySelector(':scope > div')?.innerText||e.innerText;});
+ // Never return the previous turn's answer, including identical wording.
+ const node=await wait(()=>{if(find('button','停止'))return null;const e=assistants().at(-1);const id=e&&identity(e);return id&&!previousReplies.has(id)&&(e.innerText||'').trim()?e:null;});
+ const response=node.querySelector(':scope > div')?.innerText||node.innerText;
  const cleaned=response.trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'');JSON.parse(cleaned);return cleaned;
 };
-window.wechatWebReply=async function(prompt){
- try{return await window.wechatWebReplyInner(prompt);}catch(e){
+window.wechatWebReply=async function(prompt,key,reused){
+ try{const result=await window.wechatWebReplyInner(prompt,key,reused);
+  const nodes=Array.from(document.querySelectorAll('[data-message-author-role="assistant"],[data-content-search-unit-key$=":assistant"]'));const e=nodes.at(-1);
+  document.documentElement.dataset.wechatBridgeLastReply=e&&(e.getAttribute('data-chatgpt-search-message-ids')||e.getAttribute('data-message-id')||e.getAttribute('data-content-search-unit-key'));
+  return result;
+ }catch(e){
   console.error('WeChatWebBridge: '+e.message);
-  await new Promise(r=>setTimeout(r,45000));
   throw e;
  }
 };

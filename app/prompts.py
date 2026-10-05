@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -85,6 +86,7 @@ class PromptBuilder:
                             and assess_risk(e.get('preferred_reply','')).level != RiskLevel.critical
                             and not re.search(r'https?://|\d{7,}', e.get('incoming','')+e.get('preferred_reply',''))]
         payload = {
+            'conversation_key': hashlib.sha256(message.contact.encode('utf-8')).hexdigest(),
             "contact_profile": contact.model_dump(),
             "incoming": {
                 "sender": message.sender,

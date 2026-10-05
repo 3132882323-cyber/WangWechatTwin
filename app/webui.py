@@ -124,13 +124,15 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         @app.get('/browser-bridge/next')
         async def browser_next(request: Request):
             bridge_auth(request)
+            if request.headers.get('x-wechat-bridge-version') == '4':
+                db.set_state('browser_bridge', {'version':4,'seen_at':time.time(),'max_owned_tabs':3})
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                row = conn.execute("SELECT id,prompt FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY created LIMIT 1", (time.time(), int(paused))).fetchone()
+                row = conn.execute("SELECT id,prompt,conversation_key FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY created LIMIT 1", (time.time(), int(paused))).fetchone()
                 if row:
                     conn.execute("UPDATE jobs SET status='claimed' WHERE id=?", (row[0],))
-            return {'job': {'id': row[0], 'prompt': row[1]} if row else None}
+            return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0]} if row else None}
 
         @app.post('/browser-bridge/result')
         async def browser_result(request: Request):
@@ -147,7 +149,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 db.add_event('llm_error', '网页连接失败，已暂停，未切回 Codex')
                 return {'ok': True}
             try:
-                queue.complete(body['id'], body['result'])
+                queue.complete(body['id'], body['result'],body.get('browser_meta'))
             except (ValueError, KeyError):
                 raise HTTPException(409, '任务或结果无效')
             return {'ok': True}

@@ -1,23 +1,56 @@
-// Ordinary visible Chat UI only. No session tokens, private API or existing chats.
-let busy=false;
+// Fixed owned tab pool. Same contact keeps its temporary chat; no prior user tabs.
+importScripts('pool_core.js');
 const base='http://127.0.0.1:18769/browser-bridge';
+const rootUrl='https://chatgpt.com/?temporary-chat=true';
+let busy=false;
+chrome.storage.local.set({bridgeWorkerVersion:4});
+chrome.alarms.create('poll',{periodInMinutes:.5});
 chrome.runtime.onInstalled.addListener(()=>chrome.alarms.create('poll',{periodInMinutes:.5}));
 chrome.action.onClicked.addListener(()=>chrome.runtime.openOptionsPage());
+async function store(slots){await chrome.storage.session.set({bridgePool:slots});}
+async function acquire(key){
+ const {bridgePool=[]}=await chrome.storage.session.get('bridgePool');
+ const slots=[];
+ for(const s of bridgePool){try{const t=await chrome.tabs.get(s.tabId);if(t.url===s.url&&WechatPool.validUrl(t.url))slots.push(s);}catch{}}
+ const choice=WechatPool.choose(slots,key,Date.now());let s=choice.slot;
+ if(!s){const t=await chrome.tabs.create({url:rootUrl,active:false});s={tabId:t.id,slotId:[0,1,2].find(i=>!slots.some(x=>x.slotId===i)),turns:0};slots.push(s);}
+ else if(choice.reset)await chrome.tabs.update(s.tabId,{url:rootUrl});
+ if(choice.reset){s.turns=0;s.failed=false;s.url=rootUrl;}
+ s.key=key;s.used=Date.now();await store(slots);
+ return {slots,slot:s,reused:choice.reused};
+}
+async function loadTab(id){
+ const deadline=Date.now()+30000;
+ while(Date.now()<deadline){const t=await chrome.tabs.get(id);if(t.status==='complete')return;await new Promise(r=>setTimeout(r,500));}
+ throw Error('load');
+}
 chrome.alarms.onAlarm.addListener(async()=>{
  if(busy)return;
  const {token}=await chrome.storage.local.get('token');if(!token)return;
- busy=true;let job=null,createdTab=null,stage='queue';
- const headers={Authorization:'Bearer '+token,'Content-Type':'application/json'};
+ const {bridgeLease}=await chrome.storage.session.get('bridgeLease');if(bridgeLease?.until>Date.now())return;
+ await chrome.storage.local.set({bridgeWorkerVersion:4});
+ busy=true;let job=null,pool=null,stage='queue';
+ const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4'};
  try{
   const r=await fetch(base+'/next',{headers});if(!r.ok)throw Error('bridge');
   job=(await r.json()).job;if(!job)return;
-  stage='load';createdTab=await chrome.tabs.create({url:'https://chatgpt.com/?temporary-chat=true',active:false});
-  await new Promise((resolve,reject)=>{let n=0;const timer=setInterval(async()=>{try{const t=await chrome.tabs.get(createdTab.id);if(t.status==='complete'){clearInterval(timer);resolve();}else if(++n>60){clearInterval(timer);reject(Error('load'));}}catch(e){clearInterval(timer);reject(e);}},500);});
-  stage='setup';const results=await chrome.scripting.executeScript({target:{tabId:createdTab.id},files:['web_chat.js']});
+  await chrome.storage.session.set({bridgeLease:{id:job.id,until:Date.now()+240000}});
+  pool=await acquire(job.conversation_key||'isolated:'+job.id);stage='load';await loadTab(pool.slot.tabId);
+  stage='setup';await chrome.scripting.executeScript({target:{tabId:pool.slot.tabId},files:['web_chat.js']});
   stage='reply';
-  const reply=await chrome.scripting.executeScript({target:{tabId:createdTab.id},func:async(prompt)=>await window.wechatWebReply(prompt),args:[job.prompt]});
+  const reply=await chrome.scripting.executeScript({target:{tabId:pool.slot.tabId},func:async(prompt,key,reused)=>await window.wechatWebReply(prompt,key,reused),args:[job.prompt,pool.slot.key,pool.reused]});
   const result=reply[0]?.result;if(!result)throw Error('empty');
-  stage='complete';const sent=await fetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,result})});if(!sent.ok)throw Error('result rejected');
- }catch(e){if(job){try{await fetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,error:stage})});}catch{}}}
- finally{if(createdTab)try{await chrome.tabs.remove(createdTab.id);}catch{}busy=false;}
+  const tab=await chrome.tabs.get(pool.slot.tabId);if(!WechatPool.validUrl(tab.url))throw Error('ownership');
+  pool.slot.turns+=1;pool.slot.url=tab.url;pool.slot.used=Date.now();pool.slot.failed=false;await store(pool.slots);
+  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(tab.url));
+  const fingerprint=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');
+  const browser_meta={tab_id:tab.id,slot_id:pool.slot.slotId,turn:pool.slot.turns,reused:pool.reused,managed_tabs:pool.slots.length,conversation_fingerprint:fingerprint};
+  stage='complete';const sent=await fetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,result,browser_meta})});if(!sent.ok)throw Error('result rejected');
+ }catch(e){
+  if(pool){try{const t=await chrome.tabs.get(pool.slot.tabId);if(/outside_turn|user_editing|ownership_lost/.test(String(e.message))){pool.slots=pool.slots.filter(s=>s.tabId!==pool.slot.tabId);}else{pool.slot.url=t.url;pool.slot.failed=true;}await store(pool.slots);}catch{}}
+  if(job)try{await fetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,error:stage})});}catch{}
+ }finally{
+  if(job)await chrome.storage.session.remove('bridgeLease');busy=false;
+  // Keep owned tabs and their current conversations. Never close/create per reply.
+ }
 });
