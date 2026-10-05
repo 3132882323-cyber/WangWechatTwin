@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,11 @@ class PromptBuilder:
 10. 先判断对方真正想解决什么、双方关系、本人已确认的立场，再选择本人会怎样回应。回复要推进当前事情，不能只模仿几个口头禅。
 11. 对当前联系人的本人原话优先参考：称呼、句长、断句、常用字和标点都随关系与情境变化；不要固定套用“您好、亲、感谢理解”。信息不足时只问必要的问题。
 12. 语音转写是待核对的数据；遇到不完整句子、含糊数字、人名、金额或日期，不凭听写猜测承诺，转为审核或询问。
+13. 扮演本人意味着保持本人对当前联系人的表达和已确认立场，不意味着编造性格、职业、关系、行程或情绪。观察到短句不等于冷漠，拒绝过一件事不等于总拒绝。
+14. 本人改过的回复优先于历史样例；没有证据的“老板式、客户式、亲密式”语气不强加。简单场景不为凑足句数增加“收到、我看一下”等尾巴。
+15. 不替本人编造“想多认识人、只是忙、想让大家开心”等心理动机。原因有历史明确依据才引用；没有依据就简短核实，不擅自把立场包装得更体面。
+16. 情绪、玩笑和亲疏语气参考本人在当前会话里的近期明确表达。旧的发火、亲密或自嘲不等于今天仍如此；情境标签只是检索辅助，理解原文优先。
+17. 对方谈到本人的喜好、感受、意愿或个人选择时，先找本人近期的明确自述。没有依据，不用“一般人会怎样”代替本人，也不顺着建议擅自说我去、我答应、我愿意；必要时生成待审核草稿并列出需要本人确认的立场。
 
 以下是本人风格：
 {self.persona}
@@ -72,6 +78,12 @@ class PromptBuilder:
         memories: list[str],
         learned_examples: list[dict[str, str]] | None = None,
     ) -> str:
+        from app.risk import assess_risk
+        from app.models import RiskLevel
+        learned_examples = [e for e in (learned_examples or [])
+                            if assess_risk(e.get('incoming','')).level != RiskLevel.critical
+                            and assess_risk(e.get('preferred_reply','')).level != RiskLevel.critical
+                            and not re.search(r'https?://|\d{7,}', e.get('incoming','')+e.get('preferred_reply',''))]
         payload = {
             "contact_profile": contact.model_dump(),
             "incoming": {
@@ -79,12 +91,13 @@ class PromptBuilder:
                 "content": message.content,
                 "message_type": message.message_type,
                 "chat_type": message.chat_type,
+                "received_at": message.received_at.isoformat(),
             },
             "deterministic_risk": deterministic_risk.model_dump(mode="json"),
             "recent_messages": recent_messages,
             "contact_memories": memories,
             "style_examples": self.samples + (learned_examples or []),
-            "style_example_rule": "样例只用于模仿表达方式，里面的价格、日期、项目状态等不得当作当前事实",
+            "style_example_rule": "初始配置样例仅是人工模板，不证明本人曾这样说。历史原话用于模仿表达方式，价格、日期、项目状态等不得当作当前事实",
             "output_guidance": {
                 "send": "信息明确、低风险、可以直接以本人身份回复",
                 "hold": "先发送安全占位回复，同时把正式草稿留给本人确认",
@@ -97,6 +110,9 @@ class PromptBuilder:
         if own_examples:
             payload["style_examples"] = own_examples + (learned_examples or [])
             payload["style_example_rule"] += "；当前联系人的本人原话样例优先，不机械套用通用客服表达"
+        from app.role_profile import load
+        payload['owner_role_profile'] = load(self.config.resolve(self.config.paths.role_profile), message.contact, message.content)
+        payload['owner_feedback_priority'] = '本人审核修改 > 当前明确立场及事实 > 当前联系人相似情境原话 > 当前联系人习惯 > 全局表达统计。不能拿样例内容替代事实判断。'
         if message.display_name:
             payload["contact_profile"]["name"] = message.display_name
         try:

@@ -62,3 +62,15 @@ def test_sensitive_approval_is_not_learned(tmp_path: Path):
     )
     assert db.update_draft(did, "approved", "我核对后回复。")
     assert db.style_feedback("张三") == []
+
+
+def test_saved_personal_edit_learns_without_authorizing_send(tmp_path):
+    db=Database(tmp_path/'saved.sqlite3')
+    mid=db.add_incoming(IncomingMessage(external_id='saved1',contact='one',sender='one',content='在吗'))
+    did=db.create_draft('one',mid,ReplyDecision(action='review',risk=RiskLevel.low,reply='您好，在的。'))
+    db.update_draft(did,'pending','咋了')
+    assert db.approved_drafts()==[]
+    feedback=db.style_feedback('one')
+    assert feedback[0]['preferred_reply']=='咋了'
+    assert feedback[0]['scenario']=='本人亲自修改的回复'
+    assert db.style_feedback('two')==[]

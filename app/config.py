@@ -49,6 +49,7 @@ class WebSettings(BaseModel):
 
 
 class PathSettings(BaseModel):
+    role_profile: str = '.runtime/history_reader/role_profile.json'
     chat_memory: str = ".runtime/history_reader/chat_memory.sqlite3"
     browser_bridge: str = ".runtime/browser_bridge"
     style_history: str = ".runtime/history_reader/style_samples.sqlite3"

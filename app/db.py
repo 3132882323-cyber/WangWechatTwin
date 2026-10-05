@@ -258,7 +258,7 @@ class Database:
                     "UPDATE drafts SET status=?, edited_reply=?, updated_at=? WHERE id=?",
                     (status, edited_reply, now, draft_id),
                 )
-            if cur.rowcount == 1 and status == "approved":
+            if cur.rowcount == 1 and (status == "approved" or (status == 'pending' and edited_reply is not None)):
                 row = conn.execute(
                     """
                     SELECT d.contact, d.reply, d.risk,
@@ -274,6 +274,7 @@ class Database:
                     row
                     and row["risk"] != "critical"
                     and str(row["final_reply"]).strip()
+                    and (status == 'approved' or str(row['final_reply']).strip() != str(row['reply']).strip())
                 ):
                     conn.execute(
                         """
@@ -296,13 +297,13 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT incoming, final_reply FROM style_feedback
-                WHERE contact=? ORDER BY id DESC LIMIT ?
+                SELECT incoming, final_reply, draft_reply FROM style_feedback
+                WHERE contact=? ORDER BY CASE WHEN final_reply!=draft_reply THEN 0 ELSE 1 END, id DESC LIMIT ?
                 """,
                 (contact, limit),
             ).fetchall()
         return [
-            {"scenario": "本人审核后的真实回复", "incoming": str(row["incoming"]),
+            {"scenario": "本人亲自修改的回复" if row['final_reply']!=row['draft_reply'] else '本人批准的模型草稿，不等同本人原话', "incoming": str(row["incoming"]),
              "preferred_reply": str(row["final_reply"])}
             for row in reversed(rows)
         ]
