@@ -1,0 +1,20 @@
+WangWechatTwin
+Copyright 2026 WangWechatTwin contributors
+
+This project's original code is licensed under Apache-2.0.
+
+Included derived code:
+- scripts/wcdb_readonly.py and app/adapters/history_crypto.py:
+  TANGandXUE/wcdb-key-tool, MIT License.
+  Copyright (c) 2025 CloudDreamAI / TANGandXUE.
+  See app/adapters/WCDB_READER_LICENSE.txt.
+  Changes: restricted read-only acquisition path, explicit x64 API declarations,
+  removal of debugger, login capture and user-home credential storage.
+- app/adapters/accessibility_bridge.py:
+  fanyuantaier/wechatauto-replica, Apache-2.0, commit
+  91dc0e1a601013b759b261061d8f7642f736af90.
+  See app/adapters/ACCESSIBILITY_LICENSE.txt.
+  Changes: retained module/PE and accessibility compatibility helpers only.
+
+WeChat, OpenAI services and optional external automation SDKs are separate
+products. Their binaries, credentials and proprietary source are not included.

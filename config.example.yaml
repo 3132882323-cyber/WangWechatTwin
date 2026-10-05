@@ -1,0 +1,38 @@
+owner_name: 用户
+owner_alias: 我
+adapter: mock
+mode: shadow
+openai:
+  primary_model: gpt-6-luna
+  high_risk_model: gpt-6.1-sol
+  timeout_seconds: 30
+  max_output_tokens: 600
+wechat:
+  poll_seconds: 2.0
+  allow_groups: false
+  allow_unknown_contacts: false
+  unknown_contact_mode: shadow
+  exact_contact_match: true
+  filter_mute: false
+  max_auto_sends_per_hour: 30
+  max_reply_chars: 220
+  send_holding_on_review: false
+  sender_all_existing_chats: false
+  sender_allowed_contacts: []
+  group_only_mentions: true
+  ignore_simple_acknowledgments: true
+memory:
+  recent_messages: 24
+  max_contact_memories: 30
+  retain_message_days: 30
+web:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+paths:
+  database: .runtime/wang_wechat_twin.sqlite3
+  persona: data/persona.md
+  business_rules: data/business_rules.md
+  reply_samples: data/reply_samples.csv
+  pause_file: .runtime/PAUSE
+contacts: []
