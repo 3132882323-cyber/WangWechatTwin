@@ -47,6 +47,10 @@ class PromptBuilder:
 6. 不提供验证码、密码、银行卡、身份证等敏感信息。
 7. 如果对方直接问是不是 AI，如实说明这是本人设置的智能助理，重要事情本人会确认。
 8. memory_updates 只记录长期有用、相对稳定的事实，例如对方身份、项目、偏好、已确认决定；不得记录验证码、账户、身份证等敏感信息。
+9. 本任务的个人记忆只来自本轮提供的微信数据。不得引用其他网页会话、ChatGPT 保存记忆或未提供的个人背景。
+10. 先判断对方真正想解决什么、双方关系、本人已确认的立场，再选择本人会怎样回应。回复要推进当前事情，不能只模仿几个口头禅。
+11. 对当前联系人的本人原话优先参考：称呼、句长、断句、常用字和标点都随关系与情境变化；不要固定套用“您好、亲、感谢理解”。信息不足时只问必要的问题。
+12. 语音转写是待核对的数据；遇到不完整句子、含糊数字、人名、金额或日期，不凭听写猜测承诺，转为审核或询问。
 
 以下是本人风格：
 {self.persona}
@@ -95,4 +99,15 @@ class PromptBuilder:
             payload["style_example_rule"] += "；当前联系人的本人原话样例优先，不机械套用通用客服表达"
         if message.display_name:
             payload["contact_profile"]["name"] = message.display_name
+        try:
+            origin = json.loads(message.raw_summary or '{}')
+            if origin.get('original_type') == 'voice':
+                payload['incoming']['original_type'] = 'voice'
+                payload['incoming']['transcription_source'] = 'wechat_builtin'
+                payload['incoming']['transcription_rule'] = '这是微信自动听写；含糊词、数字、人名、日期须核实，不猜测。'
+        except ValueError:
+            pass
+        from app.chat_memory import retrieve
+        payload["historical_conversation_memory"] = retrieve(self.config.resolve(self.config.paths.chat_memory), message.contact, message.content)
+        payload["historical_memory_rule"] = "这些记录只属于当前联系人，带有历史日期。过去的价格、承诺、进度和安排不代表现在仍有效；有冲突或缺少当前依据时转审核。"
         return json.dumps(payload, ensure_ascii=False, indent=2)

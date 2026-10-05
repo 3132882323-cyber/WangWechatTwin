@@ -142,6 +142,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
 
     def _read(self, initial=False):
         result = []
+        memory_rows = []
         for name, info in self.files.items():
             source = Path(info["source"])
             current = signature(source)
@@ -195,6 +196,13 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                         for local_id, server_id, typ, sender, ts, content, compression, source_text, source_compression in rows:
                             if new_table and ts < self.started_at:
                                 continue
+                            if (typ & 0xffffffff) == 1:
+                                memory_text = content
+                                if isinstance(memory_text, bytes):
+                                    memory_text = (zstandard.ZstdDecompressor().decompress(memory_text, max_output_size=8*1024*1024) if compression else memory_text).decode('utf-8')
+                                if isinstance(memory_text, str) and memory_text.strip():
+                                    identity = hashlib.sha256(f'{account}|{contact}|{server_id or name+str(local_id)}'.encode()).hexdigest()
+                                    memory_rows.append((identity, contact, 'out' if sender == own_id else 'in', ts, memory_text))
                             if sender == own_id or local_id <= last_own_id or (typ & 0xffffffff) in {10000, 10002}:
                                 continue
                             if isinstance(content, bytes):
@@ -235,6 +243,8 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                     self.signatures[name] = observed
                 finally:
                     conn.close()
+        from app.chat_memory import remember
+        remember(self.config.resolve(self.config.paths.chat_memory), memory_rows)
         return result
 
     def poll(self):

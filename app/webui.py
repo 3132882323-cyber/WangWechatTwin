@@ -5,6 +5,7 @@ import json
 import secrets
 from datetime import datetime, timezone, timedelta
 import threading
+import time
 from urllib.parse import parse_qs
 
 import uvicorn
@@ -26,7 +27,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
     rows = []
     draft_only = config.mode in {"shadow", "off"}
     for draft in drafts:
-        allowed = (not draft_only and (config.adapter != "history_verified_sender"
+        allowed = (not draft.contact.startswith('__web_self_test__') and not draft_only and (config.adapter != "history_verified_sender"
                    or config.wechat.sender_all_existing_chats or draft.contact in config.wechat.sender_allowed_contacts))
         approve_action = "approve" if allowed else "save"
         approve_label = "批准发送并学习我的修改" if allowed else "保存我的修改"
@@ -35,7 +36,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
         rows.append(
             f"""
             <section class="card">
-              <div class="meta">#{draft.id} · {html.escape(labels.get(draft.contact, draft.contact))} · 风险 {html.escape(draft.risk)} · 置信度 {draft.confidence:.2f}</div>
+              <div class="meta">#{draft.id} · {html.escape('网页连接自检（测试草稿，不发送）' if draft.contact.startswith('__web_self_test__') else labels.get(draft.contact, draft.contact))} · 风险 {html.escape(draft.risk)} · 置信度 {draft.confidence:.2f}</div>
               <div class="incoming"><strong>对方：</strong>{incoming}</div>
               <div class="reason"><strong>系统判断：</strong>{html.escape(draft.reason)}</div>
               <form method="post" action="/draft/{draft.id}/{approve_action}">
@@ -87,6 +88,7 @@ small{{color:#9ca3af}}
 <header><div><strong>王总微信数字分身</strong><br><small>{'当前只生成草稿，不会发送微信消息' if draft_only else '已接管已有聊天：日常文字自动回复，重要事项待审核；群聊只处理@你的消息' if config.wechat.sender_all_existing_chats else '仅接管已确认的测试联系人，其他联系人只生成草稿' if config.adapter == 'history_verified_sender' else '已开启发送功能'}</small></div>
 <div><span class="badge">{'已暂停' if paused else '运行中'}</span></div></header>
 <main>
+<div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
 <form method="post" action="/{'resume' if paused else 'pause'}"><input type="hidden" name="_csrf" value="{csrf_token}"><button class="pause">{'恢复处理' if paused else '立即暂停'}</button></form>
 <h2>待审核草稿（{len(drafts)}）</h2>
 {''.join(rows) if rows else '<div class="card">当前没有待审核草稿。</div>'}
@@ -106,6 +108,49 @@ setInterval(function(){{
 def create_app(config: AppConfig, db: Database) -> FastAPI:
     app = FastAPI(title="王总微信数字分身")
     app.state.csrf_token = secrets.token_urlsafe(32)
+    if config.openai.provider == 'web':
+        from app.web_llm import WebReplyLLM
+        queue = WebReplyLLM(config)
+        token_path = config.resolve(config.paths.browser_bridge) / 'pairing_token.txt'
+        if not token_path.exists():
+            token_path.write_text(secrets.token_urlsafe(48), encoding='utf-8')
+        bridge_token = token_path.read_text(encoding='utf-8').strip()
+
+        def bridge_auth(request):
+            supplied = request.headers.get('authorization', '')
+            if not secrets.compare_digest(supplied, 'Bearer ' + bridge_token):
+                raise HTTPException(403, '网页连接未配对')
+
+        @app.get('/browser-bridge/next')
+        async def browser_next(request: Request):
+            bridge_auth(request)
+            paused = config.resolve(config.paths.pause_file).exists()
+            with queue.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                row = conn.execute("SELECT id,prompt FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY created LIMIT 1", (time.time(), int(paused))).fetchone()
+                if row:
+                    conn.execute("UPDATE jobs SET status='claimed' WHERE id=?", (row[0],))
+            return {'job': {'id': row[0], 'prompt': row[1]} if row else None}
+
+        @app.post('/browser-bridge/result')
+        async def browser_result(request: Request):
+            bridge_auth(request)
+            body = await request.json()
+            with queue.connect() as conn:
+                test_row = conn.execute('SELECT is_test FROM jobs WHERE id=?', (body.get('id',''),)).fetchone()
+            if config.resolve(config.paths.pause_file).exists() and not (test_row and test_row[0]):
+                raise HTTPException(409, '已暂停')
+            if body.get('error'):
+                with queue.connect() as conn:
+                    conn.execute("UPDATE jobs SET status='failed',prompt='' WHERE id=? AND status='claimed'", (body['id'],))
+                config.resolve(config.paths.pause_file).touch()
+                db.add_event('llm_error', '网页连接失败，已暂停，未切回 Codex')
+                return {'ok': True}
+            try:
+                queue.complete(body['id'], body['result'])
+            except (ValueError, KeyError):
+                raise HTTPException(409, '任务或结果无效')
+            return {'ok': True}
 
     async def owner_action(request: Request) -> None:
         body = (await request.body()).decode("utf-8", errors="replace")
@@ -144,6 +189,8 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             draft = next((d for d in db.list_drafts(status="pending", limit=1000) if d.id == draft_id), None)
             if draft is None or (not config.wechat.sender_all_existing_chats and draft.contact not in config.wechat.sender_allowed_contacts):
                 raise HTTPException(status_code=403, detail="该联系人未授权发送")
+            if draft.contact.startswith('__web_self_test__'):
+                raise HTTPException(status_code=403, detail='本机网页自检草稿不能发送')
         raw = (await request.body()).decode("utf-8", errors="replace")
         reply = parse_qs(raw).get("reply", [""])[0].strip()
         if reply:

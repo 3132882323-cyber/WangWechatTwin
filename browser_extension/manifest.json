@@ -1,0 +1,1 @@
+{"manifest_version":3,"name":"微信分身专用网页连接","version":"0.1.0","permissions":["alarms","storage","scripting"],"host_permissions":["https://chatgpt.com/*","http://127.0.0.1:18769/*"],"background":{"service_worker":"background.js"},"options_page":"options.html","action":{"default_title":"配置微信网页连接"}}

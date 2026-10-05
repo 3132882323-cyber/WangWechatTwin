@@ -12,7 +12,8 @@ from app.models import ContactProfile
 
 
 class OpenAISettings(BaseModel):
-    provider: Literal["auto", "api", "account"] = "auto"
+    provider: Literal["auto", "api", "account", "web"] = "auto"
+    web_reply_timeout_seconds: float = 180
     primary_model: str = "gpt-6-luna"
     high_risk_model: str = "gpt-6.1-sol"
     timeout_seconds: float = 30.0
@@ -48,6 +49,8 @@ class WebSettings(BaseModel):
 
 
 class PathSettings(BaseModel):
+    chat_memory: str = ".runtime/history_reader/chat_memory.sqlite3"
+    browser_bridge: str = ".runtime/browser_bridge"
     style_history: str = ".runtime/history_reader/style_samples.sqlite3"
     history_reader: str = ".runtime/history_reader"
     learned_style: str = "data/learned_style_summary.json"
@@ -59,8 +62,8 @@ class PathSettings(BaseModel):
 
 
 class AppConfig(BaseModel):
-    owner_name: str = "用户"
-    owner_alias: str = "王总"
+    owner_name: str = "使用者"
+    owner_alias: str = "本人"
     adapter: Literal["wxauto", "mock", "history_readonly", "history_verified_sender"] = "wxauto"
     mode: Literal["shadow", "low_risk_auto", "full_auto", "off"] = "shadow"
     openai: OpenAISettings = Field(default_factory=OpenAISettings)

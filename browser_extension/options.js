@@ -1,0 +1,2 @@
+if(window.WECHAT_LOCAL_PAIRING_TOKEN){chrome.storage.local.set({token:window.WECHAT_LOCAL_PAIRING_TOKEN}).then(()=>document.querySelector('#status').textContent='本机配对已自动完成。正在验证网页草稿，微信发送仍暂停。');}
+document.querySelector('#save').onclick=async()=>{await chrome.storage.local.set({token:document.querySelector('#token').value.trim()});document.querySelector('#status').textContent='配对已保存。需在本机审核台恢复后才会处理消息。';};

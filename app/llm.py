@@ -12,6 +12,11 @@ class LLMError(RuntimeError):
 class ReplyLLM:
     def __init__(self, config: AppConfig):
         self.config = config
+        self.account = None
+        if config.openai.provider == "web":
+            from app.web_llm import WebReplyLLM
+            self.account = WebReplyLLM(config)
+            return
         api_key, base_url = openai_credentials()
         self.account = None
         if config.openai.provider == "account" or (config.openai.provider == "auto" and not api_key):

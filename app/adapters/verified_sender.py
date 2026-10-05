@@ -1,5 +1,6 @@
 """A local read bridge with explicit recipient gating and verified GUI sending."""
 from __future__ import annotations
+from contextlib import closing
 
 import ctypes
 import hashlib
@@ -122,7 +123,86 @@ class HistoryVerifiedSender(MessageAdapter):
             self.context[message.contact] = message.external_id
             if message.raw_summary:
                 self.context_origin[message.contact] = json.loads(message.raw_summary)
+            if message.message_type == 'voice':
+                try:
+                    self._transcribe_voice(message)
+                except Exception as exc:
+                    message.content = '对方发来语音，自动转写未完成，需本人查看。'
+                    origin = json.loads(message.raw_summary)
+                    origin['voice_error'] = type(exc).__name__
+                    message.raw_summary = json.dumps(origin)
         return messages
+
+    def _transcribe_voice(self, message):
+        from app.voice import align_voice
+        if message.chat_type != 'friend' or self.config.resolve(self.config.paths.pause_file).exists():
+            raise ValueError('当前不允许语音转写')
+        name = self.reader.names.get(message.contact)
+        if not name or list(self.reader.names.values()).count(name) != 1:
+            raise ValueError('语音联系人不唯一')
+        origin = json.loads(message.raw_summary)
+        info = self.reader.files[origin['source']]
+        table = 'Msg_' + hashlib.md5(message.contact.encode()).hexdigest()
+        with tempfile.TemporaryDirectory(dir=self.reader.root) as tmp:
+            snapshot, _ = authenticated_snapshot(info, Path(tmp))
+            with closing(sqlite3.connect(snapshot.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+                rows = db.execute(f'SELECT local_id,local_type,message_content,WCDB_CT_message_content,real_sender_id FROM "{table}" ORDER BY local_id DESC LIMIT 12').fetchall()[::-1]
+                own = db.execute('SELECT rowid FROM Name2Id WHERE user_name=?', (self.reader.self_username,)).fetchone()
+        expected, target_index = [], None
+        for local_id, typ, content, compression, sender_id in rows:
+            kind = {1:'text',34:'voice'}.get(typ & 0xffffffff)
+            if kind is None:
+                raise ValueError('语音上下文包含暂不能核验的消息')
+            if kind == 'text' and isinstance(content, bytes):
+                content = (zstandard.ZstdDecompressor().decompress(content, max_output_size=8*1024*1024) if compression else content).decode('utf-8')
+            if local_id == origin['local_id']:
+                target_index = len(expected)
+                origin['transcription_direction'] = 'out' if own and sender_id == own[0] else 'in'
+            expected.append((kind, content if kind == 'text' else ''))
+        if target_index is None:
+            raise ValueError('语音已离开最新消息范围')
+        self.check_sender_connection()
+        selected = self.wx.ChatWith(name, exact=True)
+        current_info = {}
+        for _ in range(8):
+            current_info = self.wx.ChatInfo() or {}
+            if current_info.get('chat_name') == name:
+                break
+            time.sleep(.25)
+        if current_info.get('chat_name') != name:
+            status = selected.get('status','unknown') if isinstance(selected, dict) else type(selected).__name__
+            raise ValueError('微信当前会话名称未通过核验；切换状态=' + str(status) + '；字段=' + ','.join(current_info))
+        if self._has_saved_human_draft(message.contact):
+            raise ValueError('该会话已有本人未发送的草稿，保留编辑现场')
+        gui = [m for m in self.wx.GetAllMessage() if getattr(m, 'type', '') in {'text','voice'}]
+        visible = [(getattr(m,'type',''), str(getattr(m,'content','')) if getattr(m,'type','') == 'text' else '') for m in gui]
+        # WeChat may load fewer than twelve items in a small window. Keep the
+        # longest available anchored tail, while retaining the target voice.
+        trim = max(0, len(expected)-len(visible))
+        if trim > target_index:
+            raise ValueError('目标语音尚未出现在窗口中')
+        expected = expected[trim:]
+        target_index -= trim
+        index = align_voice(expected, visible, target_index)
+        if self.config.resolve(self.config.paths.pause_file).exists():
+            raise ValueError('已暂停')
+        try:
+            transcript = gui[index].to_text()
+        except NameError:
+            from app.voice import native_transcription
+            transcript = native_transcription(gui[index])
+        if not isinstance(transcript, str) or not transcript.strip() or transcript.strip() in {'[语音]', '转换失败', '无法识别'}:
+            raise ValueError('微信没有返回有效转写')
+        cache = self.reader.root / 'voice_transcripts'
+        cache.mkdir(exist_ok=True)
+        (cache / (hashlib.sha256(message.external_id.encode()).hexdigest()+'.json')).write_text(json.dumps({'external_id':message.external_id,'contact':message.contact,'transcript':transcript,'source':'wechat_builtin','direction':origin['transcription_direction']}, ensure_ascii=False),encoding='utf-8')
+        from app.chat_memory import remember
+        remember(self.config.resolve(self.config.paths.chat_memory), [('voice:'+message.external_id, message.contact, origin['transcription_direction'], origin['created_at'], transcript)])
+        message.content = transcript.strip()
+        message.message_type = 'text'
+        origin['original_type'] = 'voice'
+        origin['transcription_source'] = 'wechat_builtin'
+        message.raw_summary = json.dumps(origin)
 
     def _eligible_contacts(self):
         system = {"filehelper", "weixin", "qqmail", "fmessage", "medianote", "newsapp", "notification_messages"}
@@ -204,7 +284,13 @@ class HistoryVerifiedSender(MessageAdapter):
             raise RuntimeError("发送联系人名称不唯一，停止发送")
         self.check_sender_connection()
         self.wx.ChatWith(name, exact=True)
-        if (self.wx.ChatInfo() or {}).get("chat_name") != name:
+        current_name = None
+        for _ in range(8):
+            current_name = (self.wx.ChatInfo() or {}).get('chat_name')
+            if current_name == name:
+                break
+            time.sleep(.25)
+        if current_name != name:
             raise RuntimeError("当前会话与授权联系人不一致，停止发送")
         if self.config.resolve(self.config.paths.pause_file).exists():
             return False

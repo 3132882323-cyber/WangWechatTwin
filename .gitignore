@@ -19,3 +19,6 @@ __pycache__/
 *.key
 *keys.json
 data/learned_style_summary.json
+
+pairing.local.js
+*pairing_token*
