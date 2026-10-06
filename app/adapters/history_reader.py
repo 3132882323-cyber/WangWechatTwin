@@ -235,7 +235,9 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                             if msg_type=='sticker':
                                 try:
                                     from app.stickers import acquire
-                                    digest,media_paths,label=acquire(content,self.root)
+                                    account_dirs={parent.parent for file_info in self.files.values()
+                                                  for parent in Path(file_info['source']).parents if parent.name=='db_storage'}
+                                    digest,media_paths,label=acquire(content,self.root,account_dirs)
                                     sticker_meta={'sticker_md5':digest,'asset_verified':True}
                                     content='[表情包]'+('\n'+label if label else '')
                                 except Exception as exc:
