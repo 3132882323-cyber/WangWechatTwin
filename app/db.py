@@ -106,6 +106,12 @@ class Database:
                 );
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(drafts)")}
+            for name, declaration in (("kind", "TEXT NOT NULL DEFAULT 'reply'"),
+                                      ("sticker_id", "TEXT NOT NULL DEFAULT ''"),
+                                      ("source_context_ts", "INTEGER")):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE drafts ADD COLUMN {name} {declaration}")
 
     def seen(self, external_id: str) -> bool:
         with self.connect() as conn:
@@ -200,6 +206,7 @@ class Database:
         contact: str,
         inbound_message_id: int | None,
         decision: ReplyDecision,
+        *, kind: str = "reply", source_context_ts: int | None = None,
     ) -> int:
         now = utc_now()
         with self.connect() as conn:
@@ -207,8 +214,8 @@ class Database:
                 """
                 INSERT INTO drafts
                 (contact, inbound_message_id, reply, holding_reply, action, risk, reason,
-                 confidence, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                 confidence, status, created_at, updated_at, kind, sticker_id, source_context_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                 """,
                 (
                     contact,
@@ -221,6 +228,9 @@ class Database:
                     decision.confidence,
                     now,
                     now,
+                    kind,
+                    decision.sticker_id,
+                    source_context_ts,
                 ),
             )
             return int(cur.lastrowid)

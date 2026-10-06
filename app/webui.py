@@ -31,18 +31,19 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
         allowed = (not draft.contact.startswith('__web_self_test__') and not draft_only and (config.adapter != "history_verified_sender"
                    or config.wechat.sender_all_existing_chats or draft.contact in config.wechat.sender_allowed_contacts))
         approve_action = "approve" if allowed else "save"
-        approve_label = "批准发送并学习我的修改" if allowed else "保存我的修改"
+        approve_label = ("批准这次主动联系" if draft.kind=='proactive' else "批准发送并学习我的修改") if allowed else "保存我的修改"
         text = html.escape(draft.edited_reply or draft.reply)
-        incoming = html.escape(draft.incoming_content or "（原消息已按保留策略清理）")
+        incoming = html.escape("主动联系建议：尚未给对方发消息" if draft.kind=='proactive' else draft.incoming_content or "（原消息已按保留策略清理）")
         rows.append(
             f"""
             <section class="card">
-              <div class="meta">#{draft.id} · {html.escape('网页连接自检（测试草稿，不发送）' if draft.contact.startswith('__web_self_test__') else labels.get(draft.contact, draft.contact))} · 风险 {html.escape(draft.risk)} · 置信度 {draft.confidence:.2f}</div>
+              <div class="meta">#{draft.id} · {'主动聊天建议 · ' if draft.kind=='proactive' else ''}{html.escape('网页连接自检（测试草稿，不发送）' if draft.contact.startswith('__web_self_test__') else labels.get(draft.contact, draft.contact))} · 风险 {html.escape(draft.risk)} · 置信度 {draft.confidence:.2f}</div>
               <div class="incoming"><strong>对方：</strong>{incoming}</div>
               <div class="reason"><strong>系统判断：</strong>{html.escape(draft.reason)}</div>
               <form method="post" action="/draft/{draft.id}/{approve_action}">
                 <input type="hidden" name="_csrf" value="{csrf_token}">
-                <textarea name="reply">{text}</textarea>
+                <label for="draft-reply-{draft.id}">拟发送内容</label>
+                <textarea id="draft-reply-{draft.id}" name="reply">{text}</textarea>
                 <div class="actions">
                   <button class="send" type="submit">{approve_label}</button>
                   <button class="dismiss" type="submit" formaction="/draft/{draft.id}/dismiss">不发送</button>
@@ -52,6 +53,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
             """
         )
     titles = {"runtime_started": "微信后台已启动", "runtime_stopped": "微信后台已停止", "auto_sent": "已自动回复",
+              "proactive_draft":"主动聊天建议待审核",
               "approved_sent": "已发送你确认的回复", "draft_created": "等待你确认", "media_review": "非文字消息待查看",
               "ignored_acknowledgment": "已识别简短确认，无需追加回复", "ignored": "无需回复", "send_error": "发送受阻",
               "paused": "已暂停", "resumed": "已恢复", "draft_saved": "修改已保存", "llm_error": "AI 连接受阻"}
@@ -80,6 +82,7 @@ main{{max-width:1100px;margin:24px auto;padding:0 18px}}
 .card{{background:white;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 2px 8px #0000000a}}
 .meta{{font-weight:700;margin-bottom:8px}} .incoming{{background:#f3f4f6;padding:10px;border-radius:8px;margin-bottom:8px;white-space:pre-wrap}} .reason{{color:#6b7280;margin-bottom:10px}}
 textarea{{width:100%;min-height:90px;box-sizing:border-box;border:1px solid #d1d5db;border-radius:8px;padding:10px;font-size:16px}}
+button:focus-visible,textarea:focus-visible{{outline:3px solid #2563eb;outline-offset:3px}} label{{display:block;margin:8px 0;font-weight:600}}
 .actions{{display:flex;gap:10px;margin-top:10px}} button{{border:0;border-radius:8px;padding:10px 16px;cursor:pointer}}
 .send{{background:#047857;color:white}} .dismiss{{background:#e5e7eb}} .pause{{background:#b91c1c;color:white}}
 table{{width:100%;border-collapse:collapse;background:white}} th,td{{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}
@@ -91,6 +94,7 @@ small{{color:#9ca3af}}
 <main>
 <div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
 <form method="post" action="/{'resume' if paused else 'pause'}"><input type="hidden" name="_csrf" value="{csrf_token}"><button class="pause">{'恢复处理' if paused else '立即暂停'}</button></form>
+<section class="card"><strong>主动聊天：{'已开启建议' if config.proactive.enabled else '未开启'}</strong><p>问候与话题跟进均先生成草稿，你批准后才联系对方。每天最多 {config.proactive.max_drafts_per_day} 条；同一联系人至少间隔 {config.proactive.cooldown_hours:g} 小时；北京时间 {config.proactive.active_start_hour}:00—{config.proactive.active_end_hour}:00 生成建议。已有未回复消息时不再催聊。</p></section>
 <h2>待审核草稿（{len(drafts)}）</h2>
 {''.join(rows) if rows else '<div class="card">当前没有待审核草稿。</div>'}
 <h2>最近事件</h2>

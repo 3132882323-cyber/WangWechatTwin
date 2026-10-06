@@ -43,6 +43,7 @@ class RiskAssessment(BaseModel):
 
 
 class ReplyDecision(BaseModel):
+    sticker_id: str = ""
     media_description: str = ''
     media_confidence: float = Field(default=0,ge=0,le=1)
     action: Literal["send", "hold", "review", "ignore"]
@@ -65,6 +66,9 @@ class ContactProfile(BaseModel):
 
 
 class DraftRecord(BaseModel):
+    kind: str = "reply"
+    sticker_id: str = ""
+    source_context_ts: int | None = None
     id: int
     contact: str
     inbound_message_id: int | None

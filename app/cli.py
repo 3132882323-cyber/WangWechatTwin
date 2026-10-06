@@ -240,6 +240,8 @@ def command_run(args: argparse.Namespace) -> int:
             print(f"启动微信适配器失败：{exc}", file=sys.stderr)
             return 2
         pipeline = ReplyPipeline(config, db)
+        from app.proactive import ProactivePlanner
+        proactive_planner = ProactivePlanner(config, db, adapter)
         start_webui(config, db)
         db.set_state("runtime", {"status": "running", "mode": config.mode, "pid": os.getpid()})
         db.add_event("runtime_started", f"mode={config.mode}; adapter={config.adapter}")
@@ -260,6 +262,7 @@ def command_run(args: argparse.Namespace) -> int:
                     for message in messages:
                         result = pipeline.process(message, adapter)
                         print(f"[{message.contact}] {result.status}")
+                    proactive_planner.tick()
                 except WxAutoUnavailable as exc:
                     db.add_event("adapter_error", str(exc), level="error")
                     print(f"微信适配器错误：{exc}", file=sys.stderr)

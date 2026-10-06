@@ -37,9 +37,13 @@ def acquire(raw,root):
     if hashlib.md5(data).hexdigest()!=meta['md5']:raise ValueError('表情文件与消息校验值不一致')
     image=Image.open(io.BytesIO(data))
     if image.width*image.height>4096*4096:raise ValueError('表情尺寸超出限制')
+    extension={'GIF':'.gif','PNG':'.png','JPEG':'.jpg','WEBP':'.webp'}.get(image.format)
+    if extension is None:raise ValueError('不支持的表情图片格式')
+    original=directory/(meta['md5']+extension)
+    original.write_bytes(data)
     count=getattr(image,'n_frames',1);indexes=sorted({0,count//2,count-1});paths=[]
     for index in indexes:
         image.seek(index);frame=image.convert('RGB');frame.thumbnail((640,640))
         path=directory/(meta['md5']+f'-{index}.png');frame.save(path);paths.append(path)
-    manifest.write_text(json.dumps({'md5_verified':True,'frames':[p.name for p in paths],'animated_frames':count}),encoding='utf-8')
+    manifest.write_text(json.dumps({'md5_verified':True,'frames':[p.name for p in paths],'animated_frames':count,'original':original.name}),encoding='utf-8')
     return meta['md5'],[str(p) for p in paths],meta['label']

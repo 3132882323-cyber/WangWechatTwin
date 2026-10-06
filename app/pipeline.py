@@ -279,6 +279,10 @@ class ReplyPipeline:
             # Claim before touching the UI so a crash cannot silently resend the same approval.
             self.db.update_draft(draft.id, "sending")
             try:
+                if draft.kind == 'proactive':
+                    if not hasattr(adapter,'prepare_proactive'):
+                        raise RuntimeError('当前连接不支持经过核验的主动联系')
+                    adapter.prepare_proactive(draft.contact,draft.id,draft.source_context_ts)
                 adapter.manual_approval_in_progress = True
                 ok = adapter.send_text(draft.contact, text)
             except Exception as exc:

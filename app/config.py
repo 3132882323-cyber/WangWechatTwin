@@ -42,9 +42,29 @@ class MemorySettings(BaseModel):
     retain_message_days: int = 30
 
 
+class ProactiveSettings(BaseModel):
+    enabled: bool = False
+    review_only: Literal[True] = True
+    all_existing_contacts: bool = True
+    contacts: list[str] = Field(default_factory=list)
+    purpose: Literal["followup", "chat", "both"] = "both"
+    min_idle_hours: float = Field(default=24, ge=1)
+    cooldown_hours: float = Field(default=72, ge=24)
+    max_drafts_per_day: int = Field(default=3, ge=1, le=20)
+    active_start_hour: int = Field(default=10, ge=0, le=23)
+    active_end_hour: int = Field(default=20, ge=1, le=24)
+    interval_seconds: int = Field(default=300, ge=30)
+
+
+class StickerSettings(BaseModel):
+    enabled: bool = False
+    catalog: str = ".runtime/history_reader/sticker_catalog.json"
+    max_per_contact_per_day: int = Field(default=3, ge=1, le=10)
+
+
 class LocalAPISettings(BaseModel):
     auto_load: bool = False
-    bootstrap_manifest: str = ".runtime/local_api/native/manifest.json"
+    bootstrap_manifest: str = ".runtime/local_api/v2/manifest.json"
     # This connector never falls back to GUI sending.
     port: int = Field(default=30001, ge=1, le=65535)
     token_file: str = ".runtime/local_api/token.txt"
@@ -74,13 +94,15 @@ class PathSettings(BaseModel):
 
 class AppConfig(BaseModel):
     owner_identity_exclusions: list[str] = Field(default_factory=list)
-    owner_name: str = "使用者"
+    owner_name: str = "夏鑫鑫"
     owner_alias: str = "本人"
     adapter: Literal["wxauto", "mock", "history_readonly", "history_verified_sender", "history_http_sender"] = "wxauto"
     mode: Literal["shadow", "low_risk_auto", "full_auto", "off"] = "shadow"
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     wechat: WeChatSettings = Field(default_factory=WeChatSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
+    stickers: StickerSettings = Field(default_factory=StickerSettings)
     local_api: LocalAPISettings = Field(default_factory=LocalAPISettings)
     web: WebSettings = Field(default_factory=WebSettings)
     paths: PathSettings = Field(default_factory=PathSettings)

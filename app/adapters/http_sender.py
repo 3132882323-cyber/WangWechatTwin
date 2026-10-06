@@ -153,6 +153,20 @@ class HistoryHTTPSender(MessageAdapter):
         self.last_send_skip_reason = reason
         return False
 
+    def prepare_proactive(self, contact, draft_id, source_context_ts):
+        if self._has_saved_human_draft(contact):
+            raise LocalAPIError("该会话已有本人输入草稿，取消主动联系")
+        table="Msg_"+hashlib.md5(contact.encode()).hexdigest()
+        for info in self.reader.files.values():
+            with tempfile.TemporaryDirectory(dir=self.reader.root) as tmp:
+                snapshot,_=authenticated_snapshot(info,Path(tmp))
+                with closing(sqlite3.connect(snapshot.as_uri()+'?mode=ro&immutable=1',uri=True)) as connection:
+                    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():continue
+                    latest=connection.execute(f'SELECT MAX(create_time) FROM "{table}"').fetchone()[0] or 0
+                    if source_context_ts is None or latest>source_context_ts:
+                        raise LocalAPIError("主动草稿生成后已有新聊天，取消过时建议")
+        self.context[contact]='proactive-approved:'+str(draft_id)
+
     def _stable_outgoing_state(self, contact, text, deadline):
         while True:
             try:
