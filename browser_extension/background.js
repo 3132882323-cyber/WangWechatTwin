@@ -14,14 +14,27 @@ async function acquire(key){
  for(const s of bridgePool){try{const t=await chrome.tabs.get(s.tabId);if(t.url===s.url&&WechatPool.validUrl(t.url))slots.push(s);}catch{}}
  const choice=WechatPool.choose(slots,key,Date.now());let s=choice.slot;
  if(!s){const t=await chrome.tabs.create({url:rootUrl,active:false});s={tabId:t.id,slotId:[0,1,2].find(i=>!slots.some(x=>x.slotId===i)),turns:0};slots.push(s);}
- else if(choice.reset)await chrome.tabs.update(s.tabId,{url:rootUrl});
+ else if(choice.reset){
+  try{const old=await chrome.scripting.executeScript({target:{tabId:s.tabId},func:()=>performance.timeOrigin});s.navigationOriginBefore=old[0]?.result;}catch{s.navigationOriginBefore=null;}
+  await chrome.tabs.update(s.tabId,{url:rootUrl});
+ }else{s.navigationOriginBefore=null;}
  if(choice.reset){s.turns=0;s.failed=false;s.url=rootUrl;}
  s.key=key;s.used=Date.now();await store(slots);
  return {slots,slot:s,reused:choice.reused};
 }
-async function loadTab(id){
- const deadline=Date.now()+30000;
- while(Date.now()<deadline){const t=await chrome.tabs.get(id);if(t.status==='complete')return;await new Promise(r=>setTimeout(r,500));}
+async function loadTab(id,expectedUrl,oldOrigin){
+ const deadline=Date.now()+60000;
+ while(Date.now()<deadline){
+  try{
+   const t=await chrome.tabs.get(id);
+   if(t.url===expectedUrl){
+    const result=await chrome.scripting.executeScript({target:{tabId:id},func:()=>({url:location.href,ready:document.readyState,origin:performance.timeOrigin,editor:!!document.querySelector('[role="textbox"][contenteditable="true"]')})});
+    const page=result[0]?.result;
+    if(page?.url===expectedUrl&&page.ready!=='loading'&&page.editor&&(!oldOrigin||page.origin!==oldOrigin))return;
+   }
+  }catch{}
+  await new Promise(r=>setTimeout(r,750));
+ }
  throw Error('load');
 }
 chrome.alarms.onAlarm.addListener(async()=>{
@@ -30,12 +43,12 @@ chrome.alarms.onAlarm.addListener(async()=>{
  const {bridgeLease}=await chrome.storage.session.get('bridgeLease');if(bridgeLease?.until>Date.now())return;
  await chrome.storage.local.set({bridgeWorkerVersion:4});
  busy=true;let job=null,pool=null,stage='queue';
- const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4'};
+ const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4','X-Wechat-Bridge-Build':'navigation-ready-v2'};
  try{
   const r=await fetch(base+'/next',{headers});if(!r.ok)throw Error('bridge');
   job=(await r.json()).job;if(!job)return;
   await chrome.storage.session.set({bridgeLease:{id:job.id,until:Date.now()+240000}});
-  pool=await acquire(job.conversation_key||'isolated:'+job.id);stage='load';await loadTab(pool.slot.tabId);
+  pool=await acquire(job.conversation_key||'isolated:'+job.id);stage='load';await loadTab(pool.slot.tabId,pool.slot.url,pool.slot.navigationOriginBefore);
   stage='setup';await chrome.scripting.executeScript({target:{tabId:pool.slot.tabId},files:['web_chat.js']});
   stage='reply';
   const reply=await chrome.scripting.executeScript({target:{tabId:pool.slot.tabId},func:async(prompt,key,reused)=>await window.wechatWebReply(prompt,key,reused),args:[job.prompt,pool.slot.key,pool.reused]});
