@@ -149,7 +149,9 @@ class ReplyPipeline:
 
         risk = assess_risk(message.content)
         inbound_id = self.db.add_incoming(message, risk=risk.level.value)
-        if message.message_type != "text":
+        vision_ready=(self.db.get_state('browser_bridge') or {}).get('build')=='sticker-vision-v1'
+        recognized_sticker=message.message_type=='sticker' and bool(message.media_paths) and self.config.openai.provider=='web' and vision_ready
+        if message.message_type != "text" and not recognized_sticker:
             decision = ReplyDecision(action="review", risk=RiskLevel.medium, reply="",
                                      reason="非文字内容尚未解析，需本人查看；不自动回复未知内容", confidence=0)
             draft_id = self.db.create_draft(message.contact, inbound_id, decision)
@@ -188,6 +190,12 @@ class ReplyPipeline:
                 decision = self._fallback(risk.level, risk.safe_holding_reply, str(exc))
 
         mode = self._mode(contact)
+        if recognized_sticker:
+            if not decision.media_description or decision.media_confidence<.75:
+                decision.action='review';decision.reason+='；表情识别不确定，留审核'
+            else:
+                from app.chat_memory import remember
+                remember(self.config.resolve(self.config.paths.chat_memory),[('sticker:'+message.external_id,message.contact,'in',int(message.received_at.timestamp()),'表情包可见内容（非人物事实或承诺）：'+decision.media_description)])
         decision = self._apply_policy(decision, risk.level, mode, risk.safe_holding_reply)
         if (
             decision.risk == RiskLevel.low

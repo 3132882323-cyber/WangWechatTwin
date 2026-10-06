@@ -1,5 +1,5 @@
 document.documentElement.dataset.wechatBridgeVersion='4';
-window.wechatWebReplyInner=async function(prompt,key,reused=false){
+window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  const {bridgeWorkerVersion}=await chrome.storage.local.get('bridgeWorkerVersion');
  if(bridgeWorkerVersion!==4)throw Error('update_extension_before_input');
  const stage=s=>document.documentElement.dataset.wechatBridgeStage=s;
@@ -50,6 +50,13 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false){
  const composer=await wait(()=>Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"][aria-label="询问 ChatGPT"]')).find(visible));
  if(composer.textContent.trim()||find('button','停止'))throw Error('user_editing_before_input');
  const previousReplies=new Set(assistants().map(identity));
+ if(images.length){
+  const input=await wait(()=>Array.from(document.querySelectorAll('input[type="file"]')).find(e=>!e.accept||e.accept.includes('image')||e.accept.includes('.png')));
+  const transfer=new DataTransfer();
+  for(const img of images){const bytes=Uint8Array.from(atob(img.data),c=>c.charCodeAt(0));transfer.items.add(new File([bytes],img.name,{type:img.mime}));}
+  input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));
+  await wait(()=>images.every(img=>document.body.textContent.includes(img.name)));
+ }
  composer.focus();document.execCommand('insertText',false,prompt);
  const normalized=s=>s.replace(/[\s\u200B]+/g,'');
  if(normalized(composer.textContent)!==normalized(prompt))throw Error('prompt not inserted');
@@ -60,8 +67,8 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false){
  const response=node.querySelector(':scope > div')?.innerText||node.innerText;
  const cleaned=response.trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'');JSON.parse(cleaned);return cleaned;
 };
-window.wechatWebReply=async function(prompt,key,reused){
- try{const result=await window.wechatWebReplyInner(prompt,key,reused);
+window.wechatWebReply=async function(prompt,key,reused,images){
+ try{const result=await window.wechatWebReplyInner(prompt,key,reused,images);
   const nodes=Array.from(document.querySelectorAll('[data-message-author-role="assistant"],[data-content-search-unit-key$=":assistant"]'));const e=nodes.at(-1);
   document.documentElement.dataset.wechatBridgeLastReply=e&&(e.getAttribute('data-chatgpt-search-message-ids')||e.getAttribute('data-message-id')||e.getAttribute('data-content-search-unit-key'));
   return result;

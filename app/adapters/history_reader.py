@@ -202,7 +202,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                     memory_text = (zstandard.ZstdDecompressor().decompress(memory_text, max_output_size=8*1024*1024) if compression else memory_text).decode('utf-8')
                                 if isinstance(memory_text, str) and memory_text.strip():
                                     identity = hashlib.sha256(f'{account}|{contact}|{server_id or name+str(local_id)}'.encode()).hexdigest()
-                                    memory_rows.append((identity, contact, 'out' if sender == own_id else 'in', ts, memory_text))
+                                    memory_rows.append((identity, contact, 'out' if sender == own_id else 'in', ts, memory_text,'本人' if sender==own_id else self.names.get(users.get(sender,''),'群成员（未确认）' if contact.endswith('@chatroom') else '对方')))
                             if sender == own_id or local_id <= last_own_id or (typ & 0xffffffff) in {10000, 10002}:
                                 continue
                             if isinstance(content, bytes):
@@ -227,18 +227,29 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                             msg_type = "text" if (typ & 0xffffffff) == 1 else {
                                 3: "image", 34: "voice", 43: "video", 47: "sticker", 49: "attachment"
                             }.get(typ & 0xffffffff, "unknown")
+                            media_paths=[];sticker_meta={}
+                            if msg_type=='sticker':
+                                try:
+                                    from app.stickers import acquire
+                                    digest,media_paths,label=acquire(content,self.root)
+                                    sticker_meta={'sticker_md5':digest,'asset_verified':True}
+                                    content='对方发来表情包。'+('消息附带文字：'+label if label else '请根据已附图片和当前聊天理解，不能猜测人物身份或把表情当作承诺。')
+                                except Exception as exc:
+                                    sticker_meta={'sticker_error':type(exc).__name__}
                             if msg_type != "text":
-                                content = {"image": "对方发来图片，内容尚未识别", "voice": "对方发来语音，尚未转写",
+                                if not media_paths:content = {"image": "对方发来图片，内容尚未识别", "voice": "对方发来语音，尚未转写",
                                            "video": "对方发来视频，内容尚未识别"}.get(msg_type, "对方发来附件或非文字消息，内容尚未解析")
                             identity = f"{account}|{contact}|{server_id or name + ':' + str(local_id)}"
                             result.append(IncomingMessage(
                                 external_id="local:" + hashlib.sha256(identity.encode()).hexdigest(),
                                 contact=contact, sender=self.names.get(users.get(sender, contact), "联系人"), content=content,
+                                sender_key=hashlib.sha256(users.get(sender,contact).encode()).hexdigest(),
                                 message_type=msg_type,
+                                media_paths=media_paths,
                                 display_name=self.names.get(contact, contact),
                                 chat_type="group" if contact.endswith("@chatroom") else "friend",
                                 received_at=datetime.fromtimestamp(ts, timezone.utc)))
-                            result[-1].raw_summary = json.dumps({"source": name, "local_id": local_id, "created_at": ts})
+                            result[-1].raw_summary = json.dumps({"source": name, "local_id": local_id, "created_at": ts,**sticker_meta})
                         self.cursors[cursor_key] = high
                     self.signatures[name] = observed
                 finally:

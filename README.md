@@ -1,96 +1,63 @@
-# WangWechatTwin
+# 微信聊天记忆分身
 
-Windows 本机微信回复助手：读取本人账号的新消息，参考本人写作习惯生成回复，按风险策略自动发送或留在本地审核台。
+一个在 **Windows 本机运行**的微信回复助手：先读懂这段对话是谁在说、说过什么，再参考本人给这位联系人的实际表达，生成草稿或在授权范围内回复。
 
-项目源码使用 **Apache-2.0** 开源。包括消息读取、数据库解密、界面兼容、模型调用、会话隔离、风格检索、发送验证和测试源码。第三方代码保留原许可证，见 [NOTICE](NOTICE) 和 [第三方说明](THIRD_PARTY_NOTICES.md)。微信客户端、托管模型及可选外部 GUI SDK 不属于本项目源码。
+它关注的是个人聊天记忆和交流习惯，不预设用户是老板，也不把某个联系人或旧项目中的人物当成本人。仓库地址中的 `WangWechatTwin` 是历史工程名称，**不代表用户身份**。
 
-## 当前能力与边界
+## 怎样理解一段聊天
 
-- 本人已登录账号的本地数据库读取；每页认证、WAL 提交帧校验、副本完整性检查。
-- 启动时建立历史基线，不向旧消息批量补发回复；过滤本人消息，检测手动答复和已保存的人工草稿。
-- 每联系人独立上下文和风格样例；不把甲联系人的历史提供给乙联系人。
-- 支持 OpenAI Responses API 和已登录的 Codex CLI。后者使用账号计划额度，**不是无限或免费额度**。
-- 默认 `shadow`：只生成草稿。日常自动发送需要显式选择 `low_risk_auto` 和发送范围。
-- 报价、工期、付款、合同、凭证、不确定承诺及未解析的语音图片转审核。
-- 发送前核验本人账号、唯一联系人和当前会话；发送后从本机数据库读回新的本人消息及服务器编号。状态不确定不自动重试。
-- 群聊默认关闭；开启时默认只处理 @ 本人的消息。系统通知和公众号不自动回复。
-- 本机审核台提供暂停、改稿和确认发送；审核 POST 使用本机页面令牌。
+- 区分本人、当前联系人和引用中的第三人。别人说的“我”，不自动变成本人的经历。
+- 按联系人保存日期、说话人和原文依据。检索相关话题时带回前后交流，不只抽一句话。
+- 优先学习本人亲手修改的回复，再参考相似情境原话、当前联系人习惯和全局表达统计。
+- 旧报价、计划、情绪和承诺不是今天的事实。没有本人立场依据时，不替本人编理由、作决定。
+- 不把另一个联系人的私聊原文混入当前对话，不宣称复制了完整人格。
 
-不能保证回复与本人逐句完全一致，也不保证所有微信小版本、缩放、窗口状态或消息类型都可用。未知版本或不明确的收件人应停止发送。
+## 当前能力
 
-## 环境
+| 功能 | 状态 |
+|---|---|
+| 本机历史数据库副本读取与完整性校验 | 已有 Windows 实测 |
+| 文字读取 → 普通网页模型生成 → 微信发送确认 | 已有真实新消息闭环 |
+| 本人文字习惯、联系人与情境画像 | 已接入；具体回复仍可能偏差 |
+| 微信内置语音转文字 | 已核验一条本人真实发出的语音 |
+| 固定最多 3 个网页窗口，同一联系人复用对话 | 已完成连续复用及容量实测 |
+| 表情包文件校验、静图/动图抽帧、网页视觉理解 | 正在接入；以后续本机验证为准 |
+| 普通图片、文件及其他未解析内容 | 留审核，不假装看懂 |
 
-Windows 10/11，Python 3.10–3.12（本机验证使用 3.12）。微信界面兼容路径目前严格校验 **4.1.15.13**。纯离线/mock 测试不要求登录微信；带原生 GUI 的测试要求 Windows 依赖。
+普通网页连接使用“不个性化临时聊天”，只输入微信任务所需上下文，不读取已有网页对话。API 和 Codex 账号连接仍可选；不同产品额度有各自边界，不保证无限使用。连接失败不会偷偷回退到 Codex。
 
-## 安装与只生成草稿
+自动发送默认关闭。日常低风险回复须明确开启；钱款、合同、账户、责任及缺乏事实依据的承诺留审核。发送前核验账号和联系人，发送后读取新的本人消息及服务器编号；这不等于联系人已读。图片识别或窗口状态不明确时停止该条处理。
+
+## 安装
+
+环境：Windows 10/11、Python 3.10–3.12。微信 GUI 兼容目前严格校验 `4.1.15.13`，其他版本不能据此保证可用。
 
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\python.exe -m pip install wxauto4==41.1.7
-Copy-Item config.example.yaml config.yaml
-Copy-Item .env.example .env
 ```
 
-先检查已有文件，**不要覆盖现有 `.env`、`config.yaml` 或 `.runtime`**。也可双击 `INSTALL_AND_CONFIGURE.bat`，安装入口会保留现有配置。
+确认没有已有配置后，再从 `config.example.yaml` 与 `.env.example` 创建自己的配置。**不要覆盖已有密钥、配置或数据库。**双击 `START_HERE.bat` 可进入本机菜单。
 
-模型连接任选一种：
-
-1. 在本机 `.env` 填写自己的 `OPENAI_API_KEY`；不要提交它。
-2. 安装官方 Codex CLI 并由本人完成 `codex login`，设置 `openai.provider: account` 或使用默认 `auto`。CLI 使用已保存登录，不读取或复制认证文件。
-
-仅选择**本人有权访问的已登录账号**的数据目录，例如其 `db_storage` 文件夹：
+仅连接本人有权访问的已登录微信账号：
 
 ```powershell
-.venv\Scripts\python.exe scripts\connect_local_history.py --db-dir "<本人账号的db_storage绝对路径>" --i-own-this-account
+.venv\Scripts\python.exe scripts\connect_local_history.py --db-dir "<本人账号db_storage绝对路径>" --i-own-this-account
 .venv\Scripts\python.exe -m app --config config.history.yaml run --mode shadow
 ```
 
-连接脚本只读同一 Windows 用户的 Weixin 进程、校验选定数据库的密钥，不写入原始聊天文件，不附加调试器、不捕获登录、不注入代码。生成的密钥只存放在受限的 `.runtime/history_reader`，连接后仍是只生成草稿。
+先完成只读、草稿、明确测试联系人与内容的发送验证，再按需要开启 `low_risk_auto`。群聊单独授权，默认只处理 @ 本人的消息。公众号和系统通知不自动回复。
 
-本机审核台默认为 [http://127.0.0.1:8765/](http://127.0.0.1:8765/)。端口被占用时修改本地 `web.port`。网页只监听本机，不应直接公开到互联网。
+网页模型连接见 [扩展说明](browser_extension/README.md)，角色与人物记忆见 [角色画像说明](ROLE_PROFILE.md)。本机审核台由配置中的 `web.port` 决定，只应监听本机。
 
-## 开启自动回复
+## 隐私与源码
 
-先在自己的测试联系人上验证：新消息读取 → 模型草稿 → 本人确认的测试发送 → 数据库读回。再从 `config.history.yaml` 创建本地 `config.takeover.yaml`。
-
-```yaml
-adapter: history_verified_sender
-mode: low_risk_auto
-wechat:
-  sender_all_existing_chats: false
-  sender_allowed_contacts: ["<已授权联系人的内部username>"]
-  allow_unknown_contacts: false
-  send_holding_on_review: false
-  max_auto_sends_per_hour: 30
-```
-
-该片段须与完整配置合并。联系人内部标识与显示名不同，不能凭昵称猜测标识。
-
-只有本人明确授权全部已有聊天后，才设置 `sender_all_existing_chats: true`、`allow_unknown_contacts: true`、`unknown_contact_mode: low_risk_auto`。群聊单独设置 `allow_groups`，保留 `group_only_mentions: true`。
-
-```powershell
-.venv\Scripts\python.exe -m app --config config.takeover.yaml run --mode low_risk_auto
-```
-
-界面兼容辅助代码会校验当前 DLL 版本与静态模式，再临时更新运行中客户端的既有 Qt accessibility 布尔状态；识别失败恢复原值。它不修改微信文件、不启动讲述人，也不是付费 SDK 的激活绕过。相关源代码和许可证均包含在仓库中。
-
-## 风格数据
-
-`data/persona.md`、`data/business_rules.md`、`data/reply_samples.csv` 都是通用模板。用户自己的语气概要放在本机 `data/learned_style_summary.json`；按联系人隔离的问答样例放在 `.runtime/history_reader/style_samples.sqlite3`。
-
-样例数据库格式为 `samples(contact TEXT, incoming TEXT, reply TEXT, created_at INTEGER)`。应从本人拥有的记录中本地生成，过滤凭证和敏感标识，仅用于表达风格；历史价格、日期、进度不等于当前事实。任何实际样例、联系人、数据库或日志都不要提交到公共仓库。
-
-## 验证
+聊天原文、联系人、个人画像、表情缓存、数据库、密钥和配对码只留用户本机，不随仓库发布。微信客户端、托管模型和可选外部 GUI SDK 不属于本项目源码。源码使用 **Apache-2.0**；第三方许可证见 [NOTICE](NOTICE) 与 [第三方说明](THIRD_PARTY_NOTICES.md)。
 
 ```powershell
 .venv\Scripts\python.exe -m pytest -q
+node --test browser_extension/pool.test.cjs
 ```
 
-本轮 Windows 源码测试通过 32 项。另有一次真实历史读取到草稿、一次明确授权的测试发送，以及一次从真实待回复消息恢复处理并发送的闭环验证。**这不代表每位用户、所有微信版本或全部场景均已通过**。公开仓库不包含这些私聊截图、内容或发送对象。
-
-## 项目结构
-
-`app/` 运行代码，`scripts/` 本地配置与连接工具，`tests/` 回归测试，`data/` 通用模板，`.runtime/` 用户本机运行数据（不发布）。
-
-报告问题前阅读 [隐私说明](PRIVACY.md)，请使用合成或脱敏样例。欢迎改进版本兼容、媒体解析、风格评估和可复现测试；不要提交用户真实聊天或密钥。
+源码检查与少量真实案例不代表全部微信版本、所有媒体类型或长期运行都可靠。报告问题请提交合成或脱敏样例，阅读 [隐私说明](PRIVACY.md)，不要上传真实私聊和凭证。

@@ -63,6 +63,7 @@ class PathSettings(BaseModel):
 
 
 class AppConfig(BaseModel):
+    owner_identity_exclusions: list[str] = Field(default_factory=list)
     owner_name: str = "使用者"
     owner_alias: str = "本人"
     adapter: Literal["wxauto", "mock", "history_readonly", "history_verified_sender"] = "wxauto"

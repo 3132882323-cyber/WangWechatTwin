@@ -1,6 +1,6 @@
-﻿[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Write-Output '====================================='
-Write-Output '      王总微信数字分身 V0.2.1'
+Write-Output '      微信聊天分身 V0.2.1'
 Write-Output '====================================='
 Write-Output '1. 安装并首次配置'
 Write-Output '2. 运行诊断'

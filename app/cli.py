@@ -111,10 +111,12 @@ def merge_incoming_messages(messages: list[IncomingMessage]) -> list[IncomingMes
             IncomingMessage(
                 external_id=f"merged:{digest}",
                 contact=items[-1].contact,
-                sender=items[-1].sender,
+                sender='群中多位成员' if items[-1].chat_type=='group' and len({m.sender_key or m.sender for m in items})>1 else items[-1].sender,
+                sender_key=items[-1].sender_key if len({m.sender_key or m.sender for m in items})==1 else '',
                 display_name=items[-1].display_name,
-                content="\n".join(item.content for item in items if item.content.strip()),
-                message_type="text" if all(item.message_type == "text" for item in items) else "mixed",
+                content="\n".join((item.sender+'：'+item.content) if item.chat_type=='group' else item.content for item in items if item.content.strip()),
+                media_paths=[path for item in items for path in item.media_paths],
+                message_type="text" if all(item.message_type == "text" for item in items) else ('sticker' if all(item.message_type in {'text','sticker'} for item in items) and any(item.media_paths for item in items) else 'mixed'),
                 chat_type=items[-1].chat_type,
                 received_at=max(item.received_at for item in items),
                 raw_summary=f"merged:{len(items)}",
@@ -239,7 +241,7 @@ def command_run(args: argparse.Namespace) -> int:
         db.set_state("runtime", {"status": "running", "mode": config.mode, "pid": os.getpid()})
         db.add_event("runtime_started", f"mode={config.mode}; adapter={config.adapter}")
         started = True
-        print(f"王总微信数字分身已启动，模式：{config.mode}")
+        print(f"微信聊天分身已启动，模式：{config.mode}")
         if config.web.enabled:
             print(f"本地控制台：http://{config.web.host}:{config.web.port}/")
         print("按 Ctrl+C 停止。")
@@ -280,7 +282,7 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="王总微信数字分身")
+    parser = argparse.ArgumentParser(description="微信聊天分身")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     sub = parser.add_subparsers(dest="command", required=True)
 

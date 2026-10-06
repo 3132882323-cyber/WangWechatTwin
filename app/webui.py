@@ -70,7 +70,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>王总微信数字分身</title>
+<title>微信聊天分身</title>
 <style>
 body{{font-family:Segoe UI,Microsoft YaHei,sans-serif;background:#f5f6f8;margin:0;color:#202124}}
 header{{background:#111827;color:white;padding:18px 26px;display:flex;justify-content:space-between;align-items:center}}
@@ -85,7 +85,7 @@ table{{width:100%;border-collapse:collapse;background:white}} th,td{{padding:8px
 small{{color:#9ca3af}}
 </style></head>
 <body>
-<header><div><strong>王总微信数字分身</strong><br><small>{'当前只生成草稿，不会发送微信消息' if draft_only else '已接管已有聊天：日常文字自动回复，重要事项待审核；群聊只处理@你的消息' if config.wechat.sender_all_existing_chats else '仅接管已确认的测试联系人，其他联系人只生成草稿' if config.adapter == 'history_verified_sender' else '已开启发送功能'}</small></div>
+<header><div><strong>微信聊天分身</strong><br><small>{'当前只生成草稿，不会发送微信消息' if draft_only else '已接管已有聊天：日常文字自动回复，重要事项待审核；群聊只处理@你的消息' if config.wechat.sender_all_existing_chats else '仅接管已确认的测试联系人，其他联系人只生成草稿' if config.adapter == 'history_verified_sender' else '已开启发送功能'}</small></div>
 <div><span class="badge">{'已暂停' if paused else '运行中'}</span></div></header>
 <main>
 <div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
@@ -106,7 +106,7 @@ setInterval(function(){{
 
 
 def create_app(config: AppConfig, db: Database) -> FastAPI:
-    app = FastAPI(title="王总微信数字分身")
+    app = FastAPI(title="微信聊天分身")
     app.state.csrf_token = secrets.token_urlsafe(32)
     if config.openai.provider == 'web':
         from app.web_llm import WebReplyLLM
@@ -129,10 +129,10 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                row = conn.execute("SELECT id,prompt,conversation_key FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY created LIMIT 1", (time.time(), int(paused))).fetchone()
+                row = conn.execute("SELECT id,prompt,conversation_key,images FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY created LIMIT 1", (time.time(), int(paused))).fetchone()
                 if row:
                     conn.execute("UPDATE jobs SET status='claimed' WHERE id=?", (row[0],))
-            return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0]} if row else None}
+            return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0],'images':json.loads(row[3])} if row else None}
 
         @app.post('/browser-bridge/result')
         async def browser_result(request: Request):

@@ -23,6 +23,8 @@ RISK_ORDER: dict[RiskLevel, int] = {
 
 
 class IncomingMessage(BaseModel):
+    sender_key: str = ''
+    media_paths: list[str] = Field(default_factory=list)
     display_name: str | None = None
     external_id: str
     contact: str
@@ -41,6 +43,8 @@ class RiskAssessment(BaseModel):
 
 
 class ReplyDecision(BaseModel):
+    media_description: str = ''
+    media_confidence: float = Field(default=0,ge=0,le=1)
     action: Literal["send", "hold", "review", "ignore"]
     risk: RiskLevel
     reply: str = ""

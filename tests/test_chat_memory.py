@@ -27,3 +27,13 @@ def test_new_owner_and_incoming_messages_append_idempotently(tmp_path):
     assert len(result) == 2
     assert {r['speaker'] for r in result} == {'本人','对方'}
     assert retrieve(path, 'another', '现场') == []
+
+
+def test_topic_recalls_exchange_and_respects_time_and_speaker(tmp_path):
+    from app.chat_memory import remember
+    path=tmp_path/'people.sqlite3'
+    remember(path,[('a','peer','in',100,'我老板王总做这个项目'),('b','peer','out',101,'王总不是我'),('c','peer','in',102,'以后再说'),('future','peer','out',1000,'未来才确认的新事实'),('other','someone','in',101,'别人的项目')])
+    result=retrieve(path,'peer','王总项目',as_of=102)
+    assert any(r['speaker']=='对方' and '我老板' in r['content'] for r in result)
+    assert any(r['speaker']=='本人' and '不是我' in r['content'] for r in result)
+    assert not any('未来' in r['content'] or '别人的' in r['content'] for r in result)

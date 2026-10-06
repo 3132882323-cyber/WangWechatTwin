@@ -16,6 +16,7 @@ class PromptBuilder:
         self.config = config
         self.persona = self._read(config.resolve(config.paths.persona))
         self.business_rules = self._read(config.resolve(config.paths.business_rules))
+        self.identity_fingerprint=hashlib.sha256((config.owner_name+'|'+config.owner_alias+'|'+json.dumps(config.owner_identity_exclusions,ensure_ascii=False)+'|'+self.persona+'|'+self.business_rules).encode('utf-8')).hexdigest()
         self.samples = self._read_samples(config.resolve(config.paths.reply_samples))
         style_path = config.resolve(config.paths.learned_style)
         try:
@@ -58,6 +59,7 @@ class PromptBuilder:
 15. 不替本人编造“想多认识人、只是忙、想让大家开心”等心理动机。原因有历史明确依据才引用；没有依据就简短核实，不擅自把立场包装得更体面。
 16. 情绪、玩笑和亲疏语气参考本人在当前会话里的近期明确表达。旧的发火、亲密或自嘲不等于今天仍如此；情境标签只是检索辅助，理解原文优先。
 17. 对方谈到本人的喜好、感受、意愿或个人选择时，先找本人近期的明确自述。没有依据，不用“一般人会怎样”代替本人，也不顺着建议擅自说我去、我答应、我愿意；必要时生成待审核草稿并列出需要本人确认的立场。
+18. 身份严格分开：本人是{self.config.owner_name}，明确不是本人身份的名称为{json.dumps(self.config.owner_identity_exclusions,ensure_ascii=False)}。联系人说的“我”指联系人，转述/引用中的第一人称指原说话人。不能把他人的公司、职业、经历和偏好移植到本人。
 
 以下是本人风格：
 {self.persona}
@@ -86,10 +88,12 @@ class PromptBuilder:
                             and assess_risk(e.get('preferred_reply','')).level != RiskLevel.critical
                             and not re.search(r'https?://|\d{7,}', e.get('incoming','')+e.get('preferred_reply',''))]
         payload = {
-            'conversation_key': hashlib.sha256(message.contact.encode('utf-8')).hexdigest(),
+            '__media_paths':message.media_paths,
+            'conversation_key': hashlib.sha256((message.contact+'|'+self.identity_fingerprint).encode('utf-8')).hexdigest(),
             "contact_profile": contact.model_dump(),
             "incoming": {
                 "sender": message.sender,
+                'sender_key':message.sender_key,
                 "content": message.content,
                 "message_type": message.message_type,
                 "chat_type": message.chat_type,
@@ -98,6 +102,7 @@ class PromptBuilder:
             "deterministic_risk": deterministic_risk.model_dump(mode="json"),
             "recent_messages": recent_messages,
             "contact_memories": memories,
+            'contact_memory_rule':'这些旧摘要属于当前联系人，不能移植为本人的职业或经历。未带原文依据的旧模型摘要只作待核实线索；按原微信说话人和日期核对。',
             "style_examples": self.samples + (learned_examples or []),
             "style_example_rule": "初始配置样例仅是人工模板，不证明本人曾这样说。历史原话用于模仿表达方式，价格、日期、项目状态等不得当作当前事实",
             "output_guidance": {
@@ -126,6 +131,8 @@ class PromptBuilder:
         except ValueError:
             pass
         from app.chat_memory import retrieve
-        payload["historical_conversation_memory"] = retrieve(self.config.resolve(self.config.paths.chat_memory), message.contact, message.content)
+        payload["historical_conversation_memory"] = retrieve(self.config.resolve(self.config.paths.chat_memory), message.contact, message.content,as_of=int(message.received_at.timestamp()))
         payload["historical_memory_rule"] = "这些记录只属于当前联系人，带有历史日期。过去的价格、承诺、进度和安排不代表现在仍有效；有冲突或缺少当前依据时转审核。"
+        if message.message_type=='sticker':
+            payload['sticker_rule']='观察附图文字/动作/表情，用 media_description 简要记录可见内容，给 media_confidence。仅按本轮上下文解释玩笑、赞同或反讽，不识别人脸身份，不把表情当作对价格/合同/感情的明确同意。看不清转审核。'
         return json.dumps(payload, ensure_ascii=False, indent=2)

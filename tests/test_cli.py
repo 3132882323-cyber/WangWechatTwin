@@ -26,3 +26,12 @@ def test_single_instance_lock(tmp_path):
     first.release()
     assert second.acquire()
     second.release()
+
+
+def test_group_burst_keeps_people_attribution_and_sticker_paths():
+    messages=[IncomingMessage(external_id='a',contact='g',chat_type='group',sender='甲',sender_key='a',content='我答应的是另一件事'),
+              IncomingMessage(external_id='b',contact='g',chat_type='group',sender='乙',sender_key='b',content='表情',message_type='sticker',media_paths=['frame.png'])]
+    result=merge_incoming_messages(messages)[0]
+    assert result.sender=='群中多位成员'
+    assert '甲：我答应' in result.content and '乙：表情' in result.content
+    assert result.message_type=='sticker' and result.media_paths==['frame.png']
