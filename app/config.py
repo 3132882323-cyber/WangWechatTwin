@@ -21,6 +21,7 @@ class OpenAISettings(BaseModel):
 
 
 class WeChatSettings(BaseModel):
+    use_greeting_cache: bool=True
     sender_all_existing_chats: bool = False
     group_only_mentions: bool = True
     ignore_simple_acknowledgments: bool = False
