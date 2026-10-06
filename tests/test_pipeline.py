@@ -17,6 +17,29 @@ class FakeLLM:
         return self.decision.model_copy(deep=True)
 
 
+def test_empty_laughter_is_rewritten_before_send(tmp_path):
+    cfg=make_config(tmp_path,'low_risk_auto');db=Database(cfg.resolve(cfg.paths.database));adapter=MockAdapter()
+    class Rewriter:
+        calls=0
+        def decide(self,system,payload,risk):
+            self.calls+=1
+            if self.calls==1:return ReplyDecision(action='send',risk=RiskLevel.low,reply='哈哈哈哈',confidence=.99)
+            assert 'reply_quality_feedback' in payload
+            return ReplyDecision(action='send',risk=RiskLevel.low,reply='咋了，出啥事了？',confidence=.95)
+    llm=Rewriter();pipe=ReplyPipeline(cfg,db,llm)
+    result=pipe.process(IncomingMessage(external_id='serious',contact='张三',sender='张三',content='我昨天心情挺差的'),adapter)
+    assert result.status=='sent' and llm.calls==2
+    assert adapter.sent[0][1]=='咋了，出啥事了？'
+
+
+def test_laughter_loop_stops_and_repeated_bad_generation_never_sends(tmp_path):
+    cfg=make_config(tmp_path,'low_risk_auto');db=Database(cfg.resolve(cfg.paths.database));adapter=MockAdapter()
+    pipe=ReplyPipeline(cfg,db,FakeLLM(ReplyDecision(action='send',risk=RiskLevel.low,reply='哈哈哈哈',confidence=.99)))
+    assert pipe.process(IncomingMessage(external_id='laugh',contact='张三',sender='张三',content='哈哈哈哈'),adapter).status=='ignored'
+    assert pipe.process(IncomingMessage(external_id='topic',contact='张三',sender='张三',content='你觉得这事怎么弄'),adapter).status=='draft'
+    assert not adapter.sent
+
+
 def test_image_recognition_stays_review_even_for_confident_ack(tmp_path):
     cfg=make_config(tmp_path,'low_risk_auto');cfg.openai.provider='web'
     db=Database(cfg.resolve(cfg.paths.database));db.set_state('browser_bridge',{'build':'fast-sticker-v2'})

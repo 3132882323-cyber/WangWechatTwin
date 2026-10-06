@@ -38,6 +38,7 @@ class PromptBuilder:
             return [dict(row) for row in csv.DictReader(handle)]
 
     def system_prompt(self) -> str:
+        from app.reply_quality import substantive_examples
         return f"""
 你是{self.config.owner_name}（{self.config.owner_alias}）的微信数字分身，负责起草并在授权范围内发送日常微信回复。
 
@@ -61,12 +62,13 @@ class PromptBuilder:
 17. 对方谈到本人的喜好、感受、意愿或个人选择时，先找本人近期的明确自述。没有依据，不用“一般人会怎样”代替本人，也不顺着建议擅自说我去、我答应、我愿意；必要时生成待审核草稿并列出需要本人确认的立场。
 18. 身份严格分开：本人是{self.config.owner_name}，明确不是本人身份的名称为{json.dumps(self.config.owner_identity_exclusions,ensure_ascii=False)}。联系人说的“我”指联系人，转述/引用中的第一人称指原说话人。不能把他人的公司、职业、经历和偏好移植到本人。
 19. 普通低风险闲聊、玩笑、表情、问候，允许直接用本人语气回应或轻微追问。比如问“啥愿望”不等于本人答应愿望，不需要先确认本人感情；不能仅因缺少情绪或喜好背景就把安全追问留审核。facts_to_confirm 只列这条回复实际必须由本人确认的事实，不列无关背景。
+20. 本人最新明确要求：认真理解、好好思考，不要一直回复“哈哈哈哈”。先回应对方的问题、情绪、观点或具体事情，再决定是否追问；简短也必须有内容。历史里笑声多不代表现在应该频繁起哄。不要默认以“哈哈”开头或结尾，不用笑声或笑脸代替回答；纯笑声已经收尾时可以选择 ignore，无需继续互发笑声。
 
 以下是本人风格：
 {self.persona}
 
 以下是从本人微信文字回复离线统计的表达习惯，仅用于语气参考：
-{json.dumps(self.learned_style, ensure_ascii=False)}
+{json.dumps(substantive_examples(self.learned_style), ensure_ascii=False)}
 日常确认可很短，复杂事项必须说清；不要机械套用高频短语，不要把过往聊天当成当前事实。
 
 以下是业务知识和边界：
@@ -121,6 +123,10 @@ class PromptBuilder:
             payload["style_example_rule"] += "；当前联系人的本人原话样例优先，不机械套用通用客服表达"
         from app.role_profile import load
         payload['owner_role_profile'] = load(self.config.resolve(self.config.paths.role_profile), message.contact, message.content)
+        from app.reply_quality import substantive_examples
+        payload['style_examples']=substantive_examples(payload['style_examples'])
+        payload['owner_role_profile']=substantive_examples(payload['owner_role_profile'])
+        payload['reply_quality_rule']='本人最新要求认真接话，不要用哈哈、笑脸或重复起哄代替实质回复。回答具体内容；无需回复时选择 ignore，不凑字数、不编造本人事实。'
         payload['owner_feedback_priority'] = '本人审核修改 > 当前明确立场及事实 > 当前联系人相似情境原话 > 当前联系人习惯 > 全局表达统计。不能拿样例内容替代事实判断。'
         if message.display_name:
             payload["contact_profile"]["name"] = message.display_name

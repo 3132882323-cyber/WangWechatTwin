@@ -182,6 +182,10 @@ class ReplyPipeline:
             draft_id = self.db.create_draft(message.contact, inbound_id, decision)
             self.db.add_event("media_review", decision.reason, contact=message.contact)
             return ProcessResult(status="draft", decision=decision, draft_id=draft_id)
+        from app.reply_quality import laughter_only,trim_laughter
+        if message.message_type=='text' and laughter_only(message.content) and risk.level==RiskLevel.low:
+            self.db.add_event('ignored_laughter','对方只有笑声，话题自然收尾，不再追加笑声',contact=message.contact)
+            return ProcessResult(status='ignored')
         if (self.config.wechat.ignore_simple_acknowledgments and risk.level == RiskLevel.low
                 and re.fullmatch(r"(?:好的?|收到|[Oo][Kk]|嗯+|对|是的|👌|👍)[。.!！,，\s]*", message.content.strip())):
             self.db.add_event("ignored_acknowledgment", "简短确认无需再追加回复，未调用模型", contact=message.contact)
@@ -218,6 +222,22 @@ class ReplyPipeline:
                 self.db.add_event("llm_error", str(exc), level="error", contact=message.contact)
                 decision = self._fallback(risk.level, risk.safe_holding_reply, str(exc))
 
+        if decision.action!='ignore' and laughter_only(decision.reply):
+            try:
+                corrected=json.loads(payload)
+                corrected['reply_quality_feedback']={'rejected_reply':decision.reply,
+                    'instruction':'这个回复只有笑声，没有回应对方内容。请重新理解本轮消息与上下文，认真给出有内容的本人式回复；不需要接话则 ignore。不要编造事实或承诺。'}
+                self.db.add_event('reply_quality_retry','空泛笑声回复已拦截，重新生成一次',contact=message.contact)
+                decision=self.llm.decide(self.prompt_builder.system_prompt(),json.dumps(corrected,ensure_ascii=False),risk.level)
+            except (LLMError,ValueError,AttributeError):
+                decision.action='review';decision.reply='';decision.reason+='；空泛笑声回复已拦截，需要本人审核'
+            if decision.action!='ignore' and (laughter_only(decision.reply) or not decision.reply.strip()):
+                decision.action='review';decision.reply='';decision.confidence=0
+                decision.facts_to_confirm.append('需要一条真正回应当前内容的回复')
+                decision.reason+='；重新生成仍没有实质内容，不自动发送'
+                draft_id=self.db.create_draft(message.contact,inbound_id,decision)
+                return ProcessResult(status='draft',decision=decision,draft_id=draft_id)
+        if not laughter_only(decision.reply):decision.reply=trim_laughter(decision.reply)
         mode = self._mode(contact)
         if recognized_sticker or recognized_image:
             if not decision.media_description or decision.media_confidence<.75:
