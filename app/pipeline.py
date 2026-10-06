@@ -170,11 +170,15 @@ class ReplyPipeline:
         recent = self.db.recent_messages(message.contact, self.config.memory.recent_messages)
         memories = self.db.memories(message.contact, self.config.memory.max_contact_memories)
         learned_examples = self.db.style_feedback(message.contact, limit=20)
+        from app.greeting_cache import lookup
+        cached_greeting=lookup(self.config.resolve(self.config.paths.style_history),message.contact,message.content,self.config.resolve(self.config.paths.role_profile)) if message.message_type=='text' and risk.level==RiskLevel.low else None
         payload = self.prompt_builder.user_payload(
             message, contact, risk, recent, memories, learned_examples
-        )
+        ) if not cached_greeting else ''
 
-        if risk.level == RiskLevel.critical:
+        if cached_greeting:
+            decision=ReplyDecision(action='send',risk=RiskLevel.low,reply=cached_greeting,confidence=.95,reason='本机使用已核验的本人问候原话或高频开口习惯；仅回答纯招呼，无事实或新决定，不等待网页模型')
+        elif risk.level == RiskLevel.critical:
             # Credentials, bank data, identity documents and legal/compensation details stay local.
             # Do not forward their raw text to an external model.
             decision = ReplyDecision(
