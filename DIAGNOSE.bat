@@ -15,5 +15,6 @@ if errorlevel 1 (
 )
 echo.
 echo === 本机微信与配置诊断 ===
-.venv\Scripts\python.exe -m app --config config.yaml doctor
+call "%~dp0scripts\active_config.bat"
+.venv\Scripts\python.exe -m app --config "%CONFIG%" doctor
 pause

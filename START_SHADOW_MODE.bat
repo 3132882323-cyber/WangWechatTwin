@@ -7,8 +7,7 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-set "CONFIG=config.yaml"
-if exist "config.history.yaml" if exist ".runtime\history_reader\keys.json" set "CONFIG=config.history.yaml"
+call "%~dp0scripts\active_config.bat"
 ".venv\Scripts\python.exe" -u -m app --config "%CONFIG%" run --mode shadow
 set "RESULT=%ERRORLEVEL%"
 pause

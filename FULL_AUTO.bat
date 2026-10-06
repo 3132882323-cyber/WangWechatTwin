@@ -1,18 +1,20 @@
 @echo off
+setlocal EnableExtensions
 chcp 65001 >nul
-cd /d "%~dp0"
-if not exist .venv\Scripts\python.exe (
-  echo 请先运行 INSTALL_AND_CONFIGURE.bat。
+cd /d "%~dp0" || exit /b 1
+if not exist ".venv\Scripts\python.exe" (
+  echo Please run INSTALL_AND_CONFIGURE.bat first.
   pause
   exit /b 1
 )
-echo 本模式会自动处理低风险和部分中风险消息；高风险与关键承诺仍只发占位回复并进入审核。
-echo 请先至少完成影子模式和低风险模式测试。
-set /p CONFIRM=确认启动请输入 YES：
-if /I not "%CONFIRM%"=="YES" (
-  echo 已取消。
-  pause
-  exit /b 0
+call "%~dp0scripts\active_config.bat"
+if /I "%CONFIG%"=="config.http-api.yaml" (
+  echo HTTP transport selected. The configured mode is preserved.
+  echo During interface migration, shadow mode generates drafts only.
+  ".venv\Scripts\python.exe" -u -m app --config "%CONFIG%" run
+) else (
+  ".venv\Scripts\python.exe" -u -m app --config "%CONFIG%" run --mode full_auto
 )
-.venv\Scripts\python.exe -m app --config config.yaml run --mode full_auto
+set "RESULT=%ERRORLEVEL%"
 pause
+exit /b %RESULT%
