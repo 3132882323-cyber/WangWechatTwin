@@ -17,6 +17,23 @@ class FakeLLM:
         return self.decision.model_copy(deep=True)
 
 
+def test_image_recognition_stays_review_even_for_confident_ack(tmp_path):
+    cfg=make_config(tmp_path,'low_risk_auto');cfg.openai.provider='web'
+    db=Database(cfg.resolve(cfg.paths.database));db.set_state('browser_bridge',{'build':'fast-sticker-v2'})
+    adapter=MockAdapter();pipe=ReplyPipeline(cfg,db,FakeLLM(ReplyDecision(action='send',risk=RiskLevel.low,reply='好啊',confidence=.99,media_description='一朵花',media_confidence=.99)))
+    result=pipe.process(IncomingMessage(external_id='image-review',contact='张三',sender='张三',content='[图片]',message_type='image',media_paths=['verified.png']),adapter)
+    assert result.status=='draft' and not adapter.sent
+
+
+def test_uncertain_sticker_and_voice_cannot_be_promoted_to_auto_send(tmp_path):
+    cfg=make_config(tmp_path,'low_risk_auto');cfg.openai.provider='web'
+    db=Database(cfg.resolve(cfg.paths.database));db.set_state('browser_bridge',{'build':'fast-sticker-v2'})
+    adapter=MockAdapter();pipe=ReplyPipeline(cfg,db,FakeLLM(ReplyDecision(action='send',risk=RiskLevel.low,reply='好啊',confidence=.99,media_description='模糊内容',media_confidence=.2)))
+    sticker=pipe.process(IncomingMessage(external_id='uncertain-sticker',contact='张三',sender='张三',content='[表情]',message_type='sticker',media_paths=['frame.png']),adapter)
+    voice=pipe.process(IncomingMessage(external_id='uncertain-voice',contact='张三',sender='张三',content='我去一下',raw_summary='{"original_type":"voice","asr_uncertain":true}'),adapter)
+    assert sticker.status=='draft' and voice.status=='draft' and not adapter.sent
+
+
 def test_safe_social_question_not_blocked_as_missing_personal_feelings(tmp_path):
     cfg=make_config(tmp_path,'low_risk_auto');db=Database(cfg.resolve(cfg.paths.database));adapter=MockAdapter()
     pipe=ReplyPipeline(cfg,db,FakeLLM(ReplyDecision(action='review',risk=RiskLevel.low,reply='咋，真想我了？',confidence=.9)))

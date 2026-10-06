@@ -66,6 +66,10 @@ class ContactProfile(BaseModel):
 
 
 class DraftRecord(BaseModel):
+    media_description: str=''
+    media_confidence: float=0
+    incoming_media_paths: list[str]=Field(default_factory=list)
+    original_type: str=''
     kind: str = "reply"
     sticker_id: str = ""
     source_context_ts: int | None = None

@@ -2,7 +2,7 @@
 from pathlib import Path
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
-import hashlib,io,re,json,os,uuid
+import hashlib,io,re,json,os,uuid,logging
 import httpx
 from PIL import Image
 
@@ -10,6 +10,15 @@ MAX_BYTES=2*1024*1024
 MAX_PIXELS=4096*4096
 MAX_FRAMES=240
 CACHE_VERSION=2
+
+
+class _HideMediaUrls(logging.Filter):
+    def filter(self,record):
+        message=record.getMessage()
+        return not ('HTTP Request:' in message and re.search(r'https?://[^ /]+\.(?:qq\.com|qpic\.cn)/',message))
+
+
+logging.getLogger('httpx').addFilter(_HideMediaUrls())
 
 
 def _atomic(path,data):
@@ -29,6 +38,7 @@ def _frames(data,digest,directory):
         if extension is None:raise ValueError('不支持的表情图片格式')
         count=getattr(image,'n_frames',1)
         if count>MAX_FRAMES:raise ValueError('表情动画帧数超出限制')
+        if image.width*image.height*count>64*1024*1024:raise ValueError('表情动画解码量超出限制')
         durations=[]
         for index in range(count):
             image.seek(index)

@@ -64,6 +64,14 @@ class StickerSettings(BaseModel):
     bootstrap_manifest: str = '.runtime/local_api/native_media/manifest.json'
 
 
+class MediaSettings(BaseModel):
+    voice_enabled: bool=False
+    images_enabled: bool=False
+    voice_model: str='.runtime/models/whisper-small-local'
+    max_voice_seconds: int=120
+    max_pending_voice: int=20
+
+
 class LocalAPISettings(BaseModel):
     auto_load: bool = False
     bootstrap_manifest: str = ".runtime/local_api/v2/manifest.json"
@@ -105,6 +113,7 @@ class AppConfig(BaseModel):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
     stickers: StickerSettings = Field(default_factory=StickerSettings)
+    media: MediaSettings = Field(default_factory=MediaSettings)
     local_api: LocalAPISettings = Field(default_factory=LocalAPISettings)
     web: WebSettings = Field(default_factory=WebSettings)
     paths: PathSettings = Field(default_factory=PathSettings)

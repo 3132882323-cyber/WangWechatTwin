@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from datetime import datetime,timezone
+import json
+from datetime import datetime,timezone,timedelta
 
 from app.adapters.base import MessageAdapter
 from app.config import AppConfig
@@ -39,7 +40,7 @@ class ReplyPipeline:
         from app.sticker_catalog import suggest
         entry=suggest(self.config,message.content)
         if not entry:return
-        today=datetime.now(timezone.utc).date().isoformat()
+        today=datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         state=self.db.get_state('sticker_suggestions') or {};key=message.contact+'|'+today
         if state.get(key,0)>=self.config.stickers.max_per_contact_per_day:return
         with self.db.connect() as connection:
@@ -174,7 +175,8 @@ class ReplyPipeline:
         inbound_id = self.db.add_incoming(message, risk=risk.level.value)
         vision_ready=(self.db.get_state('browser_bridge') or {}).get('build') in {'sticker-vision-v1','fast-sticker-v2'}
         recognized_sticker=message.message_type=='sticker' and 0<len(message.media_paths)<=3 and self.config.openai.provider=='web' and vision_ready
-        if message.message_type != "text" and not recognized_sticker:
+        recognized_image=message.message_type=='image' and 0<len(message.media_paths)<=3 and self.config.openai.provider=='web' and vision_ready
+        if message.message_type != "text" and not (recognized_sticker or recognized_image):
             decision = ReplyDecision(action="review", risk=RiskLevel.medium, reply="",
                                      reason="非文字内容尚未解析，需本人查看；不自动回复未知内容", confidence=0)
             draft_id = self.db.create_draft(message.contact, inbound_id, decision)
@@ -217,20 +219,32 @@ class ReplyPipeline:
                 decision = self._fallback(risk.level, risk.safe_holding_reply, str(exc))
 
         mode = self._mode(contact)
-        if recognized_sticker:
+        if recognized_sticker or recognized_image:
             if not decision.media_description or decision.media_confidence<.75:
-                decision.action='review';decision.reason+='；表情识别不确定，留审核'
+                decision.action='review';decision.reason+='；图片或表情识别不确定，留审核'
+                decision.facts_to_confirm.append('图片或表情的可见内容尚未可靠识别')
             else:
                 observed_risk=assess_risk(decision.media_description)
                 risk.level=self._max_risk(risk.level,observed_risk.level)
                 risk.reasons+=observed_risk.reasons
                 from app.chat_memory import remember
-                remember(self.config.resolve(self.config.paths.chat_memory),[('sticker:'+message.external_id,message.contact,'in',int(message.received_at.timestamp()),'表情包可见内容（非人物事实或承诺）：'+decision.media_description)])
+                caption_prefix='图片可见内容（非当前事实或承诺）：' if recognized_image else '表情包可见内容（非人物事实或承诺）：'
+                remember(self.config.resolve(self.config.paths.chat_memory),[('media:'+message.external_id,message.contact,'in',int(message.received_at.timestamp()),caption_prefix+decision.media_description)])
+            if recognized_image:
+                decision.action='review';decision.reason+='；普通图片回复先审核，不自动确认图片中的事实'
+                decision.facts_to_confirm.append('本人确认普通图片的可见内容和拟回复')
+        try:
+            media_origin=json.loads(message.raw_summary or '{}')
+            if media_origin.get('asr_uncertain'):
+                decision.action='review';decision.facts_to_confirm.append('语音听写含模糊内容或重要数字，需要核对原语音')
+                decision.reason+='；语音转写需要核对'
+        except ValueError:pass
         decision = self._apply_policy(decision, risk.level, mode, risk.safe_holding_reply)
         if (
             decision.risk == RiskLevel.low
             and decision.confidence >= 0.8
             and not decision.facts_to_confirm
+            and not (recognized_image or recognized_sticker)
         ):
             self.db.add_memories(
                 message.contact,

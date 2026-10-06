@@ -1,5 +1,7 @@
 from app.cli import merge_incoming_messages
 from app.models import IncomingMessage
+from app.db import Database
+import json
 
 
 def test_merge_burst_by_contact():
@@ -35,3 +37,19 @@ def test_group_burst_keeps_people_attribution_and_sticker_paths():
     assert result.sender=='群中多位成员'
     assert '甲：我答应' in result.content and '乙：表情' in result.content
     assert result.message_type=='sticker' and result.media_paths==['frame.png']
+
+
+def test_merged_voice_keeps_uncertainty_and_consumes_original_ids(tmp_path):
+    voice=IncomingMessage(external_id='voice',contact='peer',sender='peer',content='听写内容',raw_summary='{"original_type":"voice","asr_uncertain":true}')
+    text=IncomingMessage(external_id='text',contact='peer',sender='peer',content='你看看',raw_summary='{"local_id":9,"source":"messages"}')
+    merged=merge_incoming_messages([voice,text])[0]
+    assert json.loads(merged.raw_summary)['asr_uncertain'] is True
+    db=Database(tmp_path/'db.sqlite3');db.add_incoming(merged,'low')
+    assert db.seen('voice') and db.seen('text') and db.seen(merged.external_id)
+
+
+def test_picture_burst_has_visual_type_and_marks_truncated_input():
+    images=[IncomingMessage(external_id=str(index),contact='peer',sender='peer',content='图片',message_type='image',media_paths=[f'{index}-{j}.png' for j in range(3)]) for index in range(2)]
+    merged=merge_incoming_messages(images)[0]
+    assert merged.message_type=='image' and len(merged.media_paths)==3
+    assert json.loads(merged.raw_summary)['image_partial'] is True

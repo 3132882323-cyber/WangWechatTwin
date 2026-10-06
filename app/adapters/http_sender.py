@@ -82,6 +82,12 @@ class HistoryHTTPSender(MessageAdapter):
         self.allowed = set(config.wechat.sender_allowed_contacts)
         self.context, self.context_origin = {}, {}
         self.last_send_skip_reason = "本机微信接口尚未验证"
+        from app.media_voice import OfflineVoiceProcessor
+        self.voice_processor=OfflineVoiceProcessor(config,self.reader)
+        self.visual_processor=None
+        if config.media.images_enabled:
+            from app.media_visual import VisualMediaProcessor
+            self.visual_processor=VisualMediaProcessor(config,self.reader)
 
     def doctor(self):
         report = self.reader.doctor()
@@ -98,12 +104,21 @@ class HistoryHTTPSender(MessageAdapter):
 
     def poll(self):
         self.bootstrap.ensure()
-        messages = self.reader.poll()
+        messages = self.voice_processor.poll(self.reader.poll())
+        if self.visual_processor:messages=self.visual_processor.poll(messages)
         for message in messages:
+            if json.loads(message.raw_summary or '{}').get('transcription_source')=='offline_whisper':
+                from app.chat_memory import remember
+                remember(self.config.resolve(self.config.paths.chat_memory),[('voice:'+message.external_id,message.contact,'in',int(message.received_at.timestamp()),
+                    '语音自动听写（含糊词与重要数字需核实）：'+message.content,message.sender)])
             self.context[message.contact] = message.external_id
             if message.raw_summary:
                 self.context_origin[message.contact] = json.loads(message.raw_summary)
         return messages
+
+    def close(self):
+        self.voice_processor.close()
+        if self.visual_processor:self.visual_processor.close()
 
     def _eligible_contacts(self):
         system = {"filehelper", "weixin", "qqmail", "fmessage", "medianote", "newsapp", "notification_messages"}

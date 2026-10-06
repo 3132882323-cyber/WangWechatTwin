@@ -46,6 +46,11 @@ class Database:
                     risk TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS consumed_external_ids (
+                    external_id TEXT PRIMARY KEY,
+                    merged_into_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_messages_contact_time
                     ON messages(contact, created_at DESC);
 
@@ -109,24 +114,33 @@ class Database:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(drafts)")}
             for name, declaration in (("kind", "TEXT NOT NULL DEFAULT 'reply'"),
                                       ("sticker_id", "TEXT NOT NULL DEFAULT ''"),
+                                      ('media_description',"TEXT NOT NULL DEFAULT ''"),
+                                      ('media_confidence','REAL NOT NULL DEFAULT 0'),
                                       ("source_context_ts", "INTEGER")):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE drafts ADD COLUMN {name} {declaration}")
+            message_columns={row[1] for row in conn.execute('PRAGMA table_info(messages)')}
+            for name,declaration in [('media_paths',"TEXT NOT NULL DEFAULT '[]'"),('original_type',"TEXT NOT NULL DEFAULT ''")]:
+                if name not in message_columns:conn.execute(f'ALTER TABLE messages ADD COLUMN {name} {declaration}')
 
     def seen(self, external_id: str) -> bool:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM messages WHERE external_id=? LIMIT 1", (external_id,)
+                "SELECT 1 FROM messages WHERE external_id=? UNION ALL SELECT 1 FROM consumed_external_ids WHERE external_id=? LIMIT 1", (external_id,external_id)
             ).fetchone()
             return row is not None
 
     def add_incoming(self, message: IncomingMessage, risk: str | None = None) -> int:
+        try:origin=json.loads(message.raw_summary or '{}')
+        except ValueError:origin={}
+        if not isinstance(origin,dict):origin={}
         with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO messages
-                (external_id, contact, sender, direction, content, message_type, risk, created_at)
-                VALUES (?, ?, ?, 'in', ?, ?, ?, ?)
+                (external_id, contact, sender, direction, content, message_type, risk, created_at,media_paths,original_type)
+                VALUES (?, ?, ?, 'in', ?, ?, ?, ?,?,?)
                 """,
                 (
                     message.external_id,
@@ -136,14 +150,25 @@ class Database:
                     message.message_type,
                     risk,
                     message.received_at.isoformat(),
+                    json.dumps(message.media_paths[:3]),
+                    str(origin.get('original_type',''))[:20],
                 ),
             )
-            if cur.lastrowid:
-                return int(cur.lastrowid)
-            row = conn.execute(
-                "SELECT id FROM messages WHERE external_id=?", (message.external_id,)
-            ).fetchone()
-            return int(row["id"])
+            if cur.rowcount:
+                incoming_id=int(cur.lastrowid)
+            else:
+                row=conn.execute("SELECT id FROM messages WHERE external_id=?",(message.external_id,)).fetchone()
+                incoming_id=int(row['id'])
+            try:
+                origin=json.loads(message.raw_summary or '{}')
+                members=origin.get('member_external_ids',[]) if isinstance(origin,dict) else []
+                if not isinstance(members,list):members=[]
+                members=[key for key in members[:100] if isinstance(key,str) and 0<len(key)<=512]
+            except ValueError:members=[]
+            conn.executemany('INSERT OR IGNORE INTO consumed_external_ids(external_id,merged_into_id,created_at) VALUES(?,?,?)',
+                             [(key,incoming_id,message.received_at.isoformat()) for key in members])
+            conn.execute('COMMIT')
+            return incoming_id
 
     def add_outgoing(self, contact: str, content: str, risk: str | None = None) -> int:
         external_id = f"out:{contact}:{datetime.now(timezone.utc).timestamp()}"
@@ -214,8 +239,8 @@ class Database:
                 """
                 INSERT INTO drafts
                 (contact, inbound_message_id, reply, holding_reply, action, risk, reason,
-                 confidence, status, created_at, updated_at, kind, sticker_id, source_context_ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                 confidence, status, created_at, updated_at, kind, sticker_id, source_context_ts,media_description,media_confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?,?,?)
                 """,
                 (
                     contact,
@@ -231,13 +256,15 @@ class Database:
                     kind,
                     decision.sticker_id,
                     source_context_ts,
+                    decision.media_description,
+                    decision.media_confidence,
                 ),
             )
             return int(cur.lastrowid)
 
     def list_drafts(self, status: str | None = "pending", limit: int = 100) -> list[DraftRecord]:
         query = (
-            "SELECT d.*, m.content AS incoming_content "
+            "SELECT d.*, m.content AS incoming_content, m.media_paths AS incoming_media_paths,COALESCE(m.original_type,'') AS original_type "
             "FROM drafts d LEFT JOIN messages m ON m.id=d.inbound_message_id"
         )
         params: list[Any] = []
@@ -248,7 +275,14 @@ class Database:
         params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [DraftRecord.model_validate(dict(row)) for row in rows]
+        output=[]
+        for row in rows:
+            record=dict(row)
+            try:paths=json.loads(record['incoming_media_paths'] or '[]')
+            except (ValueError,TypeError):paths=[]
+            record['incoming_media_paths']=[path for path in paths[:3] if isinstance(path,str)] if isinstance(paths,list) else []
+            output.append(DraftRecord.model_validate(record))
+        return output
 
     def update_draft(
         self,

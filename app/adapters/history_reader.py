@@ -191,13 +191,14 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                             continue
                         columns = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
                         source_cols = "source,WCDB_CT_source" if "source" in columns else "NULL,NULL"
+                        packed_col='packed_info_data' if 'packed_info_data' in columns else 'NULL'
                         rows = conn.execute(
                             f'SELECT local_id,server_id,local_type,real_sender_id,create_time,message_content,'
-                            f'WCDB_CT_message_content,{source_cols} FROM "{table}" WHERE local_id>? ORDER BY local_id',
+                            f'WCDB_CT_message_content,{source_cols},{packed_col} FROM "{table}" WHERE local_id>? ORDER BY local_id',
                             (previous,))
                         rows = list(rows)
                         last_own_id = max((r[0] for r in rows if r[3] == own_id), default=previous)
-                        for local_id, server_id, typ, sender, ts, content, compression, source_text, source_compression in rows:
+                        for local_id, server_id, typ, sender, ts, content, compression, source_text, source_compression, packed_info in rows:
                             if new_table and ts < self.started_at:
                                 continue
                             if (typ & 0xffffffff) == 1:
@@ -232,14 +233,25 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                 3: "image", 34: "voice", 43: "video", 47: "sticker", 49: "attachment"
                             }.get(typ & 0xffffffff, "unknown")
                             media_paths=[];sticker_meta={}
+                            if msg_type=='image':
+                                from app.media_images import image_refs
+                                sticker_meta={'image_refs':image_refs(packed_info,content)}
                             if msg_type=='sticker':
                                 try:
-                                    from app.stickers import acquire
-                                    account_dirs={parent.parent for file_info in self.files.values()
-                                                  for parent in Path(file_info['source']).parents if parent.name=='db_storage'}
-                                    digest,media_paths,label=acquire(content,self.root,account_dirs)
-                                    sticker_meta={'sticker_md5':digest,'asset_verified':True}
-                                    content='[表情包]'+('\n'+label if label else '')
+                                    if self.config.adapter=='history_http_sender' and self.config.media.images_enabled:
+                                        from app.stickers import metadata
+                                        from xml.etree import ElementTree as ET
+                                        meta=metadata(content,require_url=False)
+                                        source=ET.Element('msg');ET.SubElement(source,'emoji',{'md5':meta['md5'],'cdnurl':meta['url'],'attachedtext':meta['label']})
+                                        sticker_meta={'sticker_md5':meta['md5'],'sticker_source':ET.tostring(source,encoding='unicode')}
+                                        content='[表情包]'
+                                    else:
+                                        from app.stickers import acquire
+                                        account_dirs={parent.parent for file_info in self.files.values()
+                                                      for parent in Path(file_info['source']).parents if parent.name=='db_storage'}
+                                        digest,media_paths,label=acquire(content,self.root,account_dirs)
+                                        sticker_meta={'sticker_md5':digest,'asset_verified':True}
+                                        content='[表情包]'+('\n'+label if label else '')
                                 except Exception as exc:
                                     sticker_meta={'sticker_error':type(exc).__name__}
                             if msg_type != "text":
@@ -255,7 +267,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                 display_name=self.names.get(contact, contact),
                                 chat_type="group" if contact.endswith("@chatroom") else "friend",
                                 received_at=datetime.fromtimestamp(ts, timezone.utc)))
-                            result[-1].raw_summary = json.dumps({"source": name, "local_id": local_id, "created_at": ts,**sticker_meta})
+                            result[-1].raw_summary = json.dumps({"source": name, "local_id": local_id, "server_id":server_id,"created_at": ts,**sticker_meta})
                         self.cursors[cursor_key] = high
                     self.signatures[name] = observed
                 finally:

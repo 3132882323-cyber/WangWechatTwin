@@ -72,6 +72,10 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
   await wait(()=>{const labels=document.body.textContent+' '+Array.from(document.querySelectorAll('[aria-label],[title],[alt]')).map(e=>e.getAttribute('aria-label')||e.getAttribute('title')||e.getAttribute('alt')).join(' ');return images.every(img=>labels.includes(img.name));});
  }
  composer.focus();document.execCommand('insertText',false,prompt);
+ composer.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'insertText',data:prompt}));
+ // Attachments enable Send before React/ProseMirror has synchronized the text.
+ // Let both DOM observation and UI state commit before clicking an enabled button.
+ await sleep();
  const normalized=s=>s.replace(/[\s\u200B]+/g,'');
  if(normalized(composer.textContent)!==normalized(prompt))throw Error('prompt not inserted');
  click(await wait(()=>{const e=find('button','发送');return e&&!e.disabled?e:null;}));

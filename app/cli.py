@@ -107,6 +107,21 @@ def merge_incoming_messages(messages: list[IncomingMessage]) -> list[IncomingMes
             continue
         identity = "|".join(item.external_id for item in items)
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+        origins=[]
+        for item in items:
+            try:origin=json.loads(item.raw_summary or '{}')
+            except ValueError:origin={}
+            origins.append(origin if isinstance(origin,dict) else {})
+        latest_index=max(range(len(items)),key=lambda index:items[index].received_at)
+        summary=dict(origins[latest_index])
+        summary.update(merged_count=len(items),member_external_ids=[item.external_id for item in items],
+                       asr_uncertain=any(origin.get('asr_uncertain') for origin in origins))
+        if any(origin.get('original_type')=='voice' for origin in origins):
+            summary.update(original_type='voice',transcription_source='offline_whisper')
+        all_paths=list(dict.fromkeys(path for item in items for path in item.media_paths))
+        summary['image_partial']=len(all_paths)>3 or any(origin.get('image_partial') for origin in origins)
+        types={item.message_type for item in items}
+        merged_type='text' if types=={'text'} else 'image' if types<= {'text','image','sticker'} and 'image' in types and all_paths else 'sticker' if types<= {'text','sticker'} and all_paths else 'mixed'
         merged.append(
             IncomingMessage(
                 external_id=f"merged:{digest}",
@@ -115,11 +130,11 @@ def merge_incoming_messages(messages: list[IncomingMessage]) -> list[IncomingMes
                 sender_key=items[-1].sender_key if len({m.sender_key or m.sender for m in items})==1 else '',
                 display_name=items[-1].display_name,
                 content="\n".join((item.sender+'：'+item.content) if item.chat_type=='group' else item.content for item in items if item.content.strip()),
-                media_paths=[path for item in items for path in item.media_paths],
-                message_type="text" if all(item.message_type == "text" for item in items) else ('sticker' if all(item.message_type in {'text','sticker'} for item in items) and any(item.media_paths for item in items) else 'mixed'),
+                media_paths=all_paths[:3],
+                message_type=merged_type,
                 chat_type=items[-1].chat_type,
                 received_at=max(item.received_at for item in items),
-                raw_summary=f"merged:{len(items)}",
+                raw_summary=json.dumps(summary),
             )
         )
     return merged

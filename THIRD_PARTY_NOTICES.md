@@ -27,3 +27,8 @@ under its publisher's terms; this repository does not grant a license to that
 driver. The project does not depend on paid `wxautox4` activation and does not
 include an activation bypass. OpenAI usage remains subject to the chosen account
 or API plan. WeChat is a third-party client, not supplied or endorsed here.
+# 媒体识别新增来源
+
+`app/media_images.py` 和 `app/media_voice.py` 的图片解码、媒体关联及 SILK 解码部分改编自 `ikevss/wechat-ai-memory`，MIT 许可证保存在 `licenses/WECHAT_AI_MEMORY_LICENSE.txt`。图片参数派生参考 `jiatj/wechatapi` 的 Apache-2.0 实现；本项目的准备脚本独立实现派生与双样本验证。
+
+可选依赖 `faster-whisper`、`silk-python`、`pycryptodome`、PyAV 及其依赖通过包管理器安装，不随仓库打包。下载的语音模型与用户音频、图片、密钥不进入公开源码。

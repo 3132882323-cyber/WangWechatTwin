@@ -1,0 +1,6 @@
+# Offline voice and WeChat image decoding (optional).
+faster-whisper==1.2.1
+# PyAV 19 removed metadata_errors; faster-whisper 1.2.1 requires the older API.
+av>=11,<16
+silk-python==0.2.8
+pycryptodome>=3.21,<4
