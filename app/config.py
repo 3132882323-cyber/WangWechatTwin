@@ -42,6 +42,14 @@ class MemorySettings(BaseModel):
     retain_message_days: int = 30
 
 
+class LocalAPISettings(BaseModel):
+    # This connector never falls back to GUI sending.
+    port: int = Field(default=30001, ge=1, le=65535)
+    token_file: str = ".runtime/local_api/token.txt"
+    timeout_seconds: float = Field(default=8, gt=0, le=60)
+    receipt_timeout_seconds: float = Field(default=12, gt=0, le=60)
+
+
 class WebSettings(BaseModel):
     enabled: bool = True
     host: str = "127.0.0.1"
@@ -66,11 +74,12 @@ class AppConfig(BaseModel):
     owner_identity_exclusions: list[str] = Field(default_factory=list)
     owner_name: str = "使用者"
     owner_alias: str = "本人"
-    adapter: Literal["wxauto", "mock", "history_readonly", "history_verified_sender"] = "wxauto"
+    adapter: Literal["wxauto", "mock", "history_readonly", "history_verified_sender", "history_http_sender"] = "wxauto"
     mode: Literal["shadow", "low_risk_auto", "full_auto", "off"] = "shadow"
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     wechat: WeChatSettings = Field(default_factory=WeChatSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    local_api: LocalAPISettings = Field(default_factory=LocalAPISettings)
     web: WebSettings = Field(default_factory=WebSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
     contacts: list[ContactProfile] = Field(default_factory=list)

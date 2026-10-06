@@ -133,6 +133,9 @@ def _load(args: argparse.Namespace) -> tuple[AppConfig, Database]:
 
 
 def _adapter(config: AppConfig, *, initialize: bool = True):
+    if config.adapter == "history_http_sender":
+        from app.adapters.http_sender import HistoryHTTPSender
+        return HistoryHTTPSender(config)
     if config.adapter == "history_verified_sender":
         from app.adapters.verified_sender import HistoryVerifiedSender
         return HistoryVerifiedSender(config)
