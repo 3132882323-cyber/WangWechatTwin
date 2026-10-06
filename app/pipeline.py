@@ -150,7 +150,7 @@ class ReplyPipeline:
         risk = assess_risk(message.content)
         inbound_id = self.db.add_incoming(message, risk=risk.level.value)
         vision_ready=(self.db.get_state('browser_bridge') or {}).get('build')=='sticker-vision-v1'
-        recognized_sticker=message.message_type=='sticker' and bool(message.media_paths) and self.config.openai.provider=='web' and vision_ready
+        recognized_sticker=message.message_type=='sticker' and 0<len(message.media_paths)<=3 and self.config.openai.provider=='web' and vision_ready
         if message.message_type != "text" and not recognized_sticker:
             decision = ReplyDecision(action="review", risk=RiskLevel.medium, reply="",
                                      reason="非文字内容尚未解析，需本人查看；不自动回复未知内容", confidence=0)

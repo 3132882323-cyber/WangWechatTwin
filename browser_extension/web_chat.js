@@ -36,8 +36,13 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  stage('model-menu');
  const work=Array.from(document.querySelectorAll('[role="radio"],input[type="radio"]')).filter(visible).find(e=>(e.getAttribute('aria-label')||e.textContent||'').trim()==='Work');
  if(work&& (work.getAttribute('aria-checked')==='true'||work.checked))throw Error('work mode');
- click(await wait(()=>find('button','选择 ChatGPT 模型')));
- const modelView=await wait(()=>find('[role="menuitem"]','选择模型'));click(modelView);
+ let modelView=null;
+ for(let attempt=0;attempt<8&&!modelView;attempt++){
+  const button=await wait(()=>find('button','选择 ChatGPT 模型'));click(button);
+  for(let tick=0;tick<5;tick++){await sleep();modelView=find('[role="menuitem"]','选择模型');if(modelView)break;}
+ }
+ if(!modelView)throw Error('model_menu_not_ready_before_input');
+ click(modelView);
  stage('model-choice');
  click(await wait(()=>find('[role="menuitemradio"]','GPT-5.6 Sol')));
  // Select Instant through the menu's documented keyboard interaction.
@@ -55,7 +60,7 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
   const transfer=new DataTransfer();
   for(const img of images){const bytes=Uint8Array.from(atob(img.data),c=>c.charCodeAt(0));transfer.items.add(new File([bytes],img.name,{type:img.mime}));}
   input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));
-  await wait(()=>images.every(img=>document.body.textContent.includes(img.name)));
+  await wait(()=>{const labels=document.body.textContent+' '+Array.from(document.querySelectorAll('[aria-label],[title],[alt]')).map(e=>e.getAttribute('aria-label')||e.getAttribute('title')||e.getAttribute('alt')).join(' ');return images.every(img=>labels.includes(img.name));});
  }
  composer.focus();document.execCommand('insertText',false,prompt);
  const normalized=s=>s.replace(/[\s\u200B]+/g,'');

@@ -129,7 +129,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                row = conn.execute("SELECT id,prompt,conversation_key,images FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY created LIMIT 1", (time.time(), int(paused))).fetchone()
+                row = conn.execute("SELECT id,prompt,conversation_key,images FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY is_test ASC,created LIMIT 1", (time.time(), int(paused))).fetchone()
                 if row:
                     conn.execute("UPDATE jobs SET status='claimed' WHERE id=?", (row[0],))
             return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0],'images':json.loads(row[3])} if row else None}
@@ -147,15 +147,19 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                     changed=conn.execute("UPDATE jobs SET status='failed',prompt='' WHERE id=? AND status='claimed'", (body['id'],)).rowcount
                 if changed != 1:
                     raise HTTPException(409,'任务已过期或已处理')
-                from app.browser_health import failed
-                failed(config,db,body.get('error'))
+                if test_row and test_row[0]:
+                    db.add_event('browser_test_error','独立浏览器验证失败；未暂停生产回复')
+                else:
+                    from app.browser_health import failed
+                    failed(config,db,body.get('error'))
                 return {'ok': True}
             try:
                 queue.complete(body['id'], body['result'],body.get('browser_meta'))
             except (ValueError, KeyError):
                 raise HTTPException(409, '任务或结果无效')
-            from app.browser_health import succeeded
-            succeeded(db)
+            if not (test_row and test_row[0]):
+                from app.browser_health import succeeded
+                succeeded(db)
             return {'ok': True}
 
     async def owner_action(request: Request) -> None:
