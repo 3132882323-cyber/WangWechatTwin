@@ -64,8 +64,9 @@ def make_sender(tmp_path, client):
 def test_actual_loopback_protocol_and_identity(local_server):
     client, calls, state, _ = local_server
     client.verify_owner("test-self")
-    client.submit("test-peer", "咋了")
-    assert calls[-1] == ("/SendTextMsg", {"wxidorgid": "test-peer", "msg": "咋了"})
+    client.submit("test-peer", "咋了", "test-self", "a" * 64)
+    assert calls[-1] == ("/SendTextMsg", {"wxidorgid": "test-peer", "msg": "咋了",
+                                        "expected_wxid": "test-self", "request_id": "a" * 64})
     state["owner"] = "wrong-account"
     with pytest.raises(LocalAPIError, match="账号"):
         client.verify_owner("test-self")
@@ -123,7 +124,7 @@ def test_unauthorized_and_send_rejection(local_server):
     client, calls, state, token_path = local_server
     state["send_ret"] = -1
     with pytest.raises(LocalAPIError, match="未接受"):
-        client.submit("test-peer", "咋了")
+        client.submit("test-peer", "咋了", "test-self", "a" * 64)
     token_path.write_text("z" * 40)
     with pytest.raises(LocalAPIError, match="401"):
         client.verify_owner("test-self")

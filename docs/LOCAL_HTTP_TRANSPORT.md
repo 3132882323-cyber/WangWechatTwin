@@ -9,9 +9,25 @@
 服务器必须监听 `127.0.0.1`，验证请求头 `Authorization: Bearer <token>`，并提供以下接口：
 
 - `POST /GetSelfProfile`：返回当前登录账号的 `wxid`。必须与本机已认证数据库的本人账号完全相同。
-- `POST /SendTextMsg`：接收 `{"wxidorgid":"目标微信ID","msg":"回复文字"}`。返回整数 `ret: 0` 仅表示请求接受，不能代替送达核验。
+- `POST /SendTextMsg`：接收 `wxidorgid`（目标微信ID）、`msg`（回复文字）、`expected_wxid`（已经核验的本人账号）和 `request_id`（64 字符十六进制发送尝试编号）。服务端应在同一发送锁内再次核对账号并拒绝重复编号。返回整数 `ret: 0` 仅表示请求接受，不能代替送达核验。
 
 此接口形式参考 https://github.com/aixed/WeChat-Hook 。上游当前公开源码面向微信 4.1.10.27；不能将旧偏移直接用于新版本。
+
+## 原生只读账号探针
+
+`app/native/account_probe.cpp` 与 `account_snapshot.h` 是本项目独立实现的 Windows 文件句柄探针，使用微软公开的进程快照和文件路径查询 API。它将微信进程实际打开的联系人数据库所属账号与本机已认证数据库的本人 ID 比较，不调用微信 GUI，不发送消息，不写入微信进程内存。输出只有匹配状态和统计数字，不打印账号 ID 或聊天正文。
+
+这不是官方微信登录状态接口；当前未找到唯一账号时拒绝绑定。基于 `xwechat_files/<账号>_<四位十六进制后缀>/db_storage/contact/contact.db` 的路径结构，目前仅有 Windows 微信 4.1.15.13 的本机核验。账号目录匹配必须与已有数据库认证一起使用，不能单独作为登录成功证明。
+
+在已配置 MSVC 和 Windows SDK 的开发终端可编译：
+
+```powershell
+cl /nologo /EHsc /std:c++17 /utf-8 /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 app/native/account_probe.cpp /Fe:account_probe.exe
+```
+
+运行参数为微信进程 PID 和仅保存本人 ID 的本机文本文件路径。此文件及探针输出中的实际运行日志均不应提交到 Git。
+
+参考：[PssCaptureSnapshot](https://learn.microsoft.com/en-us/windows/win32/api/processsnapshot/nf-processsnapshot-psscapturesnapshot)、[PSS_HANDLE_ENTRY](https://learn.microsoft.com/en-us/windows/win32/api/processsnapshot/ns-processsnapshot-pss_handle_entry)。原生只读探针通过不代表 Hook 发送 ABI 已经适配。
 
 ## 配置
 

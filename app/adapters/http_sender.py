@@ -64,8 +64,9 @@ class LocalHookClient:
         if not expected or profile.get("wxid") != expected:
             raise LocalAPIError("接口登录账号与已验证的聊天数据库不一致，停止发送")
 
-    def submit(self, contact, text):
-        result = self.post("/SendTextMsg", {"wxidorgid": contact, "msg": text})
+    def submit(self, contact, text, expected_owner, request_id):
+        result = self.post("/SendTextMsg", {"wxidorgid": contact, "msg": text,
+                                          "expected_wxid": expected_owner, "request_id": request_id})
         if type(result.get("ret")) is not int or result["ret"] != 0:
             raise LocalAPIError("本机微信接口未接受发送请求")
 
@@ -191,7 +192,7 @@ class HistoryHTTPSender(MessageAdapter):
         except FileExistsError:
             return self._skip("另一进程已申请发送，不重复发送")
         try:
-            self.client.submit(contact, text)
+            self.client.submit(contact, text, self.reader.self_username, token)
             deadline = time.monotonic() + self.config.local_api.receipt_timeout_seconds
             while time.monotonic() < deadline:
                 _, records, _ = self._outgoing_state(contact, text)
