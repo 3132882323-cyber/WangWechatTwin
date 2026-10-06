@@ -19,6 +19,10 @@ from app.adapters.base import MessageAdapter
 from app.models import IncomingMessage
 
 
+class SnapshotBusyError(RuntimeError):
+    """The source changed while copying; retry reading, never retry sending."""
+
+
 def wal_checksum(data, state=(0, 0), endian="<"):
     values = struct.unpack(endian + str(len(data) // 4) + "I", data)
     a, b = state
@@ -42,7 +46,7 @@ def authenticated_snapshot(info, directory):
     wal_source = Path(str(source) + "-wal")
     wal = wal_source.read_bytes() if wal_source.exists() else b""
     if signature(source) != before:
-        raise RuntimeError("微信记录正在更新，稍后重试读取")
+        raise SnapshotBusyError("微信记录正在更新，稍后重试读取")
     key, salt = bytes.fromhex(info["enc_key"]), bytes.fromhex(info["salt"])
     mac_key = hashlib.pbkdf2_hmac("sha512", key, bytes(v ^ 0x3a for v in salt), 2, dklen=32)
 

@@ -8,6 +8,7 @@ import pytest
 
 from app.adapters.http_sender import HistoryHTTPSender, LocalHookClient, LocalAPIError
 from app.config import AppConfig, LocalAPISettings
+from app.adapters.history_reader import SnapshotBusyError
 
 
 @pytest.fixture
@@ -91,6 +92,24 @@ def test_success_requires_new_server_ack(tmp_path, local_server):
     assert sender.send_text("test-peer", "咋了") is True
     claim = next((tmp_path / "send_claims").glob("*.json"))
     assert json.loads(claim.read_text())["status"] == "verified_sent"
+
+
+def test_busy_receipt_retries_read_without_resending(tmp_path, local_server):
+    client, calls, *_ = local_server
+    sender = make_sender(tmp_path, client)
+    sender.config.local_api.receipt_timeout_seconds = 2
+    count = 0
+    def state(*_):
+        nonlocal count
+        count += 1
+        if count == 1:
+            return {"shard": 10}, [], {}
+        if count == 2:
+            raise SnapshotBusyError("database updating")
+        return {"shard": 11}, [("shard", 11, True)], {}
+    sender._outgoing_state = state
+    assert sender.send_text("test-peer", "咋了") is True
+    assert sum(path == "/SendTextMsg" for path, _ in calls) == 1
 
 
 @pytest.mark.parametrize("guard", ["paused", "draft", "manual_reply", "no_context", "risk", "wrong_owner"])

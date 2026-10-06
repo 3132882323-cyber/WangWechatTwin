@@ -9,8 +9,15 @@ WeChat client, hosted AI models, or external SDKs.
 | --- | --- | --- |
 | [wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) | MIT | `scripts/wcdb_readonly.py`, `app/adapters/history_crypto.py` |
 | [wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica) | Apache-2.0 | selected compatibility helpers in `app/adapters/accessibility_bridge.py` |
+| [cpp-httplib 0.12.6](https://github.com/yhirose/cpp-httplib) | MIT | `native_transport/deps/httplib.h` and license text |
+| [JSON for Modern C++ 3.11.3](https://github.com/nlohmann/json) | MIT | `native_transport/deps/json.hpp` and license text |
 
 Original license texts and modification notes are included. See `NOTICE`.
+
+`native_transport/bridge.cpp` is this project's original native transport using
+authorized runtime layout observations and Windows public APIs. It does not
+redistribute the researched WeChat-Hook implementation or its binary. The
+transport does not use MinHook, GUI automation, recall patches or license bypass.
 
 ## External dependencies
 

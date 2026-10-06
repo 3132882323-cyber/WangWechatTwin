@@ -18,7 +18,7 @@ from pathlib import Path
 import zstandard
 
 from app.adapters.base import MessageAdapter
-from app.adapters.history_reader import HistoryReadOnlyAdapter, authenticated_snapshot
+from app.adapters.history_reader import HistoryReadOnlyAdapter, authenticated_snapshot, SnapshotBusyError
 from app.models import RiskLevel
 from app.risk import assess_risk
 
@@ -76,6 +76,8 @@ class HistoryHTTPSender(MessageAdapter):
         self.config = config
         self.reader = HistoryReadOnlyAdapter(config)
         self.client = LocalHookClient(config.local_api, config.resolve(config.local_api.token_file))
+        from app.adapters.native_bootstrap import NativeBootstrap
+        self.bootstrap = NativeBootstrap(config, self.reader)
         self.allowed = set(config.wechat.sender_allowed_contacts)
         self.context, self.context_origin = {}, {}
         self.last_send_skip_reason = "本机微信接口尚未验证"
@@ -94,6 +96,7 @@ class HistoryHTTPSender(MessageAdapter):
         return report
 
     def poll(self):
+        self.bootstrap.ensure()
         messages = self.reader.poll()
         for message in messages:
             self.context[message.contact] = message.external_id
@@ -150,6 +153,15 @@ class HistoryHTTPSender(MessageAdapter):
         self.last_send_skip_reason = reason
         return False
 
+    def _stable_outgoing_state(self, contact, text, deadline):
+        while True:
+            try:
+                return self._outgoing_state(contact, text)
+            except SnapshotBusyError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.2)
+
     def send_text(self, contact, text):
         if self.config.wechat.sender_all_existing_chats:
             self.allowed.update(self._eligible_contacts())
@@ -176,11 +188,13 @@ class HistoryHTTPSender(MessageAdapter):
         marker = claims / (token + ".json")
         if marker.exists():
             return self._skip("已有发送尝试记录，不重复发送")
-        before, _, own_watermarks = self._outgoing_state(contact, text)
+        before, _, own_watermarks = self._stable_outgoing_state(contact, text, time.monotonic() + 3)
         if not manual and any(local_id > origin["local_id"] if rel == origin["source"]
                               else ts > origin["created_at"]
                               for rel, (local_id, ts) in own_watermarks.items()):
             return self._skip("生成期间本人已回复，取消旧回复")
+        if hasattr(self, "bootstrap"):
+            self.bootstrap.ensure()
         self.client.verify_owner(self.reader.self_username)
         if self.config.resolve(self.config.paths.pause_file).exists():
             return self._skip("后台已暂停")
@@ -188,14 +202,18 @@ class HistoryHTTPSender(MessageAdapter):
             return self._skip("该会话已有本人输入草稿，保留编辑现场")
         try:
             with marker.open("x", encoding="utf-8") as claim:
-                json.dump({"status": "attempting", "transport": "http"}, claim)
+                json.dump({"status": "attempting", "transport": "http", "before": before,
+                           "created_at": time.time()}, claim)
         except FileExistsError:
             return self._skip("另一进程已申请发送，不重复发送")
         try:
             self.client.submit(contact, text, self.reader.self_username, token)
             deadline = time.monotonic() + self.config.local_api.receipt_timeout_seconds
             while time.monotonic() < deadline:
-                _, records, _ = self._outgoing_state(contact, text)
+                try:
+                    _, records, _ = self._stable_outgoing_state(contact, text, deadline)
+                except SnapshotBusyError:
+                    break
                 if any(local_id > before.get(rel, 0) and acknowledged for rel, local_id, acknowledged in records):
                     marker.write_text('{"status":"verified_sent","transport":"http"}', encoding="utf-8")
                     self.last_send_skip_reason = ""

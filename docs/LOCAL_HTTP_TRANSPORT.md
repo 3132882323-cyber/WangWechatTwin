@@ -2,7 +2,7 @@
 
 `history_http_sender` 在项目中提供另一种收发连接：使用已认证的本机微信数据库读取新消息，通过本机 HTTP 端口提交回复，并再次读取微信数据库核对新的服务器确认记录。它不打开微信窗口，不搜索会话，不使用键盘、鼠标或 GUI SDK 发送，也不会回退到 GUI 连接。
 
-这不是完整的微信 Hook 实现。**本仓库目前不提供已经适配微信 4.1.15.13 的 Hook DLL，尚未通过该版本真实 HTTP 收发验收。** 仅有本地 HTTP 测试通过，不能视为微信发送成功。
+本仓库包含独立实现的原生 HTTP 连接源码 `native_transport/bridge.cpp`。Windows 微信 4.1.15.13 已通过真实新消息、网页模型生成、HTTP 自动发送及服务器记录确认验收。它不使用窗口操作、MinHook、防撤回补丁或付费功能绕过。客户端仍须保持登录并运行，可以最小化。当前严格绑定已核验 DLL 的 SHA256；微信升级后停止加载，不回退到 GUI。
 
 ## 外部服务协议
 
@@ -11,7 +11,7 @@
 - `POST /GetSelfProfile`：返回当前登录账号的 `wxid`。必须与本机已认证数据库的本人账号完全相同。
 - `POST /SendTextMsg`：接收 `wxidorgid`（目标微信ID）、`msg`（回复文字）、`expected_wxid`（已经核验的本人账号）和 `request_id`（64 字符十六进制发送尝试编号）。服务端应在同一发送锁内再次核对账号并拒绝重复编号。返回整数 `ret: 0` 仅表示请求接受，不能代替送达核验。
 
-此接口形式参考 https://github.com/aixed/WeChat-Hook 。上游当前公开源码面向微信 4.1.10.27；不能将旧偏移直接用于新版本。
+接口命名兼容研究过的本机 HTTP 服务。本项目最终使用独立原生实现；不分发未明确授权的研究仓库源码或 DLL。发送偏移、消息结构和回调布局来自本机已授权诊断，不能移植旧版偏移或简单修改版本号。
 
 ## 原生只读账号探针
 
@@ -37,7 +37,9 @@ cl /nologo /EHsc /std:c++17 /utf-8 /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 app/nat
 adapter: history_http_sender
 mode: shadow
 local_api:
-  port: 30001
+  port: 30003
+  auto_load: true
+  bootstrap_manifest: .runtime/local_api/native/manifest.json
   token_file: .runtime/local_api/token.txt
   timeout_seconds: 8
   receipt_timeout_seconds: 12
@@ -58,3 +60,14 @@ local_api:
 `tests/test_http_sender.py` 包括真实本机回环 HTTP 服务的协议测试；送达记录为受控测试数据。测试涵盖账号不匹配、认证失败、接口拒绝、人工草稿、暂停、本人后续回复、上下文缺失、重要承诺、未知结果不重试，以及旧记录不作为新发送证据。
 
 这组测试没有向真实微信联系人发送消息。
+
+
+## 原生连接构建与恢复
+
+运行 `native_transport/build.ps1` 构建本项目的 DLL 和只读账号探针。源码、依赖及许可证均包含在仓库内；C++ 编译工具和 Windows SDK 由微软官方安装器提供。
+
+本机安装目录内需保留 DLL、探针、token.txt、port.txt、ALLOW_SEND，以及包含 DLL/探针哈希、已验证客户端哈希和安装路径的 manifest.json。它们都是本机配置，不随 Git 发布。不要复制其他人的清单或聊天配置。
+
+开启 auto_load 后，后台每隔五秒检查本机端口；连接缺失时仅向匹配进程路径、DLL 哈希和已认证账号的微信主进程加载已验证模块。加载结果未知时不自动重复加载。新登录仍由用户完成；不处理登录、安全软件或验证码界面。
+
+实际验收分别完成了网页模型生成的“哈哈我来找你聊两句 → 聊啥”和最终独立原生连接的“在吗 → 咋了”。发送前后均有真实微信记录核验，源代码测试不作为发送成功证明。消息来源按秒记录且可能与本机时钟略有差异，因此不以跨时钟负时间差作提速指标。

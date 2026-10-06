@@ -43,6 +43,8 @@ class MemorySettings(BaseModel):
 
 
 class LocalAPISettings(BaseModel):
+    auto_load: bool = False
+    bootstrap_manifest: str = ".runtime/local_api/native/manifest.json"
     # This connector never falls back to GUI sending.
     port: int = Field(default=30001, ge=1, le=65535)
     token_file: str = ".runtime/local_api/token.txt"
