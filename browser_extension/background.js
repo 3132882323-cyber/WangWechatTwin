@@ -37,27 +37,28 @@ async function loadTab(id,expectedUrl,oldOrigin){
  }
  throw Error('load');
 }
-chrome.alarms.onAlarm.addListener(async()=>{
+async function pump(){
  if(busy)return;
  const {token}=await chrome.storage.local.get('token');if(!token)return;
  const {bridgeLease}=await chrome.storage.session.get('bridgeLease');if(bridgeLease?.until>Date.now())return;
  await chrome.storage.local.set({bridgeWorkerVersion:4});
  busy=true;let job=null,pool=null,stage='queue';
- const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4','X-Wechat-Bridge-Build':'sticker-vision-v1'};
+ const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4','X-Wechat-Bridge-Build':'fast-sticker-v2'};
  try{
   const r=await fetch(base+'/next',{headers});if(!r.ok)throw Error('bridge');
   job=(await r.json()).job;if(!job)return;
+  const bridgeStarted=Date.now();const queueWait=Math.max(0,Math.round(bridgeStarted-job.created*1000));
   await chrome.storage.session.set({bridgeLease:{id:job.id,until:Date.now()+240000}});
   pool=await acquire(job.conversation_key||'isolated:'+job.id);stage='load';await loadTab(pool.slot.tabId,pool.slot.url,pool.slot.navigationOriginBefore);
   stage='setup';await chrome.scripting.executeScript({target:{tabId:pool.slot.tabId},files:['web_chat.js']});
-  stage='reply';
+  stage='reply';const replyStarted=Date.now();
   const reply=await chrome.scripting.executeScript({target:{tabId:pool.slot.tabId},func:async(prompt,key,reused,images)=>await window.wechatWebReply(prompt,key,reused,images),args:[job.prompt,pool.slot.key,pool.reused,job.images||[]]});
   const result=reply[0]?.result;if(!result)throw Error('empty');
   const tab=await chrome.tabs.get(pool.slot.tabId);if(!WechatPool.validUrl(tab.url))throw Error('ownership');
   pool.slot.turns+=1;pool.slot.url=tab.url;pool.slot.used=Date.now();pool.slot.failed=false;await store(pool.slots);
   const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(tab.url));
   const fingerprint=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');
-  const browser_meta={tab_id:tab.id,slot_id:pool.slot.slotId,turn:pool.slot.turns,reused:pool.reused,managed_tabs:pool.slots.length,conversation_fingerprint:fingerprint};
+  const browser_meta={tab_id:tab.id,slot_id:pool.slot.slotId,turn:pool.slot.turns,reused:pool.reused,managed_tabs:pool.slots.length,conversation_fingerprint:fingerprint,queue_wait_ms:queueWait,web_reply_ms:Date.now()-replyStarted,bridge_total_ms:Date.now()-bridgeStarted};
   stage='complete';const sent=await fetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,result,browser_meta})});if(!sent.ok)throw Error('result rejected');
  }catch(e){
   if(pool){try{const t=await chrome.tabs.get(pool.slot.tabId);if(/outside_turn|user_editing|ownership_lost/.test(String(e.message))){pool.slots=pool.slots.filter(s=>s.tabId!==pool.slot.tabId);}else{pool.slot.url=t.url;pool.slot.failed=true;}await store(pool.slots);}catch{}}
@@ -66,4 +67,15 @@ chrome.alarms.onAlarm.addListener(async()=>{
   if(job)await chrome.storage.session.remove('bridgeLease');busy=false;
   // Keep owned tabs and their current conversations. Never close/create per reply.
  }
-});
+}
+chrome.alarms.onAlarm.addListener(()=>{connectPush();pump();});
+let pushSocket=null;
+async function connectPush(){
+ if(pushSocket)return;const {token}=await chrome.storage.local.get('token');if(!token)return;
+ const socket=new WebSocket('ws://127.0.0.1:18769/browser-bridge/events');pushSocket=socket;
+ socket.onopen=()=>{socket.send(JSON.stringify({token}));pump();};
+ socket.onmessage=e=>{try{if(JSON.parse(e.data).type==='ready')pump();}catch{}};
+ socket.onclose=()=>{pushSocket=null;setTimeout(connectPush,2000);};
+ socket.onerror=()=>socket.close();
+}
+connectPush();

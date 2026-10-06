@@ -6,10 +6,11 @@ import secrets
 from datetime import datetime, timezone, timedelta
 import threading
 import time
+import asyncio
 from urllib.parse import parse_qs
 
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.config import AppConfig
@@ -116,6 +117,26 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             token_path.write_text(secrets.token_urlsafe(48), encoding='utf-8')
         bridge_token = token_path.read_text(encoding='utf-8').strip()
 
+        @app.websocket('/browser-bridge/events')
+        async def browser_events(socket: WebSocket):
+            await socket.accept()
+            try:
+                auth=await asyncio.wait_for(socket.receive_json(),timeout=5)
+                if not secrets.compare_digest(str(auth.get('token','')),bridge_token):
+                    await socket.close(code=1008);return
+                pulse=0;notified=0
+                while True:
+                    now=time.time();paused=config.resolve(config.paths.pause_file).exists()
+                    with queue.connect() as conn:
+                        pending=conn.execute("SELECT 1 FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) LIMIT 1",(now,int(paused))).fetchone()
+                    if pending and now-notified>=.5:
+                        await socket.send_json({'type':'ready'});notified=now;pulse=now
+                    elif now-pulse>=20:
+                        await socket.send_json({'type':'heartbeat'});pulse=now
+                    await asyncio.sleep(.25)
+            except (WebSocketDisconnect, asyncio.TimeoutError, RuntimeError):
+                return
+
         def bridge_auth(request):
             supplied = request.headers.get('authorization', '')
             if not secrets.compare_digest(supplied, 'Bearer ' + bridge_token):
@@ -129,10 +150,10 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                row = conn.execute("SELECT id,prompt,conversation_key,images FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY is_test ASC,created LIMIT 1", (time.time(), int(paused))).fetchone()
+                row = conn.execute("SELECT id,prompt,conversation_key,images,created FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY is_test ASC,created LIMIT 1", (time.time(), int(paused))).fetchone()
                 if row:
                     conn.execute("UPDATE jobs SET status='claimed' WHERE id=?", (row[0],))
-            return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0],'images':json.loads(row[3])} if row else None}
+            return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0],'images':json.loads(row[3]),'created':row[4]} if row else None}
 
         @app.post('/browser-bridge/result')
         async def browser_result(request: Request):

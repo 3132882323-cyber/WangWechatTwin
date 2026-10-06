@@ -82,7 +82,7 @@ class WebReplyLLM:
 
     def complete(self, job_id, result, browser_meta=None):
         parsed = ReplyDecision.model_validate_json(result)
-        allowed = {'tab_id','slot_id','turn','reused','managed_tabs','conversation_fingerprint'}
+        allowed = {'tab_id','slot_id','turn','reused','managed_tabs','conversation_fingerprint','queue_wait_ms','web_reply_ms','bridge_total_ms'}
         meta = {k:v for k,v in (browser_meta or {}).items() if k in allowed and isinstance(v,(int,str,bool))}
         with self.connect() as db:
             updated = db.execute("UPDATE jobs SET status='done',result=?,browser_meta=? WHERE id=? AND status IN ('pending','claimed') AND expires>?",

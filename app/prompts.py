@@ -60,6 +60,7 @@ class PromptBuilder:
 16. 情绪、玩笑和亲疏语气参考本人在当前会话里的近期明确表达。旧的发火、亲密或自嘲不等于今天仍如此；情境标签只是检索辅助，理解原文优先。
 17. 对方谈到本人的喜好、感受、意愿或个人选择时，先找本人近期的明确自述。没有依据，不用“一般人会怎样”代替本人，也不顺着建议擅自说我去、我答应、我愿意；必要时生成待审核草稿并列出需要本人确认的立场。
 18. 身份严格分开：本人是{self.config.owner_name}，明确不是本人身份的名称为{json.dumps(self.config.owner_identity_exclusions,ensure_ascii=False)}。联系人说的“我”指联系人，转述/引用中的第一人称指原说话人。不能把他人的公司、职业、经历和偏好移植到本人。
+19. 普通低风险闲聊、玩笑、表情、问候，允许直接用本人语气回应或轻微追问。比如问“啥愿望”不等于本人答应愿望，不需要先确认本人感情；不能仅因缺少情绪或喜好背景就把安全追问留审核。facts_to_confirm 只列这条回复实际必须由本人确认的事实，不列无关背景。
 
 以下是本人风格：
 {self.persona}
@@ -131,7 +132,8 @@ class PromptBuilder:
         except ValueError:
             pass
         from app.chat_memory import retrieve
-        payload["historical_conversation_memory"] = retrieve(self.config.resolve(self.config.paths.chat_memory), message.contact, message.content,as_of=int(message.received_at.timestamp()))
+        fast_social=message.message_type=='text' and bool(re.fullmatch(r'(?:你好|您好|在吗|在不|哈+|nb|牛|兄弟|OK|ok|好+|收到|对|嗯+)[。.!！?？\s]*',message.content,re.I))
+        payload["historical_conversation_memory"] = retrieve(self.config.resolve(self.config.paths.chat_memory), message.contact, message.content,limit=8 if fast_social else 18,max_chars=1800 if fast_social else 7000,as_of=int(message.received_at.timestamp()))
         payload["historical_memory_rule"] = "这些记录只属于当前联系人，带有历史日期。过去的价格、承诺、进度和安排不代表现在仍有效；有冲突或缺少当前依据时转审核。"
         if message.message_type=='sticker':
             payload['sticker_rule']='观察附图文字/动作/表情，用 media_description 简要记录可见内容，给 media_confidence。仅按本轮上下文解释玩笑、赞同或反讽，不识别人脸身份，不把表情当作对价格/合同/感情的明确同意。看不清转审核。'

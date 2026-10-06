@@ -17,6 +17,21 @@ class FakeLLM:
         return self.decision.model_copy(deep=True)
 
 
+def test_safe_social_question_not_blocked_as_missing_personal_feelings(tmp_path):
+    cfg=make_config(tmp_path,'low_risk_auto');db=Database(cfg.resolve(cfg.paths.database));adapter=MockAdapter()
+    pipe=ReplyPipeline(cfg,db,FakeLLM(ReplyDecision(action='review',risk=RiskLevel.low,reply='咋，真想我了？',confidence=.9)))
+    result=pipe.process(IncomingMessage(external_id='social',contact='张三',sender='张三',content='想你了'),adapter)
+    assert result.status=='sent'
+
+
+def test_social_ack_does_not_override_payment_review(tmp_path):
+    cfg=make_config(tmp_path,'low_risk_auto');db=Database(cfg.resolve(cfg.paths.database));adapter=MockAdapter()
+    cfg.wechat.send_holding_on_review=False
+    pipe=ReplyPipeline(cfg,db,FakeLLM(ReplyDecision(action='review',risk=RiskLevel.low,reply='好好好',confidence=.99)))
+    result=pipe.process(IncomingMessage(external_id='money-social',contact='张三',sender='张三',content='把付款账户发我'),adapter)
+    assert result.status!='sent' and not adapter.sent
+
+
 def test_shadow_blocks_contact_override_and_approved_send(tmp_path: Path):
     cfg = make_config(tmp_path, "shadow")
     cfg.contacts[0].mode = "full_auto"
@@ -39,8 +54,6 @@ def make_config(tmp_path: Path, mode: str):
     root = Path(__file__).resolve().parents[1]
     raw = yaml.safe_load((root / "config.example.yaml").read_text(encoding="utf-8"))
     raw["mode"] = mode
-    if mode == "full_auto":
-        raw["wechat"]["send_holding_on_review"] = True
     raw["adapter"] = "mock"
     raw["paths"]["database"] = str(tmp_path / "db.sqlite3")
     raw["paths"]["persona"] = str(root / "data/persona.md")

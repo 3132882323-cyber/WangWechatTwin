@@ -254,16 +254,21 @@ class HistoryVerifiedSender(MessageAdapter):
         return False
 
     def send_text(self, contact, text):
+        self.last_send_skip_reason='微信发送结果未确认'
         if self.config.wechat.sender_all_existing_chats:
             self.allowed.update(self._eligible_contacts())
         if self.config.mode in {"shadow", "off"} or contact not in self.allowed:
+            self.last_send_skip_reason='当前发送模式或联系人范围不允许自动发送'
             return False
         if self.config.resolve(self.config.paths.pause_file).exists():
+            self.last_send_skip_reason='后台已暂停'
             return False
         manual = getattr(self, "manual_approval_in_progress", False)
         if not text.strip() or (not manual and assess_risk(text).level != RiskLevel.low):
+            self.last_send_skip_reason='回复为空或内容风险需要审核'
             return False
         if not manual and self._has_saved_human_draft(contact):
+            self.last_send_skip_reason='该会话已有本人输入草稿，保护你的编辑'
             return False
         context = self.context.get(contact, "manual")
         token = hashlib.sha256((contact + "|" + context + "|" + text).encode()).hexdigest()
@@ -271,12 +276,14 @@ class HistoryVerifiedSender(MessageAdapter):
         claims.mkdir(exist_ok=True)
         marker = claims / (token + ".json")
         if marker.exists():
+            self.last_send_skip_reason='该回复已有发送尝试记录，不重复发送'
             return False
         before, _, own_watermarks = self._outgoing_state(contact, text)
         origin = getattr(self, "context_origin", {}).get(contact)
         if not manual and origin and any(
                 local_id > origin["local_id"] if rel == origin["source"] else ts > origin["created_at"]
                 for rel, (local_id, ts) in own_watermarks.items()):
+            self.last_send_skip_reason='生成期间本人已有后续回复，避免重复或回复旧上下文'
             return False  # The owner answered while the model was thinking.
         self.reader._load_names()
         name = self.reader.names.get(contact)
@@ -285,7 +292,7 @@ class HistoryVerifiedSender(MessageAdapter):
         self.check_sender_connection()
         self.wx.ChatWith(name, exact=True)
         current_name = None
-        for _ in range(8):
+        for _ in range(24):
             current_name = (self.wx.ChatInfo() or {}).get('chat_name')
             if current_name == name:
                 break
@@ -293,14 +300,22 @@ class HistoryVerifiedSender(MessageAdapter):
         if current_name != name:
             raise RuntimeError("当前会话与授权联系人不一致，停止发送")
         if self.config.resolve(self.config.paths.pause_file).exists():
+            self.last_send_skip_reason='后台已暂停'
             return False
         if not manual and self._has_saved_human_draft(contact):
+            self.last_send_skip_reason='该会话已有本人输入草稿，保护你的编辑'
             return False
         # Claim exclusively before GUI action: unknown outcomes must not be retried.
         with marker.open("x", encoding="utf-8") as claim:
             json.dump({"status": "attempting"}, claim)
         try:
-            self.wx.SendMsg(msg=text, who=name, clear=True, exact=True)
+            # The selected chat has already been verified. Passing who again
+            # triggers a second SDK search/switch and can race the UI.
+            if (self.wx.ChatInfo() or {}).get('chat_name') != name:
+                marker.write_text('{"status":"cancelled_before_send"}',encoding='utf-8')
+                self.last_send_skip_reason='发送前会话发生变化，未发送'
+                return False
+            self.wx.SendMsg(msg=text, clear=True)
             for _ in range(12):
                 _, records, _ = self._outgoing_state(contact, text)
                 if any(local_id > before.get(rel, 0) and acknowledged for rel, local_id, acknowledged in records):

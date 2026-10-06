@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "微信分身专用网页连接",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "permissions": [
     "alarms",
     "storage",
@@ -17,5 +17,6 @@
   "options_page": "options.html",
   "action": {
     "default_title": "配置微信网页连接"
-  }
+  },
+  "minimum_chrome_version": "116"
 }

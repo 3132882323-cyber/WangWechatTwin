@@ -36,6 +36,9 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  stage('model-menu');
  const work=Array.from(document.querySelectorAll('[role="radio"],input[type="radio"]')).filter(visible).find(e=>(e.getAttribute('aria-label')||e.textContent||'').trim()==='Work');
  if(work&& (work.getAttribute('aria-checked')==='true'||work.checked))throw Error('work mode');
+ const modelButton=find('button','选择 ChatGPT 模型');
+ const cachedModel=reused&&root.dataset.wechatBridgeModel==='gpt56-instant'&&modelButton?.textContent.includes('Instant');
+ if(!cachedModel){
  let modelView=null;
  for(let attempt=0;attempt<8&&!modelView;attempt++){
   const button=await wait(()=>find('button','选择 ChatGPT 模型'));click(button);
@@ -51,6 +54,12 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  for(let i=0;i<5;i++){effort.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',code:'ArrowLeft',bubbles:true}));await sleep();}
  if(!Array.from(document.querySelectorAll('[role="menu"]')).some(e=>visible(e)&&e.textContent.includes('Instant')))throw Error('Instant not verified');
  click(await wait(()=>find('button','选择 ChatGPT 模型')));
+ root.dataset.wechatBridgeModel='gpt56-instant';
+ if(!window.wechatModelWatch){
+  window.wechatModelWatch=true;
+  document.addEventListener('pointerdown',e=>{if(e.isTrusted&&e.target.closest('button[aria-label="选择 ChatGPT 模型"]'))root.dataset.wechatBridgeModel='';},true);
+ }
+ }
  stage('composer');
  const composer=await wait(()=>Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"][aria-label="询问 ChatGPT"]')).find(visible));
  if(composer.textContent.trim()||find('button','停止'))throw Error('user_editing_before_input');
@@ -70,12 +79,11 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  // Never return the previous turn's answer, including identical wording.
  const node=await wait(()=>{if(find('button','停止'))return null;const e=assistants().at(-1);const id=e&&identity(e);return id&&!previousReplies.has(id)&&(e.innerText||'').trim()?e:null;});
  const response=node.querySelector(':scope > div')?.innerText||node.innerText;
- const cleaned=response.trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'');JSON.parse(cleaned);return cleaned;
+ const cleaned=response.trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'');JSON.parse(cleaned);
+ root.dataset.wechatBridgeLastReply=identity(node);return cleaned;
 };
 window.wechatWebReply=async function(prompt,key,reused,images){
  try{const result=await window.wechatWebReplyInner(prompt,key,reused,images);
-  const nodes=Array.from(document.querySelectorAll('[data-message-author-role="assistant"],[data-content-search-unit-key$=":assistant"]'));const e=nodes.at(-1);
-  document.documentElement.dataset.wechatBridgeLastReply=e&&(e.getAttribute('data-chatgpt-search-message-ids')||e.getAttribute('data-message-id')||e.getAttribute('data-content-search-unit-key'));
   return result;
  }catch(e){
   console.error('WeChatWebBridge: '+e.message);

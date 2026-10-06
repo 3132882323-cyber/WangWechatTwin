@@ -233,7 +233,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                     from app.stickers import acquire
                                     digest,media_paths,label=acquire(content,self.root)
                                     sticker_meta={'sticker_md5':digest,'asset_verified':True}
-                                    content='对方发来表情包。'+('消息附带文字：'+label if label else '请根据已附图片和当前聊天理解，不能猜测人物身份或把表情当作承诺。')
+                                    content='[表情包]'+('\n'+label if label else '')
                                 except Exception as exc:
                                     sticker_meta={'sticker_error':type(exc).__name__}
                             if msg_type != "text":
