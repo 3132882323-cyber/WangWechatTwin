@@ -13,6 +13,7 @@ import json
 import sqlite3
 import tempfile
 import time
+from xml.etree import ElementTree as ET
 from pathlib import Path
 
 import zstandard
@@ -127,13 +128,19 @@ class HistoryHTTPSender(MessageAdapter):
                     own = conn.execute(f'SELECT local_id,create_time FROM "{table}" WHERE real_sender_id=? ORDER BY local_id DESC LIMIT 1', (own_id,)).fetchone()
                     if own:
                         own_watermarks[rel] = own
-                    for local_id, server_id, content, compression in conn.execute(
-                            f'SELECT local_id,server_id,message_content,WCDB_CT_message_content FROM "{table}" '
+                    for local_id, server_id, content, compression, message_type in conn.execute(
+                            f'SELECT local_id,server_id,message_content,WCDB_CT_message_content,local_type FROM "{table}" '
                             'WHERE real_sender_id=? ORDER BY local_id DESC LIMIT 12', (own_id,)):
                         if isinstance(content, bytes):
                             content = (zstandard.ZstdDecompressor().decompress(content, max_output_size=8*1024*1024)
                                        if compression else content).decode("utf-8")
-                        if content == text:
+                        matches=content==text
+                        if isinstance(text,dict) and message_type==3:
+                            try:
+                                node=ET.fromstring(content[content.index('<msg'):]).find('img')
+                                matches=node is not None and text['md5'] in [value for key,value in node.attrib.items() if 'md5' in key.lower()]
+                            except (ValueError,TypeError,ET.ParseError):matches=False
+                        if matches:
                             records.append((rel, local_id, bool(server_id)))
         return watermarks, records, own_watermarks
 
@@ -238,3 +245,44 @@ class HistoryHTTPSender(MessageAdapter):
             raise
         marker.write_text('{"status":"unknown_do_not_retry","transport":"http"}', encoding="utf-8")
         return self._skip("接口已接受，但未核对到微信服务器确认；不自动重试")
+
+    def send_sticker(self,contact,digest):
+        from app.sticker_catalog import item
+        import shutil
+        if not getattr(self,'manual_approval_in_progress',False):return self._skip('表情图片需要逐条批准')
+        if self.config.wechat.sender_all_existing_chats:self.allowed.update(self._eligible_contacts())
+        if self.config.mode in {'shadow','off'} or contact not in self.allowed or contact.endswith('@chatroom'):
+            return self._skip('当前模式或联系人范围不允许发送表情')
+        if self.config.resolve(self.config.paths.pause_file).exists() or self._has_saved_human_draft(contact):
+            return self._skip('后台已暂停或会话存在本人草稿')
+        entry=item(self.config,digest)
+        media_config=self.config.model_copy(update={'local_api':self.config.local_api.model_copy(update={
+            'port':self.config.stickers.port,'bootstrap_manifest':self.config.stickers.bootstrap_manifest})})
+        from app.adapters.native_bootstrap import NativeBootstrap
+        NativeBootstrap(media_config,self.reader).ensure()
+        client=LocalHookClient(media_config.local_api,self.config.resolve(self.config.local_api.token_file))
+        client.verify_owner(self.reader.self_username)
+        root=self.config.resolve(self.config.stickers.bootstrap_manifest).parent/'approved_assets'
+        root.mkdir(exist_ok=True);path=root/entry['original_path'].name
+        shutil.copyfile(entry['original_path'],path)
+        if hashlib.md5(path.read_bytes()).hexdigest()!=digest:raise LocalAPIError('表情图片暂存校验失败')
+        token=hashlib.sha256((contact+'|sticker|'+str(getattr(self,'approved_draft_id',''))+'|'+digest).encode()).hexdigest()
+        claims=self.reader.root/'send_claims';claims.mkdir(exist_ok=True);marker=claims/(token+'.json')
+        if marker.exists():return self._skip('已有表情发送尝试，不重复发送')
+        before,_,_=self._stable_outgoing_state(contact,{'md5':digest},time.monotonic()+3)
+        if self.config.resolve(self.config.paths.pause_file).exists():return self._skip('后台已暂停')
+        with marker.open('x',encoding='utf-8') as claim:json.dump({'status':'attempting','kind':'sticker_image'},claim)
+        try:
+            result=client.post('/SendImgMsg',{'wxidorgid':contact,'path':str(path),'expected_wxid':self.reader.self_username,'request_id':token})
+            if result.get('ret')!=0:raise LocalAPIError('表情图片接口未接受发送')
+            deadline=time.monotonic()+self.config.local_api.receipt_timeout_seconds
+            while time.monotonic()<deadline:
+                _,records,_=self._stable_outgoing_state(contact,{'md5':digest},deadline)
+                if any(lid>before.get(rel,0) and ack for rel,lid,ack in records):
+                    marker.write_text('{"status":"verified_sent","kind":"sticker_image"}')
+                    self.last_send_skip_reason='';return True
+                time.sleep(.5)
+        except Exception:
+            marker.write_text('{"status":"unknown_do_not_retry","kind":"sticker_image"}');raise
+        marker.write_text('{"status":"unknown_do_not_retry","kind":"sticker_image"}')
+        return self._skip('未核对到表情图片服务器确认，不重试发送')

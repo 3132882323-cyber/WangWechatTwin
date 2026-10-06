@@ -8,6 +8,7 @@
 #include <fstream>
 #include <mutex>
 #include <unordered_set>
+#include <filesystem>
 #include "deps/httplib.h"
 #include "deps/json.hpp"
 #include "../app/native/account_snapshot.h"
@@ -80,14 +81,24 @@ static std::string ReadString(void* message,size_t offset) {
     return std::string(bytes,static_cast<size_t>(Word(field,16)));
 }
 struct NativeRequest {void* vector;void* options;void* message;};
-static NativeRequest Build(const std::string& target,const std::string& text) {
-    auto control=Allocate(0x1100);Word(control,0)=imageBase+messageControl;
+static NativeRequest Build(const std::string& target,const std::string& text,const std::wstring& imagePath=L"") {
+    auto control=Allocate(0x1100);Word(control,0)=imageBase+(imagePath.empty()?messageControl:0x90dace8);
     Word(control,8)=0x200000005;
     auto message=static_cast<char*>(control)+16;
     using Constructor=void(__fastcall*)(void*);
-    reinterpret_cast<Constructor>(imageBase+constructText)(message);
-    StringField(message,0xb0,target);StringField(message,0x758,text);
-    Word(message,0x118)=1;Word(message,0x1c8)=text.size();
+    reinterpret_cast<Constructor>(imageBase+(imagePath.empty()?constructText:0x1a81f70))(message);
+    StringField(message,0xb0,target);
+    if(imagePath.empty()) {
+        StringField(message,0x758,text);Word(message,0x118)=1;Word(message,0x1c8)=text.size();
+    } else {
+        auto field=message+0x120;memset(field,0,32);
+        size_t capacity=imagePath.size()<8?7:((imagePath.size()+8)&~size_t(7))-1;
+        if(imagePath.size()<8)memcpy(field,imagePath.data(),imagePath.size()*2);
+        else {auto pathBytes=Allocate((capacity+1)*2);memcpy(pathBytes,imagePath.data(),imagePath.size()*2);Word(field,0)=reinterpret_cast<uint64_t>(pathBytes);}
+        Word(field,16)=imagePath.size();Word(field,24)=capacity;
+        StringField(message,0x1a8,std::filesystem::path(imagePath).filename().u8string());
+        Word(message,0x118)=3;Word(message,0x1c8)=std::filesystem::file_size(imagePath);
+    }
     auto element=Allocate(16);Word(element,0)=reinterpret_cast<uint64_t>(message);Word(element,8)=reinterpret_cast<uint64_t>(control);
     auto vector=Allocate(40);Word(vector,0)=imageBase+vectorControl;
     Word(vector,8)=reinterpret_cast<uint64_t>(element);Word(vector,16)=reinterpret_cast<uint64_t>(element)+16;
@@ -111,6 +122,18 @@ static bool LayoutValid(const NativeRequest& request,const std::string& target,c
 static bool OwnerMatches(const std::string& expected) {
     auto owners=OpenWeixinDatabaseAccounts(GetCurrentProcess());
     return owners.size()==1 && AccountIdUtf8(*owners.begin())==expected;
+}
+static std::wstring Wide(const std::string& value) {
+    int size=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,value.data(),static_cast<int>(value.size()),nullptr,0);
+    if(size<=0)throw std::runtime_error("invalid_path");
+    std::wstring result(size,0);MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,value.data(),static_cast<int>(value.size()),result.data(),size);return result;
+}
+static bool ImageLayoutValid(const NativeRequest& request,const std::string& target,const std::wstring& path) {
+    auto field=static_cast<char*>(request.message)+0x120;
+    auto content=Word(field,24)<8?reinterpret_cast<wchar_t*>(field):reinterpret_cast<wchar_t*>(Word(field,0));
+    return Word(request.message,0)==imageBase+0x90dad78 && ReadString(request.message,0xb0)==target &&
+           Word(request.message,0x118)==3 && Word(field,16)==path.size() &&
+           std::wstring(content,path.size())==path && Word(request.message,0x1c8)==std::filesystem::file_size(path);
 }
 static bool ValidText(const json& input) {
     if(!input.is_object())return false;
@@ -173,6 +196,36 @@ static DWORD WINAPI Serve(void*) {
             Reply(response,200,{{"ret",0},{"retmsg","accepted"},{"delivery_verified",false}});
         }catch(...){Reply(response,400,{{"error","invalid_request"}});}
     });
+    auto imageRoute=[](const httplib::Request& request,httplib::Response& response,bool send){
+        try {
+            auto input=json::parse(request.body);
+            if(!input.contains("wxidorgid")||!input.contains("path")||!input.contains("expected_wxid"))throw std::runtime_error("invalid_request");
+            auto target=input["wxidorgid"].get<std::string>();auto path=Wide(input["path"].get<std::string>());
+            if(target.empty()||target.size()>128||target.find('\0')!=std::string::npos||path.find(L'\0')!=std::wstring::npos||!std::filesystem::path(path).is_absolute()||!std::filesystem::is_regular_file(path)||std::filesystem::file_size(path)>2*1024*1024)throw std::runtime_error("invalid_image");
+            auto approvedRoot=std::filesystem::weakly_canonical(directory+L"\\approved_assets");
+            auto canonical=std::filesystem::weakly_canonical(path);
+            if(canonical.parent_path()!=approvedRoot)throw std::runtime_error("image_not_approved");
+            std::ifstream imageFile(canonical,std::ios::binary);char header[12]={};imageFile.read(header,12);
+            bool imageHeader=(static_cast<unsigned char>(header[0])==0xff && static_cast<unsigned char>(header[1])==0xd8 && static_cast<unsigned char>(header[2])==0xff)
+                || memcmp(header,"\x89PNG\r\n\x1a\n",8)==0 || memcmp(header,"GIF87a",6)==0 || memcmp(header,"GIF89a",6)==0
+                || (memcmp(header,"RIFF",4)==0 && memcmp(header+8,"WEBP",4)==0);
+            if(!imageHeader)throw std::runtime_error("invalid_image_header");
+            std::lock_guard<std::mutex> lock(sendLock);
+            if(!OwnerMatches(input["expected_wxid"])){Reply(response,409,{{"error","account_changed"}});return;}
+            if(send){
+                if(GetFileAttributesW((directory+L"\\ALLOW_SEND").c_str())==INVALID_FILE_ATTRIBUTES){Reply(response,423,{{"error","sending_not_armed"}});return;}
+                auto id=input["request_id"].get<std::string>();
+                if(id.size()!=64||!std::all_of(id.begin(),id.end(),[](unsigned char c){return std::isxdigit(c)!=0;}))throw std::runtime_error("invalid_request_id");
+                if(!attempts.insert(id).second){Reply(response,409,{{"error","duplicate_attempt"}});return;}
+            }
+            auto built=Build(target,"",path);bool valid=ImageLayoutValid(built,target,path);
+            if(!valid){Reply(response,500,{{"error","image_layout_mismatch"},{"sent",false}});return;}
+            if(send){using Dispatch=void(__fastcall*)(void*,void*);reinterpret_cast<Dispatch>(imageBase+dispatch)(built.vector,built.options);}
+            Reply(response,200,{{"ok",true},{"ret",0},{"sent",send},{"message_type",3},{"delivery_verified",false}});
+        }catch(...){Reply(response,400,{{"error","invalid_image_request"},{"sent",false}});}
+    };
+    server.Post("/SelfTestImageLayout",[imageRoute](const auto& request,auto& response){imageRoute(request,response,false);});
+    server.Post("/SendImgMsg",[imageRoute](const auto& request,auto& response){imageRoute(request,response,true);});
     Status("ready");
     if(!server.listen("127.0.0.1",port)){Status("listen_failed");return 4;}
     Status("stopped");return 0;

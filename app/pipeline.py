@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from datetime import datetime,timezone
 
 from app.adapters.base import MessageAdapter
 from app.config import AppConfig
@@ -32,6 +33,22 @@ class ReplyPipeline:
         self.prompt_builder = PromptBuilder(config)
         self.llm = llm
         self.contact_map = config.contact_map()
+
+    def _sticker_suggestion(self,message,inbound_id):
+        if message.message_type!='text' or assess_risk(message.content).level!=RiskLevel.low:return
+        from app.sticker_catalog import suggest
+        entry=suggest(self.config,message.content)
+        if not entry:return
+        today=datetime.now(timezone.utc).date().isoformat()
+        state=self.db.get_state('sticker_suggestions') or {};key=message.contact+'|'+today
+        if state.get(key,0)>=self.config.stickers.max_per_contact_per_day:return
+        with self.db.connect() as connection:
+            if connection.execute("SELECT 1 FROM drafts WHERE contact=? AND kind='sticker' AND status IN ('pending','approved')",(message.contact,)).fetchone():return
+        self.db.create_draft(message.contact,inbound_id,ReplyDecision(action='review',risk=RiskLevel.low,
+            reply='[表情包图片：'+entry['label']+']',sticker_id=entry['id'],confidence=.85,
+            reason='对方明确分享好消息，建议用已批准表情库中的图片庆祝；批准后才发送'),kind='sticker')
+        state[key]=state.get(key,0)+1;self.db.set_state('sticker_suggestions',state)
+        self.db.add_event('sticker_draft','表情图片建议待审核',contact=message.contact)
 
     def _contact(self, name: str) -> ContactProfile | None:
         return self.contact_map.get(name)
@@ -238,6 +255,7 @@ class ReplyPipeline:
                 if ok:
                     self.db.add_outgoing(message.contact, decision.reply, decision.risk.value)
                     self.db.add_event("auto_sent", decision.reason or "低风险自动回复", contact=message.contact)
+                    self._sticker_suggestion(message,inbound_id)
                     return ProcessResult(status="sent", decision=decision)
                 decision.action = "review"
                 skip=getattr(adapter,'last_send_skip_reason','微信发送未确认')
@@ -284,7 +302,8 @@ class ReplyPipeline:
                         raise RuntimeError('当前连接不支持经过核验的主动联系')
                     adapter.prepare_proactive(draft.contact,draft.id,draft.source_context_ts)
                 adapter.manual_approval_in_progress = True
-                ok = adapter.send_text(draft.contact, text)
+                adapter.approved_draft_id=draft.id
+                ok = adapter.send_sticker(draft.contact,draft.sticker_id) if draft.kind=='sticker' else adapter.send_text(draft.contact, text)
             except Exception as exc:
                 self.db.add_event("approved_send_error", str(exc), level="error", contact=draft.contact)
                 ok = False

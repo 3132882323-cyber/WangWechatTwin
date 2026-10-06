@@ -60,6 +60,8 @@ class StickerSettings(BaseModel):
     enabled: bool = False
     catalog: str = ".runtime/history_reader/sticker_catalog.json"
     max_per_contact_per_day: int = Field(default=3, ge=1, le=10)
+    port: int = Field(default=30004,ge=1,le=65535)
+    bootstrap_manifest: str = '.runtime/local_api/native_media/manifest.json'
 
 
 class LocalAPISettings(BaseModel):

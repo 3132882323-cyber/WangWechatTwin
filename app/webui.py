@@ -11,7 +11,7 @@ from urllib.parse import parse_qs
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 
 from app.config import AppConfig
 from app.db import Database
@@ -32,18 +32,20 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
                    or config.wechat.sender_all_existing_chats or draft.contact in config.wechat.sender_allowed_contacts))
         approve_action = "approve" if allowed else "save"
         approve_label = ("批准这次主动联系" if draft.kind=='proactive' else "批准发送并学习我的修改") if allowed else "保存我的修改"
+        if draft.kind=='sticker' and allowed:approve_label='批准发送这张表情图片'
         text = html.escape(draft.edited_reply or draft.reply)
         incoming = html.escape("主动联系建议：尚未给对方发消息" if draft.kind=='proactive' else draft.incoming_content or "（原消息已按保留策略清理）")
         rows.append(
             f"""
             <section class="card">
-              <div class="meta">#{draft.id} · {'主动聊天建议 · ' if draft.kind=='proactive' else ''}{html.escape('网页连接自检（测试草稿，不发送）' if draft.contact.startswith('__web_self_test__') else labels.get(draft.contact, draft.contact))} · 风险 {html.escape(draft.risk)} · 置信度 {draft.confidence:.2f}</div>
+              <div class="meta">#{draft.id} · {'主动聊天建议 · ' if draft.kind=='proactive' else '表情图片建议 · ' if draft.kind=='sticker' else ''}{html.escape('表情图片自检（测试草稿，不发送）' if draft.contact=='__web_self_test__sticker' else '网页连接自检（测试草稿，不发送）' if draft.contact.startswith('__web_self_test__') else labels.get(draft.contact, draft.contact))} · 风险 {html.escape(draft.risk)} · 置信度 {draft.confidence:.2f}</div>
               <div class="incoming"><strong>对方：</strong>{incoming}</div>
               <div class="reason"><strong>系统判断：</strong>{html.escape(draft.reason)}</div>
+              {'<img alt="拟发送的表情图片" style="max-width:240px;max-height:240px" src="/sticker-preview/'+html.escape(draft.sticker_id)+'">' if draft.kind=='sticker' else ''}
               <form method="post" action="/draft/{draft.id}/{approve_action}">
                 <input type="hidden" name="_csrf" value="{csrf_token}">
                 <label for="draft-reply-{draft.id}">拟发送内容</label>
-                <textarea id="draft-reply-{draft.id}" name="reply">{text}</textarea>
+                <textarea id="draft-reply-{draft.id}" name="reply" {'readonly' if draft.kind=='sticker' else ''}>{text}</textarea>
                 <div class="actions">
                   <button class="send" type="submit">{approve_label}</button>
                   <button class="dismiss" type="submit" formaction="/draft/{draft.id}/dismiss">不发送</button>
@@ -54,6 +56,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
         )
     titles = {"runtime_started": "微信后台已启动", "runtime_stopped": "微信后台已停止", "auto_sent": "已自动回复",
               "proactive_draft":"主动聊天建议待审核",
+              "sticker_draft":"表情图片建议待审核",
               "approved_sent": "已发送你确认的回复", "draft_created": "等待你确认", "media_review": "非文字消息待查看",
               "ignored_acknowledgment": "已识别简短确认，无需追加回复", "ignored": "无需回复", "send_error": "发送受阻",
               "paused": "已暂停", "resumed": "已恢复", "draft_saved": "修改已保存", "llm_error": "AI 连接受阻"}
@@ -95,6 +98,7 @@ small{{color:#9ca3af}}
 <div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
 <form method="post" action="/{'resume' if paused else 'pause'}"><input type="hidden" name="_csrf" value="{csrf_token}"><button class="pause">{'恢复处理' if paused else '立即暂停'}</button></form>
 <section class="card"><strong>主动聊天：{'已开启建议' if config.proactive.enabled else '未开启'}</strong><p>问候与话题跟进均先生成草稿，你批准后才联系对方。每天最多 {config.proactive.max_drafts_per_day} 条；同一联系人至少间隔 {config.proactive.cooldown_hours:g} 小时；北京时间 {config.proactive.active_start_hour}:00—{config.proactive.active_end_hour}:00 生成建议。已有未回复消息时不再催聊。</p></section>
+<section class="card"><strong>表情图片：{'已启用审核建议' if config.stickers.enabled else '未启用'}</strong><p>对方明确分享好消息时，建议使用已批准的表情图片。预览后批准才发送；通过本机接口发送原图，每个联系人每天最多 {config.stickers.max_per_contact_per_day} 条建议。</p></section>
 <h2>待审核草稿（{len(drafts)}）</h2>
 {''.join(rows) if rows else '<div class="card">当前没有待审核草稿。</div>'}
 <h2>最近事件</h2>
@@ -200,6 +204,15 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
     @app.get("/health")
     async def health() -> JSONResponse:
         return JSONResponse({"ok": True, "paused": config.resolve(config.paths.pause_file).exists()})
+
+    @app.get('/sticker-preview/{digest}')
+    async def sticker_preview(digest:str):
+        try:
+            from app.sticker_catalog import item
+            entry=item(config,digest)
+            return FileResponse(entry['preview_path'],media_type='image/png',headers={'Cache-Control':'no-store'})
+        except (OSError,ValueError,KeyError,TypeError):
+            raise HTTPException(status_code=404,detail='表情图片未批准或校验失败') from None
 
     @app.post("/pause")
     async def pause(request: Request) -> RedirectResponse:
