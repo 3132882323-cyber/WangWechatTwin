@@ -227,3 +227,16 @@ def test_critical_message_stays_local(tmp_path: Path):
     assert result.status == "holding_and_draft"
     assert adapter.sent
     assert "敏感" not in adapter.sent[0][1] or "核对" in adapter.sent[0][1]
+
+
+def test_interrupted_registered_message_recovers_as_draft_without_resending(tmp_path):
+    import json
+    cfg=make_config(tmp_path,'low_risk_auto');db=Database(cfg.resolve(cfg.paths.database));adapter=MockAdapter()
+    message=IncomingMessage(external_id='interrupted',contact='张三',sender='张三',content='你好呀')
+    db.add_incoming(message,'low')
+    pipeline=ReplyPipeline(cfg,db,FakeLLM(ReplyDecision(action='send',risk=RiskLevel.low,reply='咋了',confidence=.99)))
+    recovered=message.model_copy(update={'raw_summary':json.dumps({'resume_incomplete':True})})
+    result=pipeline.process(recovered,adapter)
+    assert result.status=='draft' and not adapter.sent
+    assert pipeline.process(recovered,adapter).status=='duplicate'
+    with db.connect() as conn:assert conn.execute("SELECT count(*) FROM drafts").fetchone()[0]==1

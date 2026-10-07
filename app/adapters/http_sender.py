@@ -271,6 +271,7 @@ class HistoryHTTPSender(MessageAdapter):
         except FileExistsError:
             return self._skip("另一进程已申请发送，不重复发送")
         try:
+            if hasattr(self.reader,'personal'):self.reader.personal.sending_intent(contact,text,token)
             self.client.submit(contact, text, self.reader.self_username, token)
             deadline = time.monotonic() + self.config.local_api.receipt_timeout_seconds
             while time.monotonic() < deadline:

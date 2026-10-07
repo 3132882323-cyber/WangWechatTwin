@@ -1,7 +1,7 @@
 """One local owner database. Observations, AI output and corrections stay distinct."""
 from pathlib import Path
 from contextlib import closing
-import sqlite3,json,hashlib,time
+import sqlite3,json,hashlib,time,re
 from app.risk import assess_risk
 from app.models import RiskLevel
 
@@ -16,6 +16,7 @@ class PersonalMemory:
                 CREATE INDEX IF NOT EXISTS personal_contact_time ON observations(contact_key,at DESC);
                 CREATE TABLE IF NOT EXISTS corrections(target_id TEXT PRIMARY KEY,contact_key TEXT NOT NULL,original TEXT,corrected TEXT,at REAL);
                 CREATE TABLE IF NOT EXISTS ai_receipts(source TEXT,local_id INTEGER,contact_key TEXT,body_hash TEXT,PRIMARY KEY(source,local_id));
+                CREATE TABLE IF NOT EXISTS ai_intents(context TEXT PRIMARY KEY,contact_key TEXT,body_hash TEXT,created REAL);
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS model_notes(target_id TEXT,contact_key TEXT,provider TEXT,content TEXT,at REAL,PRIMARY KEY(target_id,provider));
             ''')
@@ -34,7 +35,8 @@ class PersonalMemory:
         if message.media_paths:safe_meta['media_paths']=message.media_paths[:3]
         with closing(self.connect()) as db:
             receipt=db.execute('SELECT 1 FROM ai_receipts WHERE source=? AND local_id=?',(source,local_id)).fetchone()
-            if direction=='out' and receipt:provenance='ai_generated'
+            intent=db.execute('SELECT 1 FROM ai_intents WHERE contact_key=? AND body_hash=? AND created BETWEEN ? AND ?',(key,hashlib.sha256(message.content.encode()).hexdigest(),message.received_at.timestamp()-120,message.received_at.timestamp()+30)).fetchone()
+            if direction=='out' and (receipt or intent):provenance='ai_generated'
             db.execute('INSERT OR REPLACE INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                 (message.external_id,key,direction,'本人' if direction=='out' else message.sender,message.content,message.message_type,
                  int(message.received_at.timestamp()),provenance,source,local_id,json.dumps(safe_meta)))
@@ -88,3 +90,36 @@ class PersonalMemory:
             return [{'provider':provider,'content':content,'at':at} for provider,content,at in db.execute(
                 'SELECT provider,content,at FROM model_notes WHERE contact_key=? AND target_id IN ('+','.join('?' for _ in identities)+') AND at>? ORDER BY at DESC LIMIT 2',
                 (self.contact_key(contact),*identities,time.time()-600))]
+
+    def human_style_examples(self,contact,incoming,limit=4):
+        from app.style_history import grams
+        wanted=grams(incoming)
+        with closing(self.connect()) as db:
+            rows=db.execute("SELECT id,direction,content,at,provenance FROM observations WHERE contact_key=? AND kind='text' ORDER BY at DESC,rowid DESC LIMIT 300",(self.contact_key(contact),)).fetchall()
+        rows.reverse();previous=None;scored=[]
+        for identity,direction,text,at,provenance in rows:
+            if direction=='in':previous=(text,at);continue
+            if provenance!='wechat_original' or not previous or at-previous[1]>1800:continue
+            if assess_risk(text).level!=RiskLevel.low or assess_risk(previous[0]).level!=RiskLevel.low:continue
+            if re.search(r'https?://|\d{7,}',text+previous[0]):continue
+            similarity=len(wanted & grams(previous[0]))/max(1,len(wanted | grams(previous[0])))
+            if similarity==0:continue
+            scored.append((similarity,at,{'scenario':'已核验本人手发的当前联系人原话，仅模仿表达','incoming':previous[0],'preferred_reply':text,'evidence_id':identity,'provenance':provenance}))
+        scored.sort(key=lambda row:(row[0],row[1]),reverse=True)
+        return [row[2] for row in scored[:limit]]
+
+    def voice_vocabulary(self,contact,owner_name,display_name=''):
+        with closing(self.connect()) as db:
+            rows=db.execute('SELECT corrected FROM corrections WHERE contact_key=? ORDER BY at DESC LIMIT 12',(self.contact_key(contact),)).fetchall()
+        names=[owner_name,display_name]
+        # Corrections supply local hints only; never force corrected words into an unrelated transcript.
+        for row in rows:names.extend(re.findall(r'[\u4e00-\u9fff]{2,6}',row[0])[:5])
+        return '，'.join(dict.fromkeys(name for name in names if name and not re.search(r'\d|https?://',name)))[:220]
+
+    def exclude_ai_style(self,contact,examples):
+        with closing(self.connect()) as db:
+            ai={row[0] for row in db.execute("SELECT content FROM observations WHERE contact_key=? AND provenance='ai_generated'",(self.contact_key(contact),))}
+        return [example for example in examples if example.get('preferred_reply') not in ai]
+
+    def sending_intent(self,contact,text,context):
+        with closing(self.connect()) as db:db.execute('INSERT OR IGNORE INTO ai_intents VALUES(?,?,?,?)',(context,self.contact_key(contact),hashlib.sha256(text.encode()).hexdigest(),time.time()))

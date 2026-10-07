@@ -33,6 +33,8 @@ class ReplyPipeline:
         self.db = db
         self.prompt_builder = PromptBuilder(config)
         self.llm = llm
+        from threading import Lock
+        self.llm_init_lock=Lock()
         self.contact_map = config.contact_map()
 
     def _sticker_suggestion(self,message,inbound_id):
@@ -143,8 +145,28 @@ class ReplyPipeline:
                 decision.holding_reply = holding or "收到，我先核一下具体情况，确认完给你回。"
         return decision
 
-    def process(self, message: IncomingMessage, adapter: MessageAdapter) -> ProcessResult:
-        if self.db.seen(message.external_id):
+    def process(self,message:IncomingMessage,adapter:MessageAdapter)->ProcessResult:
+        import time
+        origin=json.loads(message.raw_summary or '{}')
+        recovering=bool(origin.get('resume_incomplete'))
+        with self.db.connect() as conn:
+            conn.execute('CREATE TABLE IF NOT EXISTS reply_outcomes(external_id TEXT PRIMARY KEY,status TEXT,updated REAL)')
+            conn.execute('BEGIN IMMEDIATE')
+            previous=conn.execute('SELECT status FROM reply_outcomes WHERE external_id=?',(message.external_id,)).fetchone()
+            if previous and (previous[0]!='processing' or not recovering):
+                conn.execute('COMMIT');return ProcessResult(status='duplicate')
+            if recovering and self.db.seen(message.external_id):
+                handled=conn.execute('SELECT 1 FROM drafts d JOIN messages m ON m.id=d.inbound_message_id WHERE m.external_id=?',(message.external_id,)).fetchone()
+                if handled:
+                    conn.execute('COMMIT');return ProcessResult(status='duplicate')
+            conn.execute("INSERT OR REPLACE INTO reply_outcomes VALUES(?,'processing',?)",(message.external_id,time.time()))
+            conn.execute('COMMIT')
+        result=self._process(message,adapter)
+        with self.db.connect() as conn:conn.execute('UPDATE reply_outcomes SET status=?,updated=? WHERE external_id=?',(result.status,time.time(),message.external_id))
+        return result
+
+    def _process(self, message: IncomingMessage, adapter: MessageAdapter) -> ProcessResult:
+        if self.db.seen(message.external_id) and not json.loads(message.raw_summary or '{}').get('resume_incomplete'):
             return ProcessResult(status="duplicate")
         if message.chat_type == "group" and not self.config.wechat.allow_groups:
             self.db.add_incoming(message, risk="ignored_group")
@@ -215,8 +237,8 @@ class ReplyPipeline:
             )
         else:
             try:
-                if self.llm is None:
-                    self.llm = ReplyLLM(self.config)
+                with self.llm_init_lock:
+                    if self.llm is None:self.llm = ReplyLLM(self.config)
                 decision = self.llm.decide(self.prompt_builder.system_prompt(), payload, risk.level)
             except LLMError as exc:
                 self.db.add_event("llm_error", str(exc), level="error", contact=message.contact)
@@ -239,7 +261,8 @@ class ReplyPipeline:
                 return ProcessResult(status='draft',decision=decision,draft_id=draft_id)
         if not laughter_only(decision.reply):decision.reply=trim_laughter(decision.reply)
         mode = self._mode(contact)
-        if json.loads(message.raw_summary or '{}').get('owner_corrected_input'):mode='shadow'
+        if any(json.loads(message.raw_summary or '{}').get(key) for key in ('owner_corrected_input','resume_incomplete')):
+            mode='shadow';decision.reason+='；中断恢复或本人纠正，只起草，不重复发送'
         if recognized_sticker or recognized_image:
             if not decision.media_description or decision.media_confidence<.75:
                 decision.action='review';decision.reason+='；图片或表情识别不确定，留审核'

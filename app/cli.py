@@ -88,12 +88,13 @@ class SingleInstanceLock:
             self.fd = None
         self.path.unlink(missing_ok=True)
 
-def merge_incoming_messages(messages: list[IncomingMessage]) -> list[IncomingMessage]:
+def merge_incoming_messages(messages: list[IncomingMessage], *, separate_media: bool=False) -> list[IncomingMessage]:
     """Merge a burst from the same conversation into one coherent turn."""
     groups: dict[tuple[str, str], list[IncomingMessage]] = {}
     order: list[tuple[str, str]] = []
     for message in messages:
-        key = (message.contact, message.chat_type)
+        kind='text' if message.message_type=='text' else 'visual' if message.message_type in {'image','sticker'} else message.message_type
+        key = (message.contact, message.chat_type,kind) if separate_media else (message.contact,message.chat_type)
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -280,7 +281,7 @@ def command_run(args: argparse.Namespace) -> int:
                 if config.resolve(config.paths.pause_file).exists():
                     time.sleep(max(config.wechat.poll_seconds, 1.0))
                 try:
-                    messages = merge_incoming_messages(adapter.poll())
+                    messages = merge_incoming_messages(adapter.poll(),separate_media=True)
                     scheduler.submit(messages)
                     if candidates:candidates.submit(messages)
                     proactive_planner.tick()

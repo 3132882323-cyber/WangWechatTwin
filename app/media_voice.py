@@ -84,7 +84,8 @@ class OfflineVoiceProcessor:
         model_path=self.config.resolve(self.config.media.voice_model)
         model_file=model_path/'model.bin'
         if not model_file.exists():raise ValueError('本机语音模型尚未准备好')
-        model_stamp=str(model_file.stat().st_size)+':'+str(model_file.stat().st_mtime_ns)+':owner-hotwords-v2:'+self.config.owner_name
+        vocabulary=self.reader.personal.voice_vocabulary(message.contact,self.config.owner_name,message.display_name or message.sender) if hasattr(self.reader,'personal') else self.config.owner_name
+        model_stamp=str(model_file.stat().st_size)+':'+str(model_file.stat().st_mtime_ns)+':word-quality-v3:'+hashlib.sha256(vocabulary.encode()).hexdigest()[:16]
         cache=root/(digest+'-offline.json')
         if cache.exists():
             saved=json.loads(cache.read_text(encoding='utf-8'))
@@ -103,12 +104,14 @@ class OfflineVoiceProcessor:
                 from faster_whisper import WhisperModel
                 self.model=WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=4,local_files_only=True)
             segments,info=self.model.transcribe(str(wav_path),language='zh',beam_size=5,vad_filter=True,condition_on_previous_text=False,
-                hotwords=self.config.owner_name)
+                hotwords=vocabulary,word_timestamps=True,hallucination_silence_threshold=1.0,
+                vad_parameters={"min_silence_duration_ms":500})
             segments=list(segments);text=''.join(segment.text.strip() for segment in segments).strip()
         if not text or not segments:raise ValueError('语音未识别出可靠正文')
-        uncertain=any(s.avg_logprob<-1 or s.no_speech_prob>.6 for s in segments)
-        uncertain=uncertain or bool(re.search(r'\d{2,}|[一二两三四五六七八九十百千万]+(?:元|号|点|天|月|年|块|分钟|小时)',text))
+        from app.voice_quality import assess_transcript
+        quality_reasons=assess_transcript(text,segments);uncertain=bool(quality_reasons)
         saved={'text':text,'audio_sha256':digest,'model_stamp':model_stamp,'uncertain':uncertain,
+               'quality_reasons':quality_reasons,'segments':[{'start':round(segment.start,2),'end':round(segment.end,2),'text':segment.text.strip()} for segment in segments],
                'duration_seconds':round(seconds,2),'asr_seconds':round(time.monotonic()-started,2),'engine':'faster-whisper-small-int8-local'}
         _atomic(cache,json.dumps(saved,ensure_ascii=False).encode('utf-8'))
         return self._result(message,saved,False)
@@ -116,7 +119,7 @@ class OfflineVoiceProcessor:
     def _result(self,message,result,cached):
         origin=json.loads(message.raw_summary or '{}')
         origin.update(original_type='voice',transcription_source='offline_whisper',asr_uncertain=result['uncertain'],
-                      audio_sha256=result['audio_sha256'],duration_seconds=result['duration_seconds'],transcript_cached=cached)
+                      asr_quality_reasons=result.get('quality_reasons',[]),audio_sha256=result['audio_sha256'],duration_seconds=result['duration_seconds'],transcript_cached=cached)
         return message.model_copy(update={'message_type':'text','content':result['text'],'raw_summary':json.dumps(origin)})
 
     def poll(self,messages):

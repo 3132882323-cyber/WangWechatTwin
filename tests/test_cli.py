@@ -53,3 +53,11 @@ def test_picture_burst_has_visual_type_and_marks_truncated_input():
     merged=merge_incoming_messages(images)[0]
     assert merged.message_type=='image' and len(merged.media_paths)==3
     assert json.loads(merged.raw_summary)['image_partial'] is True
+
+
+def test_followup_text_is_not_swallowed_by_sticker_turn():
+    sticker=IncomingMessage(external_id='sticker',contact='peer',sender='peer',content='[表情]',message_type='sticker',media_paths=['frame.png'])
+    text=IncomingMessage(external_id='followup',contact='peer',sender='peer',content='我看看有没有时间')
+    turns=merge_incoming_messages([sticker,text],separate_media=True)
+    assert len(turns)==2
+    assert turns[1].message_type=='text' and turns[1].external_id=='followup' and not turns[1].media_paths

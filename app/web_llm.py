@@ -41,6 +41,9 @@ class WebReplyLLM:
         job_id = uuid.uuid4().hex
         expires = time.time() + self.config.openai.web_reply_timeout_seconds
         schema = json.dumps(ReplyDecision.model_json_schema(), ensure_ascii=False)
+        if self.config.openai.provider=='deepseek_web':
+            schema=json.dumps({'action':'send','risk':'low','reply':'实际回复正文','confidence':.9,'reason':'简短理由','facts_to_confirm':[],'memory_updates':[],'media_description':'','media_confidence':0,'sticker_id':''},ensure_ascii=False)
+            schema+='\n这是输出示例，不是要复制的内容；action 只能为 send/review/hold/ignore，risk 只能为 low/medium/high/critical。不要输出 JSON Schema 或 properties/defs。'
         try:
             parsed_payload=json.loads(user_payload)
             contact_name=str(parsed_payload.get('contact_profile',{}).get('name','')).strip()[:128]
@@ -52,6 +55,10 @@ class WebReplyLLM:
                 parsed_payload['style_examples']=parsed_payload.get('style_examples',[])[:4]
                 parsed_payload['historical_conversation_memory']=parsed_payload.get('historical_conversation_memory',[])[:6]
                 parsed_payload['current_personal_conversation']=parsed_payload.get('current_personal_conversation',[])[-10:]
+                latest=parsed_payload.get('current_personal_conversation',[])
+                present={(row.get('direction'),row.get('content')) for row in latest}
+                parsed_payload['recent_messages']=[row for row in parsed_payload.get('recent_messages',[]) if (row.get('direction'),row.get('content')) not in present][-8:]
+                parsed_payload['style_examples']=parsed_payload['style_examples'][:4]
                 parsed_payload.pop('owner_role_profile',None)
                 system_prompt=system_prompt.split('以下是从本人微信文字回复离线统计的表达习惯')[0]
             user_payload=json.dumps(parsed_payload,ensure_ascii=False)
@@ -69,6 +76,8 @@ class WebReplyLLM:
             images.append({'name':path.name,'mime':'image/png','data':base64.b64encode(path.read_bytes()).decode('ascii')})
         if not isinstance(namespace,str) or not re.fullmatch(r'[0-9a-f]{64}',namespace):
             namespace = 'isolated:'+job_id
+        try:user_payload=json.dumps(json.loads(user_payload),ensure_ascii=False,separators=(',',':'))
+        except ValueError:pass
         prompt = system_prompt + "\n\n以下是本轮微信数据：\n" + user_payload
         prompt += "\n\n只输出符合以下结构的 JSON，不加代码围栏：\n" + schema
         prompt += '\n如果需要回应，reply 必须写出真正可用的回复正文；review 表示供人审核，不表示 reply 留空。只有无需回应时才使用 ignore。'
@@ -77,12 +86,15 @@ class WebReplyLLM:
         with self.connect() as db:
             provider='deepseek' if self.config.openai.provider=='deepseek_web' else 'chatgpt'
             db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test,provider,contact_name) VALUES(?,?,?,NULL,?,?,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test),provider,contact_name))
+        waiting_started=time.time()
         try:
             while time.time() < expires:
                 if self.config.resolve(self.config.paths.pause_file).exists():
                     raise LLMError("已暂停网页回复")
                 with self.connect() as db:
                     status, result = db.execute("SELECT status,result FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if status=='pending' and time.time()-waiting_started>35:
+                    raise LLMError('网页未领取任务，已快速转审核，避免长期堵塞')
                 if status == "done":
                     try:
                         return ReplyDecision.model_validate_json(result)
