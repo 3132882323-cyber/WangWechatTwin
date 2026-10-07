@@ -50,7 +50,8 @@ class ReplyLLM:
         if self.hybrid:
             import json,re
             parsed=json.loads(user_payload);text=parsed.get('incoming',{}).get('content','')
-            complex_task=risk!=RiskLevel.low or bool(parsed.get('__media_paths')) or len(text)>160 or bool(re.search('算一下|分析|方案|对比|合同|解释清楚',text))
+            visual_task=parsed.get('incoming',{}).get('message_type') in {'image','sticker'} or bool(parsed.get('__media_paths'))
+            complex_task=risk!=RiskLevel.low or visual_task or len(text)>160 or bool(re.search('算一下|分析|方案|对比|合同|解释清楚',text))
             return self.hybrid['chatgpt' if complex_task else 'deepseek'].decide(system_prompt,user_payload,risk)
         if self.account is not None:
             return self.account.decide(system_prompt, user_payload, risk)
