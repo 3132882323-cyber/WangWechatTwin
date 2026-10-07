@@ -77,11 +77,14 @@ class OfflineVoiceProcessor:
             except (VoiceNotReady,SnapshotBusyError):
                 if time.monotonic()>=deadline:raise
                 time.sleep(.4)
+        if hasattr(self.reader,'personal'):
+            correction=self.reader.personal.corrected(message.external_id,message.contact)
+            if correction:return self._result(message,{'text':correction,'audio_sha256':digest,'uncertain':False,'duration_seconds':0},True)
         root=self.reader.root/'voice_transcripts';root.mkdir(exist_ok=True)
         model_path=self.config.resolve(self.config.media.voice_model)
         model_file=model_path/'model.bin'
         if not model_file.exists():raise ValueError('本机语音模型尚未准备好')
-        model_stamp=str(model_file.stat().st_size)+':'+str(model_file.stat().st_mtime_ns)
+        model_stamp=str(model_file.stat().st_size)+':'+str(model_file.stat().st_mtime_ns)+':owner-hotwords-v2:'+self.config.owner_name
         cache=root/(digest+'-offline.json')
         if cache.exists():
             saved=json.loads(cache.read_text(encoding='utf-8'))
@@ -99,7 +102,8 @@ class OfflineVoiceProcessor:
             if self.model is None:
                 from faster_whisper import WhisperModel
                 self.model=WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=4,local_files_only=True)
-            segments,info=self.model.transcribe(str(wav_path),language='zh',beam_size=5,vad_filter=True,condition_on_previous_text=False)
+            segments,info=self.model.transcribe(str(wav_path),language='zh',beam_size=5,vad_filter=True,condition_on_previous_text=False,
+                hotwords=self.config.owner_name)
             segments=list(segments);text=''.join(segment.text.strip() for segment in segments).strip()
         if not text or not segments:raise ValueError('语音未识别出可靠正文')
         uncertain=any(s.avg_logprob<-1 or s.no_speech_prob>.6 for s in segments)
@@ -118,7 +122,8 @@ class OfflineVoiceProcessor:
     def poll(self,messages):
         output=[];changed=False
         for key,(message,future) in list(self.pending.items()):
-            if self.db.seen(message.external_id):
+            owner_done=json.loads(message.raw_summary or '{}').get('owner_message') and hasattr(self.reader,'personal') and self.reader.personal.observed(message.external_id)
+            if self.db.seen(message.external_id) or owner_done:
                 del self.pending[key];changed=True;continue
             if not future.done():continue
             try:output.append(future.result())

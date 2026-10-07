@@ -1,5 +1,6 @@
 // Fixed owned tab pool. Same contact keeps its temporary chat; no prior user tabs.
 importScripts('pool_core.js');
+importScripts('deepseek_background.js');
 const base='http://127.0.0.1:18769/browser-bridge';
 const rootUrl='https://chatgpt.com/?temporary-chat=true';
 let busy=false;

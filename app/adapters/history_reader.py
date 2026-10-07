@@ -114,6 +114,10 @@ class HistoryReadOnlyAdapter(MessageAdapter):
         self.existing_conversations = set()
         self.contact_signatures = {}
         self.started_at = int(time.time())
+        from app.personal_memory import PersonalMemory
+        self.personal=PersonalMemory(config.resolve(config.paths.personal_database))
+        self.personal.import_history(config.resolve(config.paths.chat_memory))
+        self.own_media=[]
         self._load_names()
         self.ready = False
         self._read(initial=True)
@@ -208,6 +212,28 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                 if isinstance(memory_text, str) and memory_text.strip():
                                     identity = hashlib.sha256(f'{account}|{contact}|{server_id or name+str(local_id)}'.encode()).hexdigest()
                                     memory_rows.append((identity, contact, 'out' if sender == own_id else 'in', ts, memory_text,'本人' if sender==own_id else self.names.get(users.get(sender,''),'群成员（未确认）' if contact.endswith('@chatroom') else '对方')))
+                                    observed=IncomingMessage(external_id='local:'+hashlib.sha256(f'{account}|{contact}|{server_id or name+":"+str(local_id)}'.encode()).hexdigest(),contact=contact,
+                                        sender='本人' if sender==own_id else self.names.get(users.get(sender,''),'对方'),content=memory_text,received_at=datetime.fromtimestamp(ts,timezone.utc),
+                                        raw_summary=json.dumps({'source':name,'local_id':local_id,'server_id':server_id}))
+                                    provenance=self.personal.observe(observed,'out' if sender==own_id else 'in')
+                                    if provenance=='ai_generated':memory_rows[-1]=(*memory_rows[-1][:6],'本人（AI生成，仅作已发送上下文）')
+                            if sender==own_id and (typ&0xffffffff) in {3,34,47}:
+                                own_content=content
+                                if isinstance(own_content,bytes):own_content=(zstandard.ZstdDecompressor().decompress(own_content,max_output_size=8*1024*1024) if compression else own_content).decode('utf-8',errors='replace')
+                                own_type={3:'image',34:'voice',47:'sticker'}[typ&0xffffffff]
+                                own_meta={'source':name,'local_id':local_id,'server_id':server_id,'created_at':ts,'owner_message':True}
+                                if own_type=='image':
+                                    from app.media_images import image_refs
+                                    own_meta['image_refs']=image_refs(packed_info,own_content)
+                                if own_type=='sticker':
+                                    try:
+                                        from app.stickers import metadata
+                                        from xml.etree import ElementTree as ET
+                                        meta=metadata(own_content,require_url=False);node=ET.Element('msg');ET.SubElement(node,'emoji',{'md5':meta['md5'],'cdnurl':meta['url'],'attachedtext':meta['label']})
+                                        own_meta['sticker_source']=ET.tostring(node,encoding='unicode')
+                                    except ValueError:pass
+                                self.own_media.append(IncomingMessage(external_id='local:'+hashlib.sha256(f'{account}|{contact}|{server_id or name+":"+str(local_id)}'.encode()).hexdigest(),
+                                    contact=contact,sender='本人',content='本人发出的'+own_type,message_type=own_type,received_at=datetime.fromtimestamp(ts,timezone.utc),raw_summary=json.dumps(own_meta)))
                             if sender == own_id or local_id <= last_own_id or (typ & 0xffffffff) in {10000, 10002}:
                                 continue
                             if isinstance(content, bytes):

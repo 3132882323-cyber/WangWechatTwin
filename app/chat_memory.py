@@ -57,7 +57,7 @@ def retrieve(path, contact, query, limit=18, max_chars=7000,as_of=None):
         if used + len(content) > max_chars:
             continue
         used += len(content)
-        label='本人' if direction=='out' else (speaker or ('群成员（未确认）' if contact.endswith('@chatroom') else '对方'))
+        label=(speaker if speaker.startswith('本人（') else '本人') if direction=='out' else (speaker or ('群成员（未确认）' if contact.endswith('@chatroom') else '对方'))
         output.append({"speaker": label, "time": datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).isoformat(),
                        "content": content, 'evidence_id':record_id[0:16], 'speaker_rule':'第一人称归属该条说话人；转述中的人不等同本人',"historical_risk": risk, "source": "当前联系人的本机历史记录；不是当前事实确认"})
     return output

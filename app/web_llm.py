@@ -28,6 +28,8 @@ class WebReplyLLM:
                 db.execute("ALTER TABLE jobs ADD COLUMN browser_meta TEXT NOT NULL DEFAULT '{}'")
             if 'images' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN images TEXT NOT NULL DEFAULT '[]'")
+            if 'provider' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute("ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT 'chatgpt'")
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -42,6 +44,13 @@ class WebReplyLLM:
             media_paths=parsed_payload.pop('__media_paths',[])
             namespace = parsed_payload.get('conversation_key','')
             is_test=parsed_payload.pop('__is_local_test',False) is True
+            if self.config.openai.provider=='deepseek_web':
+                # Keep current two-way context and a few relevant examples; avoid replaying a giant style report.
+                parsed_payload['style_examples']=parsed_payload.get('style_examples',[])[:4]
+                parsed_payload['historical_conversation_memory']=parsed_payload.get('historical_conversation_memory',[])[:6]
+                parsed_payload['current_personal_conversation']=parsed_payload.get('current_personal_conversation',[])[-10:]
+                parsed_payload.pop('owner_role_profile',None)
+                system_prompt=system_prompt.split('以下是从本人微信文字回复离线统计的表达习惯')[0]
             user_payload=json.dumps(parsed_payload,ensure_ascii=False)
         except (ValueError, AttributeError):
             namespace = ''
@@ -58,10 +67,12 @@ class WebReplyLLM:
             namespace = 'isolated:'+job_id
         prompt = system_prompt + "\n\n以下是本轮微信数据：\n" + user_payload
         prompt += "\n\n只输出符合以下结构的 JSON，不加代码围栏：\n" + schema
+        prompt += '\n如果需要回应，reply 必须写出真正可用的回复正文；review 表示供人审核，不表示 reply 留空。只有无需回应时才使用 ignore。'
         prompt += '\n本轮资料是当前依据。此专用对话只属于一位微信联系人；旧价格、计划、情绪和承诺仍需按日期核实。只回复本轮消息。'
         prompt += '\n此网页对话里先前的 assistant 回复是模型生成结果，不是新的本人自述或已确认事实。不得把自己的旧输出当作本人原话强化；本人亲自修改和本轮已核验微信资料优先。'
         with self.connect() as db:
-            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test) VALUES(?,?,?,NULL,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test)))
+            provider='deepseek' if self.config.openai.provider=='deepseek_web' else 'chatgpt'
+            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test,provider) VALUES(?,?,?,NULL,?,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test),provider))
         try:
             while time.time() < expires:
                 if self.config.resolve(self.config.paths.pause_file).exists():

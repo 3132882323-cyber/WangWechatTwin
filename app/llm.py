@@ -13,7 +13,13 @@ class ReplyLLM:
     def __init__(self, config: AppConfig):
         self.config = config
         self.account = None
-        if config.openai.provider == "web":
+        self.hybrid=None
+        if config.openai.provider=='hybrid_web':
+            from app.web_llm import WebReplyLLM
+            self.hybrid={'chatgpt':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'web'})})),
+                         'deepseek':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'deepseek_web'})}))}
+            return
+        if config.openai.provider in {"web","deepseek_web"}:
             from app.web_llm import WebReplyLLM
             self.account = WebReplyLLM(config)
             return
@@ -41,6 +47,11 @@ class ReplyLLM:
         self.client = OpenAI(**kwargs)
 
     def decide(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
+        if self.hybrid:
+            import json,re
+            parsed=json.loads(user_payload);text=parsed.get('incoming',{}).get('content','')
+            complex_task=risk!=RiskLevel.low or bool(parsed.get('__media_paths')) or len(text)>160 or bool(re.search('算一下|分析|方案|对比|合同|解释清楚',text))
+            return self.hybrid['chatgpt' if complex_task else 'deepseek'].decide(system_prompt,user_payload,risk)
         if self.account is not None:
             return self.account.decide(system_prompt, user_payload, risk)
         model = (

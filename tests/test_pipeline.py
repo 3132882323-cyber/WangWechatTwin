@@ -95,6 +95,7 @@ def make_config(tmp_path: Path, mode: str):
     raw = yaml.safe_load((root / "config.example.yaml").read_text(encoding="utf-8"))
     raw["mode"] = mode
     raw["adapter"] = "mock"
+    raw["wechat"]["send_holding_on_review"] = True
     raw["paths"]["database"] = str(tmp_path / "db.sqlite3")
     raw["paths"]["persona"] = str(root / "data/persona.md")
     raw["paths"]["business_rules"] = str(root / "data/business_rules.md")

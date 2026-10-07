@@ -13,6 +13,8 @@ import json
 import sqlite3
 import tempfile
 import time
+from contextvars import ContextVar
+from contextlib import contextmanager
 from xml.etree import ElementTree as ET
 from pathlib import Path
 
@@ -82,6 +84,8 @@ class HistoryHTTPSender(MessageAdapter):
         self.allowed = set(config.wechat.sender_allowed_contacts)
         self.context, self.context_origin = {}, {}
         self.last_send_skip_reason = "本机微信接口尚未验证"
+        self.reply_context=ContextVar('wechat_reply_context',default=None)
+        self.latest_inbound={}
         from app.media_voice import OfflineVoiceProcessor
         self.voice_processor=OfflineVoiceProcessor(config,self.reader)
         self.visual_processor=None
@@ -104,9 +108,22 @@ class HistoryHTTPSender(MessageAdapter):
 
     def poll(self):
         self.bootstrap.ensure()
-        messages = self.voice_processor.poll(self.reader.poll())
+        raw=self.reader.poll()
+        for message in raw:self.latest_inbound[message.contact]=json.loads(message.raw_summary or '{}')
+        own=self.reader.own_media;self.reader.own_media=[]
+        messages = self.voice_processor.poll(raw+own)
         if self.visual_processor:messages=self.visual_processor.poll(messages)
+        incoming=[]
         for message in messages:
+            owner_message=json.loads(message.raw_summary or '{}').get('owner_message',False)
+            if owner_message:
+                provenance='automatic_transcription' if json.loads(message.raw_summary or '{}').get('transcription_source') else 'wechat_media_observation'
+                self.reader.personal.observe(message,'out',provenance)
+                if message.message_type=='text':
+                    from app.chat_memory import remember
+                    remember(self.config.resolve(self.config.paths.chat_memory),[('own-media:'+message.external_id,message.contact,'out',int(message.received_at.timestamp()),message.content,'本人（语音听写需核实）')])
+                continue
+            self.reader.personal.observe(message,'in','automatic_transcription' if json.loads(message.raw_summary or '{}').get('transcription_source') else 'wechat_original')
             if json.loads(message.raw_summary or '{}').get('transcription_source')=='offline_whisper':
                 from app.chat_memory import remember
                 remember(self.config.resolve(self.config.paths.chat_memory),[('voice:'+message.external_id,message.contact,'in',int(message.received_at.timestamp()),
@@ -114,7 +131,14 @@ class HistoryHTTPSender(MessageAdapter):
             self.context[message.contact] = message.external_id
             if message.raw_summary:
                 self.context_origin[message.contact] = json.loads(message.raw_summary)
-        return messages
+            incoming.append(message)
+        return incoming
+
+    @contextmanager
+    def bind_reply(self,message):
+        token=self.reply_context.set((message.contact,message.external_id,json.loads(message.raw_summary or '{}')))
+        try:yield
+        finally:self.reply_context.reset(token)
 
     def close(self):
         self.voice_processor.close()
@@ -212,8 +236,12 @@ class HistoryHTTPSender(MessageAdapter):
             return self._skip("回复为空或过长")
         if not manual and assess_risk(text).level != RiskLevel.low:
             return self._skip("回复内容需要审核")
-        origin = self.context_origin.get(contact)
-        context = self.context.get(contact)
+        bound=self.reply_context.get() if hasattr(self,'reply_context') else None
+        origin=bound[2] if bound and bound[0]==contact else self.context_origin.get(contact)
+        context=bound[1] if bound and bound[0]==contact else self.context.get(contact)
+        newest=self.latest_inbound.get(contact) if hasattr(self,'latest_inbound') else None
+        if not manual and origin and newest and ((newest.get('source')==origin.get('source') and newest.get('local_id',0)>origin.get('local_id',0)) or newest.get('created_at',0)>origin.get('created_at',0)):
+            return self._skip('生成期间已有新的对方消息，取消旧回复，等待最新一轮')
         if not manual and (not origin or not context):
             return self._skip("没有已读取的新消息上下文，禁止主动发送")
         if not manual and self._has_saved_human_draft(contact):
@@ -251,6 +279,15 @@ class HistoryHTTPSender(MessageAdapter):
                 except SnapshotBusyError:
                     break
                 if any(local_id > before.get(rel, 0) and acknowledged for rel, local_id, acknowledged in records):
+                    if hasattr(self.reader,'personal'):
+                        for rel,lid,ack in records:
+                            if lid>before.get(rel,0) and ack:self.reader.personal.receipt(contact,text,rel,lid)
+                        with closing(self.reader.personal.connect()) as personal:
+                            identities=[row[0].removeprefix('local:') for rel,lid,ack in records if lid>before.get(rel,0) and ack
+                                        for row in personal.execute('SELECT id FROM observations WHERE source=? AND local_id=?',(rel,lid))]
+                        if identities:
+                            with sqlite3.connect(self.config.resolve(self.config.paths.chat_memory)) as memory:
+                                memory.executemany("UPDATE history SET speaker='本人（AI生成，仅作已发送上下文）' WHERE id=?",[(identity,) for identity in identities])
                     marker.write_text('{"status":"verified_sent","transport":"http"}', encoding="utf-8")
                     self.last_send_skip_reason = ""
                     return True

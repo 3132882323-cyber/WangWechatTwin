@@ -9,6 +9,7 @@
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
+    "https://chat.deepseek.com/*",
     "http://127.0.0.1:18769/*"
   ],
   "background": {

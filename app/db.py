@@ -120,7 +120,7 @@ class Database:
                 if name not in columns:
                     conn.execute(f"ALTER TABLE drafts ADD COLUMN {name} {declaration}")
             message_columns={row[1] for row in conn.execute('PRAGMA table_info(messages)')}
-            for name,declaration in [('media_paths',"TEXT NOT NULL DEFAULT '[]'"),('original_type',"TEXT NOT NULL DEFAULT ''")]:
+            for name,declaration in [('media_paths',"TEXT NOT NULL DEFAULT '[]'"),('original_type',"TEXT NOT NULL DEFAULT ''"),('source_metadata',"TEXT NOT NULL DEFAULT '{}'" )]:
                 if name not in message_columns:conn.execute(f'ALTER TABLE messages ADD COLUMN {name} {declaration}')
 
     def seen(self, external_id: str) -> bool:
@@ -139,8 +139,8 @@ class Database:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO messages
-                (external_id, contact, sender, direction, content, message_type, risk, created_at,media_paths,original_type)
-                VALUES (?, ?, ?, 'in', ?, ?, ?, ?,?,?)
+                (external_id, contact, sender, direction, content, message_type, risk, created_at,media_paths,original_type,source_metadata)
+                VALUES (?, ?, ?, 'in', ?, ?, ?, ?,?,?,?)
                 """,
                 (
                     message.external_id,
@@ -152,6 +152,7 @@ class Database:
                     message.received_at.isoformat(),
                     json.dumps(message.media_paths[:3]),
                     str(origin.get('original_type',''))[:20],
+                    json.dumps({key:origin[key] for key in ['source','local_id','server_id','created_at','audio_sha256','asr_uncertain','original_type','member_external_ids','owner_corrected_input'] if key in origin}),
                 ),
             )
             if cur.rowcount:

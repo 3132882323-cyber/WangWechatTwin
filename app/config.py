@@ -12,7 +12,9 @@ from app.models import ContactProfile
 
 
 class OpenAISettings(BaseModel):
-    provider: Literal["auto", "api", "account", "web"] = "auto"
+    deepseek_drafts: bool=False
+    deepseek_fast: bool=False
+    provider: Literal["auto", "api", "account", "web", "deepseek_web", "hybrid_web"] = "auto"
     web_reply_timeout_seconds: float = 180
     primary_model: str = "gpt-6-luna"
     high_risk_model: str = "gpt-6.1-sol"
@@ -90,6 +92,7 @@ class WebSettings(BaseModel):
 
 
 class PathSettings(BaseModel):
+    personal_database: str='.runtime/personal_memory.sqlite3'
     role_profile: str = '.runtime/history_reader/role_profile.json'
     chat_memory: str = ".runtime/history_reader/chat_memory.sqlite3"
     browser_bridge: str = ".runtime/browser_bridge"

@@ -128,6 +128,22 @@ class PromptBuilder:
         payload['owner_role_profile']=substantive_examples(payload['owner_role_profile'])
         payload['reply_quality_rule']='本人最新要求认真接话，不要用哈哈、笑脸或重复起哄代替实质回复。回答具体内容；无需回复时选择 ignore，不凑字数、不编造本人事实。'
         payload['owner_feedback_priority'] = '本人审核修改 > 当前明确立场及事实 > 当前联系人相似情境原话 > 当前联系人习惯 > 全局表达统计。不能拿样例内容替代事实判断。'
+        from app.personal_memory import PersonalMemory
+        personal=PersonalMemory(self.config.resolve(self.config.paths.personal_database))
+        latest=personal.recent(message.contact)
+        payload['current_personal_conversation']=latest
+        payload['personal_database_rule']='这是当前联系人最新的双向聊天记录，含本人亲手发出的原文。ai_generated 是模型生成，不是新的本人事实或人工风格样例；automatic_transcription 是待核实听写。先理解本人刚说过什么及对方回应的对象，不要把对方的话当作本人经历。'
+        try:note_origin=json.loads(message.raw_summary or '{}')
+        except ValueError:note_origin={}
+        payload['optional_model_candidates']=personal.notes([message.external_id]+note_origin.get('member_external_ids',[]),message.contact) if self.config.openai.provider!='deepseek_web' else []
+        payload['model_candidate_rule']='其他模型的候选只作第二种理解，不是本人原话或已确认事实；不等待候选，优先本人最新消息，过时和矛盾候选丢弃。'
+        if not message.media_paths and re.search(r'这个|图片|照片|好看|怎么样|颜色|款|你看',message.content):
+            import time
+            for record in reversed(latest):
+                if record['direction']=='out' and record['media_paths'] and time.time()-record['at']<21600:
+                    payload['__media_paths']=record['media_paths'][:3]
+                    payload['owner_image_context']='所附图片是本人先前发给当前联系人的图片，对方可能在回应它；不要误认为是对方新发的图片。'
+                    break
         if message.display_name:
             payload["contact_profile"]["name"] = message.display_name
         try:

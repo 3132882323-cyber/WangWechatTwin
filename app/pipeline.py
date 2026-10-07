@@ -174,8 +174,8 @@ class ReplyPipeline:
         risk = assess_risk(message.content)
         inbound_id = self.db.add_incoming(message, risk=risk.level.value)
         vision_ready=(self.db.get_state('browser_bridge') or {}).get('build') in {'sticker-vision-v1','fast-sticker-v2'}
-        recognized_sticker=message.message_type=='sticker' and 0<len(message.media_paths)<=3 and self.config.openai.provider=='web' and vision_ready
-        recognized_image=message.message_type=='image' and 0<len(message.media_paths)<=3 and self.config.openai.provider=='web' and vision_ready
+        recognized_sticker=message.message_type=='sticker' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web'} and vision_ready
+        recognized_image=message.message_type=='image' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web'} and vision_ready
         if message.message_type != "text" and not (recognized_sticker or recognized_image):
             decision = ReplyDecision(action="review", risk=RiskLevel.medium, reply="",
                                      reason="非文字内容尚未解析，需本人查看；不自动回复未知内容", confidence=0)
@@ -222,11 +222,11 @@ class ReplyPipeline:
                 self.db.add_event("llm_error", str(exc), level="error", contact=message.contact)
                 decision = self._fallback(risk.level, risk.safe_holding_reply, str(exc))
 
-        if decision.action!='ignore' and laughter_only(decision.reply):
+        if decision.action!='ignore' and (laughter_only(decision.reply) or not decision.reply.strip()):
             try:
                 corrected=json.loads(payload)
                 corrected['reply_quality_feedback']={'rejected_reply':decision.reply,
-                    'instruction':'这个回复只有笑声，没有回应对方内容。请重新理解本轮消息与上下文，认真给出有内容的本人式回复；不需要接话则 ignore。不要编造事实或承诺。'}
+                    'instruction':'这个回复没有有效正文或只有笑声，没有回应对方内容。请重新理解本轮消息与上下文，认真给出有内容的本人式回复；不需要接话则 ignore。review 也必须包含草稿正文。不要编造事实或承诺。'}
                 self.db.add_event('reply_quality_retry','空泛笑声回复已拦截，重新生成一次',contact=message.contact)
                 decision=self.llm.decide(self.prompt_builder.system_prompt(),json.dumps(corrected,ensure_ascii=False),risk.level)
             except (LLMError,ValueError,AttributeError):
@@ -239,6 +239,7 @@ class ReplyPipeline:
                 return ProcessResult(status='draft',decision=decision,draft_id=draft_id)
         if not laughter_only(decision.reply):decision.reply=trim_laughter(decision.reply)
         mode = self._mode(contact)
+        if json.loads(message.raw_summary or '{}').get('owner_corrected_input'):mode='shadow'
         if recognized_sticker or recognized_image:
             if not decision.media_description or decision.media_confidence<.75:
                 decision.action='review';decision.reason+='；图片或表情识别不确定，留审核'
@@ -324,6 +325,8 @@ class ReplyPipeline:
             return 0
         sent = 0
         for draft in self.db.approved_drafts():
+            if draft.kind=='deepseek_candidate':
+                self.db.update_draft(draft.id,'pending');continue
             text = (draft.edited_reply or draft.reply).strip()
             if not text:
                 self.db.update_draft(draft.id, "failed")

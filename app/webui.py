@@ -35,7 +35,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
     draft_only = config.mode in {"shadow", "off"}
     for draft in drafts:
         contact_label=test_labels.get(draft.contact,'网页连接自检（测试草稿，不发送）' if draft.contact.startswith('__web_self_test__') else labels.get(draft.contact,draft.contact))
-        allowed = (not draft.contact.startswith('__web_self_test__') and not draft_only and (config.adapter != "history_verified_sender"
+        allowed = (draft.kind!='deepseek_candidate' and not draft.contact.startswith('__web_self_test__') and not draft_only and (config.adapter != "history_verified_sender"
                    or config.wechat.sender_all_existing_chats or draft.contact in config.wechat.sender_allowed_contacts))
         approve_action = "approve" if allowed else "save"
         approve_label = ("批准这次主动联系" if draft.kind=='proactive' else "批准发送并学习我的修改") if allowed else "保存我的修改"
@@ -58,6 +58,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
               {source_label}{description}<div class="media-previews">{''.join(previews)}</div>
               <div class="reason"><strong>系统判断：</strong>{html.escape(draft.reason)}</div>
               {'<img alt="拟发送的表情图片" style="max-width:240px;max-height:240px" src="/sticker-preview/'+html.escape(draft.sticker_id)+'">' if draft.kind=='sticker' else ''}
+              {f'<form method="post" action="/draft/{draft.id}/correct-input"><input type="hidden" name="_csrf" value="{csrf_token}"><label for="input-correction-{draft.id}">听写或理解有误？改正原文后重新生成草稿</label><textarea id="input-correction-{draft.id}" name="corrected_input">{html.escape(draft.incoming_content or "")}</textarea><button type="submit">保存识别纠正并重新起草</button></form>' if draft.inbound_message_id and draft.kind=='reply' else ''}
               <form method="post" action="/draft/{draft.id}/{approve_action}">
                 <input type="hidden" name="_csrf" value="{csrf_token}">
                 <label for="draft-reply-{draft.id}">拟发送内容</label>
@@ -87,6 +88,12 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
         detail = "日常文字自动回复，重要事项留草稿" if event["event_type"] == "runtime_started" and not draft_only else "只生成草稿，不发送" if event["event_type"] == "runtime_started" else event["detail"]
         rendered_events.append(f"<tr><td>{html.escape(when)}</td><td>{html.escape(str(title))}</td><td>{html.escape(str(contact))}</td><td>{html.escape(str(detail))}</td></tr>")
     event_rows = "".join(rendered_events)
+    from app.personal_memory import PersonalMemory
+    from contextlib import closing
+    personal=PersonalMemory(config.resolve(config.paths.personal_database))
+    with closing(personal.connect()) as personal_db:
+        personal_count=personal_db.execute('SELECT count(*) FROM observations').fetchone()[0]
+        correction_count=personal_db.execute('SELECT count(*) FROM corrections').fetchone()[0]
     return f"""
 <!doctype html>
 <html lang="zh-CN">
@@ -112,6 +119,7 @@ small{{color:#9ca3af}}
 <header><div><strong>微信聊天分身</strong><br><small>{'当前只生成草稿，不会发送微信消息' if draft_only else '已接管已有聊天：日常文字自动回复，重要事项待审核；群聊只处理@你的消息' if config.wechat.sender_all_existing_chats else '仅接管已确认的测试联系人，其他联系人只生成草稿' if config.adapter == 'history_verified_sender' else '已开启发送功能'}</small></div>
 <div><span class="badge">{'已暂停' if paused else '运行中'}</span></div></header>
 <main>
+<section class="card"><strong>本人的专属聊天数据库</strong><p>已保存 {personal_count} 条双向记录，识别纠正 {correction_count} 条。本人原文、AI 回复与听写结果分开记录；本人发出的文字和已解码媒体也进入当前聊天上下文。{'日常文字由 DeepSeek 快速模式回复，复杂内容与图片交给 GPT 最高档；两个模型共用一条发送通道。' if config.openai.provider=='hybrid_web' else 'DeepSeek 仅生成对照草稿，不直接发送。'}</p></section>
 <div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
 <form method="post" action="/{'resume' if paused else 'pause'}"><input type="hidden" name="_csrf" value="{csrf_token}"><button class="pause">{'恢复处理' if paused else '立即暂停'}</button></form>
 <section class="card"><strong>主动聊天：{'已开启建议' if config.proactive.enabled else '未开启'}</strong><p>问候与话题跟进均先生成草稿，你批准后才联系对方。每天最多 {config.proactive.max_drafts_per_day} 条；同一联系人至少间隔 {config.proactive.cooldown_hours:g} 小时；北京时间 {config.proactive.active_start_hour}:00—{config.proactive.active_end_hour}:00 生成建议。已有未回复消息时不再催聊。</p></section>
@@ -150,11 +158,13 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 auth=await asyncio.wait_for(socket.receive_json(),timeout=5)
                 if not secrets.compare_digest(str(auth.get('token','')),bridge_token):
                     await socket.close(code=1008);return
+                provider=auth.get('provider','chatgpt')
+                if provider not in {'chatgpt','deepseek'}:await socket.close(code=1008);return
                 pulse=0;notified=0
                 while True:
                     now=time.time();paused=config.resolve(config.paths.pause_file).exists()
                     with queue.connect() as conn:
-                        pending=conn.execute("SELECT 1 FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) LIMIT 1",(now,int(paused))).fetchone()
+                        pending=conn.execute("SELECT 1 FROM jobs WHERE status='pending' AND provider=? AND expires>? AND (?=0 OR is_test=1) LIMIT 1",(provider,now,int(paused))).fetchone()
                     if pending and now-notified>=.5:
                         await socket.send_json({'type':'ready'});notified=now;pulse=now
                     elif now-pulse>=20:
@@ -171,12 +181,15 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         @app.get('/browser-bridge/next')
         async def browser_next(request: Request):
             bridge_auth(request)
-            if request.headers.get('x-wechat-bridge-version') == '4':
+            provider=request.headers.get('x-wechat-bridge-provider','chatgpt')
+            if provider not in {'chatgpt','deepseek'}:raise HTTPException(400,'未知网页提供方')
+            if provider=='chatgpt' and request.headers.get('x-wechat-bridge-version') == '4':
                 db.set_state('browser_bridge', {'version':4,'seen_at':time.time(),'max_owned_tabs':3,'build':request.headers.get('x-wechat-bridge-build','original')})
+            elif provider=='deepseek':db.set_state('deepseek_bridge',{'seen_at':time.time(),'draft_only':True})
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                row = conn.execute("SELECT id,prompt,conversation_key,images,created FROM jobs WHERE status='pending' AND expires>? AND (?=0 OR is_test=1) ORDER BY is_test ASC,created LIMIT 1", (time.time(), int(paused))).fetchone()
+                row = conn.execute("SELECT id,prompt,conversation_key,images,created FROM jobs WHERE status='pending' AND provider=? AND expires>? AND (?=0 OR is_test=1) ORDER BY is_test ASC,created LIMIT 1", (provider,time.time(), int(paused))).fetchone()
                 if row:
                     conn.execute("UPDATE jobs SET status='claimed' WHERE id=?", (row[0],))
             return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0],'images':json.loads(row[3]),'created':row[4]} if row else None}
@@ -186,7 +199,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             bridge_auth(request)
             body = await request.json()
             with queue.connect() as conn:
-                test_row = conn.execute('SELECT is_test FROM jobs WHERE id=?', (body.get('id',''),)).fetchone()
+                test_row = conn.execute('SELECT is_test,provider FROM jobs WHERE id=?', (body.get('id',''),)).fetchone()
             if config.resolve(config.paths.pause_file).exists() and not (test_row and test_row[0]):
                 raise HTTPException(409, '已暂停')
             if body.get('error'):
@@ -194,7 +207,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                     changed=conn.execute("UPDATE jobs SET status='failed',prompt='' WHERE id=? AND status='claimed'", (body['id'],)).rowcount
                 if changed != 1:
                     raise HTTPException(409,'任务已过期或已处理')
-                if test_row and test_row[0]:
+                if test_row and (test_row[0] or test_row[1]=='deepseek'):
                     db.add_event('browser_test_error','独立浏览器验证失败；未暂停生产回复')
                 else:
                     from app.browser_health import failed
@@ -204,7 +217,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 queue.complete(body['id'], body['result'],body.get('browser_meta'))
             except (ValueError, KeyError):
                 raise HTTPException(409, '任务或结果无效')
-            if not (test_row and test_row[0]):
+            if not (test_row and (test_row[0] or test_row[1]=='deepseek')):
                 from app.browser_health import succeeded
                 succeeded(db)
             return {'ok': True}
@@ -260,6 +273,8 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
     @app.post("/draft/{draft_id}/approve")
     async def approve(draft_id: int, request: Request) -> RedirectResponse:
         await owner_action(request)
+        candidate=next((draft for draft in db.list_drafts(status='pending',limit=1000) if draft.id==draft_id),None)
+        if candidate and candidate.kind=='deepseek_candidate':raise HTTPException(403,'DeepSeek 对照草稿暂不允许直接发送')
         if config.mode in {"shadow", "off"}:
             raise HTTPException(status_code=403, detail="当前只生成草稿，未开启发送")
         if config.adapter == "history_verified_sender":
@@ -287,6 +302,27 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             db.update_draft(draft_id, "pending", reply)
             db.add_event("draft_saved", f"草稿 #{draft_id} 修改已保存，未批准发送")
         return RedirectResponse(url="/", status_code=303)
+
+    @app.post('/draft/{draft_id}/correct-input')
+    async def correct_input(draft_id:int,request:Request):
+        await owner_action(request)
+        body=parse_qs((await request.body()).decode('utf-8',errors='replace'));corrected=body.get('corrected_input',[''])[0].strip()
+        if not corrected or len(corrected)>4000:raise HTTPException(400,'纠正内容为空或过长')
+        with db.connect() as connection:
+            row=connection.execute("SELECT m.external_id,m.contact,m.sender,m.content,m.created_at,m.source_metadata FROM drafts d JOIN messages m ON m.id=d.inbound_message_id WHERE d.id=? AND d.status='pending'",(draft_id,)).fetchone()
+            if not row:raise HTTPException(409,'草稿已处理，请刷新')
+        from app.personal_memory import PersonalMemory
+        from app.models import IncomingMessage
+        import uuid
+        personal=PersonalMemory(config.resolve(config.paths.personal_database));personal.correct(row[0],row[1],row[3],corrected)
+        origin=json.loads(row[5] or '{}');origin.update(owner_corrected_input=True,asr_uncertain=False)
+        message=IncomingMessage(external_id='corrected:'+uuid.uuid4().hex,contact=row[1],sender=row[2],content=corrected,
+            received_at=datetime.fromisoformat(row[4]),raw_summary=json.dumps(origin))
+        with db.connect() as connection:
+            connection.execute('CREATE TABLE IF NOT EXISTS reply_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,contact TEXT,payload TEXT,status TEXT,created REAL,updated REAL)')
+            connection.execute("INSERT INTO reply_jobs(contact,payload,status,created,updated) VALUES(?,?,'pending',?,?)",(message.contact,message.model_dump_json(),time.time(),time.time()))
+        db.update_draft(draft_id,'superseded');db.add_event('input_corrected','本人纠正识别原文，已重新排队起草，不自动发送',contact=message.contact)
+        return RedirectResponse('/',status_code=303)
 
     @app.post("/draft/{draft_id}/dismiss")
     async def dismiss(draft_id: int, request: Request) -> RedirectResponse:

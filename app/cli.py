@@ -114,7 +114,9 @@ def merge_incoming_messages(messages: list[IncomingMessage]) -> list[IncomingMes
             origins.append(origin if isinstance(origin,dict) else {})
         latest_index=max(range(len(items)),key=lambda index:items[index].received_at)
         summary=dict(origins[latest_index])
-        summary.update(merged_count=len(items),member_external_ids=[item.external_id for item in items],
+        members=[]
+        for item,origin in zip(items,origins):members.extend([item.external_id]+origin.get('member_external_ids',[]))
+        summary.update(merged_count=len(items),member_external_ids=list(dict.fromkeys(members)),
                        asr_uncertain=any(origin.get('asr_uncertain') for origin in origins))
         if any(origin.get('original_type')=='voice' for origin in origins):
             summary.update(original_type='voice',transcription_source='offline_whisper')
@@ -247,6 +249,8 @@ def command_run(args: argparse.Namespace) -> int:
         return 2
 
     adapter = None
+    scheduler = None
+    candidates = None
     started = False
     try:
         try:
@@ -255,6 +259,11 @@ def command_run(args: argparse.Namespace) -> int:
             print(f"启动微信适配器失败：{exc}", file=sys.stderr)
             return 2
         pipeline = ReplyPipeline(config, db)
+        from app.reply_scheduler import ReplyScheduler
+        scheduler=ReplyScheduler(config,db,pipeline,adapter)
+        if config.openai.deepseek_drafts:
+            from app.deepseek_candidates import DeepseekCandidates
+            candidates=DeepseekCandidates(config,db)
         from app.proactive import ProactivePlanner
         proactive_planner = ProactivePlanner(config, db, adapter)
         start_webui(config, db)
@@ -270,13 +279,10 @@ def command_run(args: argparse.Namespace) -> int:
             while True:
                 if config.resolve(config.paths.pause_file).exists():
                     time.sleep(max(config.wechat.poll_seconds, 1.0))
-                    continue
                 try:
-                    pipeline.send_approved(adapter)
                     messages = merge_incoming_messages(adapter.poll())
-                    for message in messages:
-                        result = pipeline.process(message, adapter)
-                        print(f"[{message.contact}] {result.status}")
+                    scheduler.submit(messages)
+                    if candidates:candidates.submit(messages)
                     proactive_planner.tick()
                 except WxAutoUnavailable as exc:
                     db.add_event("adapter_error", str(exc), level="error")
@@ -291,6 +297,8 @@ def command_run(args: argparse.Namespace) -> int:
             print("\n已停止。")
         return 0
     finally:
+        if scheduler:scheduler.close()
+        if candidates:candidates.close()
         if adapter is not None:
             try:
                 adapter.close()
