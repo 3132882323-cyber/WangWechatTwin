@@ -15,15 +15,24 @@ class ReplyScheduler:
                 message=IncomingMessage.model_validate_json(payload);origin=json.loads(message.raw_summary or '{}');origin['resume_incomplete']=True
                 message=message.model_copy(update={'raw_summary':json.dumps(origin)})
                 connection.execute("UPDATE reply_jobs SET status='pending',payload=?,updated=? WHERE id=?",(message.model_dump_json(),time.time(),identity))
-        self.threads=[threading.Thread(target=self.run,args=(lane,),daemon=True,name='wechat-reply-'+lane) for lane in ('deepseek','chatgpt')]
+        self.threads=[threading.Thread(target=self.run,args=(lane,),daemon=True,name='wechat-reply-'+lane) for lane in ('deepseek','chatgpt','doubao')]
         self.thread=self.threads[0]
         for thread in self.threads:thread.start()
 
     @staticmethod
     def category(message):return 'text' if message.message_type=='text' else 'visual'
 
+    @staticmethod
+    def recovering(message):return bool(json.loads(message.raw_summary or '{}').get('resume_incomplete'))
+
     @classmethod
-    def compatible(cls,left,right):return cls.category(left)==cls.category(right)
+    def compatible(cls,left,right):
+        return not cls.recovering(left) and not cls.recovering(right) and cls.category(left)==cls.category(right)
+
+    @classmethod
+    def occupancy_key(cls,message):
+        # Recovery can only draft; it must not hold another model's live replies.
+        return message.contact,cls.category(message),cls.recovering(message)
 
     def submit(self,messages):
         from app.cli import merge_incoming_messages
@@ -38,8 +47,9 @@ class ReplyScheduler:
                     previous=IncomingMessage.model_validate_json(pending[1]);merged=merge_incoming_messages([previous,message])[0]
                     connection.execute('UPDATE reply_jobs SET payload=?,updated=? WHERE id=?',(merged.model_dump_json(),now,pending[0]))
                 else:
-                    active=connection.execute("SELECT payload FROM reply_jobs WHERE contact=? AND status='working' ORDER BY id DESC LIMIT 1",(message.contact,)).fetchone()
-                    if active and self.compatible(IncomingMessage.model_validate_json(active[0]),message):
+                    active_candidates=connection.execute("SELECT payload FROM reply_jobs WHERE contact=? AND status='working' ORDER BY id DESC",(message.contact,)).fetchall()
+                    active=next((row for row in active_candidates if self.compatible(IncomingMessage.model_validate_json(row[0]),message)),None)
+                    if active:
                         previous=IncomingMessage.model_validate_json(active[0]);message=merge_incoming_messages([previous,message])[0]
                     connection.execute('INSERT INTO reply_jobs(contact,payload,status,created,updated) VALUES(?,?,\'pending\',?,?)',(message.contact,message.model_dump_json(),now,now))
                 connection.execute('COMMIT')
@@ -53,15 +63,18 @@ class ReplyScheduler:
 
     def run(self,lane='deepseek'):
         while not self.stop.is_set():
+            if lane=='chatgpt' and (self.db.get_state('browser_failures') or {}).get('blocked_until',0)>time.time():
+                self.stop.wait(.5);continue
             if self.config.resolve(self.config.paths.pause_file).exists():self.wake.wait(.5);self.wake.clear();continue
             try:
                 row=None
                 if lane=='deepseek':self.pipeline.send_approved(self.adapter)
                 with self.db.connect() as connection:
                     connection.execute('BEGIN IMMEDIATE')
-                    candidates=connection.execute("SELECT id,payload,contact FROM reply_jobs WHERE status='pending' AND updated<? ORDER BY id",(time.time()-.35,)).fetchall()
-                    occupied={(contact,self.category(IncomingMessage.model_validate_json(payload))) for contact,payload in connection.execute("SELECT contact,payload FROM reply_jobs WHERE status='working'")}
-                    row=next(((identity,payload) for identity,payload,contact in candidates if (contact,self.category(IncomingMessage.model_validate_json(payload))) not in occupied and self.lane(IncomingMessage.model_validate_json(payload))==lane),None)
+                    candidates=[(identity,payload,IncomingMessage.model_validate_json(payload)) for identity,payload in connection.execute("SELECT id,payload FROM reply_jobs WHERE status='pending' AND updated<? ORDER BY id",(time.time()-.35,))]
+                    candidates.sort(key=lambda candidate:(self.recovering(candidate[2]),candidate[0]))
+                    occupied={self.occupancy_key(IncomingMessage.model_validate_json(payload)) for (payload,) in connection.execute("SELECT payload FROM reply_jobs WHERE status='working'")}
+                    row=next(((identity,payload) for identity,payload,message in candidates if self.occupancy_key(message) not in occupied and self.lane(message)==lane),None)
                     if row:connection.execute("UPDATE reply_jobs SET status='working',updated=? WHERE id=?",(time.time(),row[0]))
                     connection.execute('COMMIT')
                 if not row:self.wake.wait(.5);self.wake.clear();continue

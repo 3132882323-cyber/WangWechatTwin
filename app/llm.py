@@ -17,9 +17,10 @@ class ReplyLLM:
         if config.openai.provider=='hybrid_web':
             from app.web_llm import WebReplyLLM
             self.hybrid={'chatgpt':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'web'})})),
-                         'deepseek':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'deepseek_web'})}))}
+                         'deepseek':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'deepseek_web'})})),
+                         'doubao':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'doubao_web'})}))}
             return
-        if config.openai.provider in {"web","deepseek_web"}:
+        if config.openai.provider in {"web","deepseek_web","doubao_web"}:
             from app.web_llm import WebReplyLLM
             self.account = WebReplyLLM(config)
             return
@@ -51,8 +52,10 @@ class ReplyLLM:
         import json,re
         parsed=json.loads(user_payload);text=parsed.get('incoming',{}).get('content','')
         visual=parsed.get('incoming',{}).get('message_type') in {'image','sticker'} or bool(parsed.get('__media_paths'))
-        complex_task=risk!=RiskLevel.low or visual or len(text)>160 or bool(re.search('算一下|分析|方案|对比|合同|解释清楚',text))
-        return 'chatgpt' if complex_task else 'deepseek'
+        emotional=bool(re.search('气死|气炸|气疯|愤怒|崩溃|烦死|激动|受不了了|忍不住哭|别烦我|你是不是有病|骗子|混蛋|滚开|分手|不想活|吵架|绝交|别再联系',text))
+        professional=risk in {RiskLevel.high,RiskLevel.critical} or bool(re.search('分析|方案|对比|合同|解释清楚|报价|施工|工期|工程|安装|配置|材料|板材|保温|门窗|排期|调度|财务|电路|代码|技术|法律|税|保险|投资|诊断|治疗|药物|预算|尺寸|图纸',text))
+        if professional or emotional:return 'chatgpt'
+        return 'doubao' if visual else 'deepseek'
 
     def decide(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
         if self.hybrid:

@@ -119,7 +119,7 @@ small{{color:#9ca3af}}
 <header><div><strong>微信聊天分身</strong><br><small>{'当前只生成草稿，不会发送微信消息' if draft_only else '已接管已有聊天：日常文字自动回复，重要事项待审核；群聊只处理@你的消息' if config.wechat.sender_all_existing_chats else '仅接管已确认的测试联系人，其他联系人只生成草稿' if config.adapter == 'history_verified_sender' else '已开启发送功能'}</small></div>
 <div><span class="badge">{'已暂停' if paused else '运行中'}</span></div></header>
 <main>
-<section class="card"><strong>本人的专属聊天数据库</strong><p>已保存 {personal_count} 条双向记录，识别纠正 {correction_count} 条。本人原文、AI 回复与听写结果分开记录；本人发出的文字和已解码媒体也进入当前聊天上下文。{'日常文字由 DeepSeek 快速模式回复，复杂内容与图片交给 GPT 最高档；两个模型共用一条发送通道。' if config.openai.provider=='hybrid_web' else 'DeepSeek 仅生成对照草稿，不直接发送。'}</p></section>
+<section class="card"><strong>本人的专属聊天数据库</strong><p>已保存 {personal_count} 条双向记录，识别纠正 {correction_count} 条。本人原文、AI 回复与听写结果分开记录；本人发出的文字和已解码媒体也进入当前聊天上下文。{'日常文字与语音转写由 DeepSeek 回复，图片表情交给豆包，专业与激动情绪交给 GPT；共用本机审核及发送规则。' if config.openai.provider=='hybrid_web' else 'DeepSeek 仅生成对照草稿，不直接发送。'}</p></section>
 <div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
 <form method="post" action="/{'resume' if paused else 'pause'}"><input type="hidden" name="_csrf" value="{csrf_token}"><button class="pause">{'恢复处理' if paused else '立即暂停'}</button></form>
 <section class="card"><strong>主动聊天：{'已开启建议' if config.proactive.enabled else '未开启'}</strong><p>问候与话题跟进均先生成草稿，你批准后才联系对方。每天最多 {config.proactive.max_drafts_per_day} 条；同一联系人至少间隔 {config.proactive.cooldown_hours:g} 小时；北京时间 {config.proactive.active_start_hour}:00—{config.proactive.active_end_hour}:00 生成建议。已有未回复消息时不再催聊。</p></section>
@@ -143,7 +143,7 @@ setInterval(function(){{
 def create_app(config: AppConfig, db: Database) -> FastAPI:
     app = FastAPI(title="微信聊天分身")
     app.state.csrf_token = secrets.token_urlsafe(32)
-    if config.openai.provider in {'web','deepseek_web','hybrid_web'}:
+    if config.openai.provider in {'web','deepseek_web','doubao_web','hybrid_web'}:
         from app.web_llm import WebReplyLLM
         queue = WebReplyLLM(config)
         token_path = config.resolve(config.paths.browser_bridge) / 'pairing_token.txt'
@@ -159,7 +159,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 if not secrets.compare_digest(str(auth.get('token','')),bridge_token):
                     await socket.close(code=1008);return
                 provider=auth.get('provider','chatgpt')
-                if provider not in {'chatgpt','deepseek'}:await socket.close(code=1008);return
+                if provider not in {'chatgpt','deepseek','doubao'}:await socket.close(code=1008);return
                 pulse=0;notified=0
                 while True:
                     now=time.time();paused=config.resolve(config.paths.pause_file).exists()
@@ -182,10 +182,10 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         async def browser_next(request: Request):
             bridge_auth(request)
             provider=request.headers.get('x-wechat-bridge-provider','chatgpt')
-            if provider not in {'chatgpt','deepseek'}:raise HTTPException(400,'未知网页提供方')
+            if provider not in {'chatgpt','deepseek','doubao'}:raise HTTPException(400,'未知网页提供方')
             if provider=='chatgpt' and request.headers.get('x-wechat-bridge-version') == '4':
                 db.set_state('browser_bridge', {'version':4,'seen_at':time.time(),'max_owned_tabs':3,'build':request.headers.get('x-wechat-bridge-build','original')})
-            elif provider=='deepseek':db.set_state('deepseek_bridge',{'seen_at':time.time(),'draft_only':True})
+            elif provider in {'deepseek','doubao'}:db.set_state(provider+'_bridge',{'seen_at':time.time(),'ready':True})
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
@@ -207,7 +207,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                     changed=conn.execute("UPDATE jobs SET status='failed',prompt='' WHERE id=? AND status='claimed'", (body['id'],)).rowcount
                 if changed != 1:
                     raise HTTPException(409,'任务已过期或已处理')
-                if test_row and (test_row[0] or test_row[1]=='deepseek'):
+                if test_row and (test_row[0] or test_row[1] in {'deepseek','doubao'}):
                     db.add_event('browser_test_error','独立浏览器验证失败；未暂停生产回复')
                 else:
                     from app.browser_health import failed
@@ -217,7 +217,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 queue.complete(body['id'], body['result'],body.get('browser_meta'))
             except (ValueError, KeyError):
                 raise HTTPException(409, '任务或结果无效')
-            if not (test_row and (test_row[0] or test_row[1]=='deepseek')):
+            if not (test_row and (test_row[0] or test_row[1] in {'deepseek','doubao'})):
                 from app.browser_health import succeeded
                 succeeded(db)
             return {'ok': True}

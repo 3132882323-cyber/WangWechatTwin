@@ -240,3 +240,10 @@ def test_interrupted_registered_message_recovers_as_draft_without_resending(tmp_
     assert result.status=='draft' and not adapter.sent
     assert pipeline.process(recovered,adapter).status=='duplicate'
     with db.connect() as conn:assert conn.execute("SELECT count(*) FROM drafts").fetchone()[0]==1
+
+
+def test_agitated_reply_stays_review_despite_model_send(tmp_path):
+    cfg=make_config(tmp_path,'low_risk_auto');db=Database(cfg.resolve(cfg.paths.database));adapter=MockAdapter()
+    llm=FakeLLM(ReplyDecision(action='send',risk=RiskLevel.low,reply='你先说具体咋回事',confidence=.99))
+    result=ReplyPipeline(cfg,db,llm).process(IncomingMessage(external_id='emotion',contact='张三',sender='张三',content='气死我了，你是不是有病'),adapter)
+    assert result.status=='draft' and not adapter.sent

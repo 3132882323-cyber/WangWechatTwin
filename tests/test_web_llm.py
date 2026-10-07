@@ -44,3 +44,20 @@ def test_browser_completion_metadata_tracks_reuse_without_raw_urls(tmp_path):
     q.complete('pool','{"action":"review","risk":"low","reply":"第二轮"}',{'tab_id':1,'turn':2,'reused':True,'raw_url':'private-url'})
     with q.connect() as db:meta=json.loads(db.execute("SELECT browser_meta FROM jobs WHERE id='pool'").fetchone()[0])
     assert meta['reused'] is True and meta['turn']==2 and 'raw_url' not in meta
+
+
+def test_pause_allows_only_explicit_virtual_queue_verification(tmp_path,monkeypatch):
+    import json
+    from app.web_llm import WebReplyLLM
+    cfg=AppConfig(project_root=tmp_path,openai={'provider':'deepseek_web','web_reply_timeout_seconds':2})
+    cfg.resolve(cfg.paths.pause_file).parent.mkdir(parents=True,exist_ok=True);cfg.resolve(cfg.paths.pause_file).touch()
+    llm=WebReplyLLM(cfg)
+    def finish(_):
+        with llm.connect() as conn:
+            row=conn.execute("SELECT id,is_test FROM jobs WHERE status='pending' ORDER BY created DESC LIMIT 1").fetchone()
+        assert row[1]==1
+        llm.complete(row[0],json.dumps({'action':'review','risk':'low','reply':'测试完成'}))
+    monkeypatch.setattr('app.web_llm.time.sleep',finish)
+    result=llm.decide('test',json.dumps({'__is_local_test':True,'incoming':{'content':'虚构'}}),RiskLevel.low)
+    assert result.reply=='测试完成'
+    with pytest.raises(LLMError,match='已暂停'):llm.decide('production',json.dumps({'incoming':{'content':'正常消息'}}),RiskLevel.low)

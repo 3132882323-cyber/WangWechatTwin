@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "微信分身专用网页连接",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "permissions": [
     "alarms",
     "storage",
@@ -10,7 +10,8 @@
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.deepseek.com/*",
-    "http://127.0.0.1:18769/*"
+    "http://127.0.0.1:18769/*",
+    "https://www.doubao.com/*"
   ],
   "background": {
     "service_worker": "background.js"

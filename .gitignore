@@ -28,3 +28,5 @@ native_transport/*.dll
 native_transport/*.lib
 native_transport/*.exp
 native_transport/*.obj
+
+*-bootstrap.local.json

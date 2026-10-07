@@ -85,6 +85,7 @@ class HistoryHTTPSender(MessageAdapter):
         self.context, self.context_origin = {}, {}
         self.last_send_skip_reason = "本机微信接口尚未验证"
         self.reply_context=ContextVar('wechat_reply_context',default=None)
+        self.approval_context=ContextVar('wechat_approval_context',default=None)
         self.latest_inbound={}
         from app.media_voice import OfflineVoiceProcessor
         self.voice_processor=OfflineVoiceProcessor(config,self.reader)
@@ -139,6 +140,14 @@ class HistoryHTTPSender(MessageAdapter):
         token=self.reply_context.set((message.contact,message.external_id,json.loads(message.raw_summary or '{}')))
         try:yield
         finally:self.reply_context.reset(token)
+
+    @contextmanager
+    def bind_approval(self,contact,draft_id):
+        if not contact or type(draft_id) is not int or draft_id <= 0:
+            raise ValueError('人工批准必须绑定联系人和有效草稿编号')
+        token=self.approval_context.set((contact,draft_id))
+        try:yield
+        finally:self.approval_context.reset(token)
 
     def close(self):
         self.voice_processor.close()
@@ -231,7 +240,10 @@ class HistoryHTTPSender(MessageAdapter):
             return self._skip("群聊自动发送未开启")
         if self.config.resolve(self.config.paths.pause_file).exists():
             return self._skip("后台已暂停")
-        manual = getattr(self, "manual_approval_in_progress", False)
+        approval=self.approval_context.get() if hasattr(self,'approval_context') else None
+        if approval and approval[0]!=contact:
+            return self._skip('人工批准的联系人与发送目标不一致')
+        manual = approval is not None
         if not text.strip() or len(text) > self.config.wechat.max_reply_chars:
             return self._skip("回复为空或过长")
         if not manual and assess_risk(text).level != RiskLevel.low:
@@ -239,6 +251,7 @@ class HistoryHTTPSender(MessageAdapter):
         bound=self.reply_context.get() if hasattr(self,'reply_context') else None
         origin=bound[2] if bound and bound[0]==contact else self.context_origin.get(contact)
         context=bound[1] if bound and bound[0]==contact else self.context.get(contact)
+        if manual:context='approved:'+str(approval[1])
         newest=self.latest_inbound.get(contact) if hasattr(self,'latest_inbound') else None
         if not manual and origin and newest and ((newest.get('source')==origin.get('source') and newest.get('local_id',0)>origin.get('local_id',0)) or newest.get('created_at',0)>origin.get('created_at',0)):
             return self._skip('生成期间已有新的对方消息，取消旧回复，等待最新一轮')
@@ -302,7 +315,9 @@ class HistoryHTTPSender(MessageAdapter):
     def send_sticker(self,contact,digest):
         from app.sticker_catalog import item
         import shutil
-        if not getattr(self,'manual_approval_in_progress',False):return self._skip('表情图片需要逐条批准')
+        approval=self.approval_context.get() if hasattr(self,'approval_context') else None
+        if approval is None:return self._skip('表情图片需要逐条批准')
+        if approval[0]!=contact:return self._skip('人工批准的联系人与发送目标不一致')
         if self.config.wechat.sender_all_existing_chats:self.allowed.update(self._eligible_contacts())
         if self.config.mode in {'shadow','off'} or contact not in self.allowed or contact.endswith('@chatroom'):
             return self._skip('当前模式或联系人范围不允许发送表情')
@@ -319,7 +334,7 @@ class HistoryHTTPSender(MessageAdapter):
         root.mkdir(exist_ok=True);path=root/entry['original_path'].name
         shutil.copyfile(entry['original_path'],path)
         if hashlib.md5(path.read_bytes()).hexdigest()!=digest:raise LocalAPIError('表情图片暂存校验失败')
-        token=hashlib.sha256((contact+'|sticker|'+str(getattr(self,'approved_draft_id',''))+'|'+digest).encode()).hexdigest()
+        token=hashlib.sha256((contact+'|sticker|'+str(approval[1])+'|'+digest).encode()).hexdigest()
         claims=self.reader.root/'send_claims';claims.mkdir(exist_ok=True);marker=claims/(token+'.json')
         if marker.exists():return self._skip('已有表情发送尝试，不重复发送')
         before,_,_=self._stable_outgoing_state(contact,{'md5':digest},time.monotonic()+3)

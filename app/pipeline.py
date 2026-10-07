@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import re
 import json
 from datetime import datetime,timezone,timedelta
@@ -70,6 +71,44 @@ class ReplyPipeline:
     @staticmethod
     def _max_risk(a: RiskLevel, b: RiskLevel) -> RiskLevel:
         return a if RISK_ORDER[a] >= RISK_ORDER[b] else b
+
+    @staticmethod
+    def _neutral_date_question(message, decision, risk, route) -> bool:
+        if (
+            message.message_type != "text" or route != "deepseek"
+            or risk.level != RiskLevel.medium
+            or risk.reasons != ["包含日期、数量、金额或交付信息"]
+            or decision.action != "send" or decision.risk != RiskLevel.low
+            or decision.confidence < .9 or decision.facts_to_confirm
+        ):
+            return False
+        try:
+            origin = json.loads(message.raw_summary or "{}")
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(origin, dict) or any(origin.get(key) for key in (
+            "asr_uncertain", "resume_incomplete", "owner_corrected_input",
+        )):
+            return False
+        # This exception only covers a stated calendar day, never an amount,
+        # quantity, or a request for the owner's action.
+        without_dates, date_count = re.subn(r"(?<!\d)(?:[1-9]|[12]\d|3[01])\s*(?:号|日)", "", message.content)
+        if not date_count or re.search(r"\d|[零〇一二三四五六七八九十百千万两]|钱|元|块|费用|资金|帮|替|代办|陪|一起|咱|我们|能来|能否|能不能|可以|要不要|麻烦|请|安排|约|交付|完工|开工|完成|做好|送货|送到|出发|到达|见面|订票|订房|截止|到期|承诺|保证|你.*(?:来|搬|做)", without_dates):
+            return False
+        reply = decision.reply.strip()
+        if not 0 < len(reply) <= 40 or re.search(
+            r"\d|[零〇一二三四五六七八九十百千万两]|我|咱|一起|承诺|保证|答应|负责|帮|替|陪|能否|能不能|可以|要不要|请|麻烦",
+            reply,
+        ) or assess_risk(reply).level != RiskLevel.low:
+            return False
+        # Full-match a single question about the other person's current state.
+        # Statements, agreements, action requests, and additional clauses fail.
+        return bool(re.fullmatch(
+            r"(?:(?:(?:你(?:那边)?的?|那边的?)?)(?:东西|行李|物品|房间|新家|住处)|你(?:那边|现在|最近)?)"
+            r"(?:都|已经|现在)?(?:收拾|整理|打包|准备|安顿|搬)"
+            r"(?:(?:得差不多|好|完|齐|妥当)?了?(?:吗|没|没有)|得怎么样了?)[？?]?",
+            reply,
+        ))
 
     def _fallback(self, risk: RiskLevel, holding: str | None, error: str) -> ReplyDecision:
         if risk == RiskLevel.low:
@@ -196,8 +235,10 @@ class ReplyPipeline:
         risk = assess_risk(message.content)
         inbound_id = self.db.add_incoming(message, risk=risk.level.value)
         vision_ready=(self.db.get_state('browser_bridge') or {}).get('build') in {'sticker-vision-v1','fast-sticker-v2'}
-        recognized_sticker=message.message_type=='sticker' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web'} and vision_ready
-        recognized_image=message.message_type=='image' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web'} and vision_ready
+        media_route=ReplyLLM.route(json.dumps({'incoming':{'content':message.content,'message_type':message.message_type},'__media_paths':message.media_paths}),risk.level)
+        if media_route=='doubao' and self.config.openai.provider in {'hybrid_web','doubao_web'}:vision_ready=bool((self.db.get_state('doubao_bridge') or {}).get('ready'))
+        recognized_sticker=message.message_type=='sticker' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web','doubao_web'} and vision_ready
+        recognized_image=message.message_type=='image' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web','doubao_web'} and vision_ready
         if message.message_type != "text" and not (recognized_sticker or recognized_image):
             decision = ReplyDecision(action="review", risk=RiskLevel.medium, reply="",
                                      reason="非文字内容尚未解析，需本人查看；不自动回复未知内容", confidence=0)
@@ -263,6 +304,8 @@ class ReplyPipeline:
         mode = self._mode(contact)
         if any(json.loads(message.raw_summary or '{}').get(key) for key in ('owner_corrected_input','resume_incomplete')):
             mode='shadow';decision.reason+='；中断恢复或本人纠正，只起草，不重复发送'
+        if media_route=='chatgpt' and re.search('气死|气炸|气疯|愤怒|崩溃|烦死|激动|受不了了|忍不住哭|别烦我|你是不是有病|骗子|混蛋|滚开|分手|不想活|吵架|绝交|别再联系',message.content):
+            mode='shadow';decision.reason+='；明显激动情绪，先供本人审核'
         if recognized_sticker or recognized_image:
             if not decision.media_description or decision.media_confidence<.75:
                 decision.action='review';decision.reason+='；图片或表情识别不确定，留审核'
@@ -283,12 +326,19 @@ class ReplyPipeline:
                 decision.action='review';decision.facts_to_confirm.append('语音听写含模糊内容或重要数字，需要核对原语音')
                 decision.reason+='；语音转写需要核对'
         except ValueError:pass
-        decision = self._apply_policy(decision, risk.level, mode, risk.safe_holding_reply)
+        neutral_date_question = mode == "low_risk_auto" and self._neutral_date_question(
+            message, decision, risk, media_route,
+        )
+        if neutral_date_question:
+            decision.reason = (decision.reason + "；输入日期仍记为中风险，仅发送无数字、无承诺的对方状态问句").strip("；")
+        policy_risk = RiskLevel.low if neutral_date_question else risk.level
+        decision = self._apply_policy(decision, policy_risk, mode, risk.safe_holding_reply)
         if (
             decision.risk == RiskLevel.low
             and decision.confidence >= 0.8
             and not decision.facts_to_confirm
             and not (recognized_image or recognized_sticker)
+            and not neutral_date_question
         ):
             self.db.add_memories(
                 message.contact,
@@ -343,6 +393,18 @@ class ReplyPipeline:
         self.db.add_event("draft_created", decision.reason, contact=message.contact)
         return ProcessResult(status="draft", decision=decision, draft_id=draft_id)
 
+    @staticmethod
+    @contextmanager
+    def _approval_scope(adapter,contact,draft_id):
+        if hasattr(adapter,'bind_approval'):
+            with adapter.bind_approval(contact,draft_id):yield
+            return
+        # Older adapters still expect these fields; HTTP approval is context-local.
+        adapter.manual_approval_in_progress=True
+        adapter.approved_draft_id=draft_id
+        try:yield
+        finally:adapter.manual_approval_in_progress=False
+
     def send_approved(self, adapter: MessageAdapter) -> int:
         if self.config.mode in {"shadow", "off"}:
             return 0
@@ -361,14 +423,11 @@ class ReplyPipeline:
                     if not hasattr(adapter,'prepare_proactive'):
                         raise RuntimeError('当前连接不支持经过核验的主动联系')
                     adapter.prepare_proactive(draft.contact,draft.id,draft.source_context_ts)
-                adapter.manual_approval_in_progress = True
-                adapter.approved_draft_id=draft.id
-                ok = adapter.send_sticker(draft.contact,draft.sticker_id) if draft.kind=='sticker' else adapter.send_text(draft.contact, text)
+                with self._approval_scope(adapter,draft.contact,draft.id):
+                    ok = adapter.send_sticker(draft.contact,draft.sticker_id) if draft.kind=='sticker' else adapter.send_text(draft.contact, text)
             except Exception as exc:
                 self.db.add_event("approved_send_error", str(exc), level="error", contact=draft.contact)
                 ok = False
-            finally:
-                adapter.manual_approval_in_progress = False
             if ok:
                 self.db.add_outgoing(draft.contact, text, draft.risk)
                 self.db.update_draft(draft.id, "sent")

@@ -39,9 +39,10 @@ class WebReplyLLM:
     def decide(self, system_prompt, user_payload, risk):
         from app.llm import LLMError
         job_id = uuid.uuid4().hex
-        expires = time.time() + self.config.openai.web_reply_timeout_seconds
+        provider_budget={'deepseek_web':90,'doubao_web':120}.get(self.config.openai.provider,self.config.openai.web_reply_timeout_seconds)
+        expires = time.time() + min(self.config.openai.web_reply_timeout_seconds,provider_budget)
         schema = json.dumps(ReplyDecision.model_json_schema(), ensure_ascii=False)
-        if self.config.openai.provider=='deepseek_web':
+        if self.config.openai.provider in {'deepseek_web','doubao_web'}:
             schema=json.dumps({'action':'send','risk':'low','reply':'实际回复正文','confidence':.9,'reason':'简短理由','facts_to_confirm':[],'memory_updates':[],'media_description':'','media_confidence':0,'sticker_id':''},ensure_ascii=False)
             schema+='\n这是输出示例，不是要复制的内容；action 只能为 send/review/hold/ignore，risk 只能为 low/medium/high/critical。不要输出 JSON Schema 或 properties/defs。'
         try:
@@ -50,7 +51,7 @@ class WebReplyLLM:
             media_paths=parsed_payload.pop('__media_paths',[])
             namespace = parsed_payload.get('conversation_key','')
             is_test=parsed_payload.pop('__is_local_test',False) is True
-            if self.config.openai.provider=='deepseek_web':
+            if self.config.openai.provider in {'deepseek_web','doubao_web'}:
                 # Keep current two-way context and a few relevant examples; avoid replaying a giant style report.
                 parsed_payload['style_examples']=parsed_payload.get('style_examples',[])[:4]
                 parsed_payload['historical_conversation_memory']=parsed_payload.get('historical_conversation_memory',[])[:6]
@@ -84,12 +85,12 @@ class WebReplyLLM:
         prompt += '\n本轮资料是当前依据。此专用对话只属于一位微信联系人；旧价格、计划、情绪和承诺仍需按日期核实。只回复本轮消息。'
         prompt += '\n此网页对话里先前的 assistant 回复是模型生成结果，不是新的本人自述或已确认事实。不得把自己的旧输出当作本人原话强化；本人亲自修改和本轮已核验微信资料优先。'
         with self.connect() as db:
-            provider='deepseek' if self.config.openai.provider=='deepseek_web' else 'chatgpt'
+            provider={'deepseek_web':'deepseek','doubao_web':'doubao'}.get(self.config.openai.provider,'chatgpt')
             db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test,provider,contact_name) VALUES(?,?,?,NULL,?,?,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test),provider,contact_name))
         waiting_started=time.time()
         try:
             while time.time() < expires:
-                if self.config.resolve(self.config.paths.pause_file).exists():
+                if self.config.resolve(self.config.paths.pause_file).exists() and not is_test:
                     raise LLMError("已暂停网页回复")
                 with self.connect() as db:
                     status, result = db.execute("SELECT status,result FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -111,7 +112,7 @@ class WebReplyLLM:
 
     def complete(self, job_id, result, browser_meta=None):
         parsed = ReplyDecision.model_validate_json(result)
-        allowed = {'tab_id','slot_id','turn','reused','managed_tabs','conversation_fingerprint','queue_wait_ms','web_reply_ms','bridge_total_ms'}
+        allowed = {'tab_id','slot_id','turn','reused','managed_tabs','conversation_fingerprint','queue_wait_ms','web_reply_ms','bridge_total_ms','restored_from_local_context'}
         meta = {k:v for k,v in (browser_meta or {}).items() if k in allowed and isinstance(v,(int,str,bool))}
         with self.connect() as db:
             updated = db.execute("UPDATE jobs SET status='done',result=?,browser_meta=? WHERE id=? AND status IN ('pending','claimed') AND expires>?",

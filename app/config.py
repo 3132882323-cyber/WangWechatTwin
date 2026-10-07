@@ -14,7 +14,7 @@ from app.models import ContactProfile
 class OpenAISettings(BaseModel):
     deepseek_drafts: bool=False
     deepseek_fast: bool=False
-    provider: Literal["auto", "api", "account", "web", "deepseek_web", "hybrid_web"] = "auto"
+    provider: Literal["auto", "api", "account", "web", "deepseek_web", "doubao_web", "hybrid_web"] = "auto"
     web_reply_timeout_seconds: float = 180
     primary_model: str = "gpt-6-luna"
     high_risk_model: str = "gpt-6.1-sol"

@@ -63,9 +63,20 @@ def test_hybrid_registers_authenticated_provider_queues(tmp_path):
     assert client.get('/browser-bridge/next').status_code==403
     queue=WebReplyLLM(cfg)
     with queue.connect() as conn:
-        for provider in ('chatgpt','deepseek'):
+        for provider in ('chatgpt','deepseek','doubao'):
             conn.execute("INSERT INTO jobs(id,prompt,status,created,expires,provider) VALUES(?,?,'pending',?,?,?)",(provider,'test',time.time(),time.time()+60,provider))
     headers={'Authorization':'Bearer '+token,'X-Wechat-Bridge-Provider':'deepseek'}
     assert client.get('/browser-bridge/next',headers=headers).json()['job']['id']=='deepseek'
     headers['X-Wechat-Bridge-Provider']='chatgpt'
     assert client.get('/browser-bridge/next',headers=headers).json()['job']['id']=='chatgpt'
+
+
+def test_doubao_route_registered_without_weakening_auth(tmp_path):
+    from app.config import AppConfig
+    cfg=AppConfig(project_root=tmp_path,openai={'provider':'hybrid_web'})
+    cfg.paths.database=str(tmp_path/'db.sqlite3');cfg.paths.browser_bridge=str(tmp_path/'bridge')
+    app=create_app(cfg,Database(cfg.resolve(cfg.paths.database)));client=TestClient(app)
+    assert client.get('/browser-bridge/next',headers={'X-Wechat-Bridge-Provider':'doubao'}).status_code==403
+    token=(tmp_path/'bridge'/'pairing_token.txt').read_text().strip()
+    response=client.get('/browser-bridge/next',headers={'X-Wechat-Bridge-Provider':'doubao','Authorization':'Bearer '+token})
+    assert response.status_code==200

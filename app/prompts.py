@@ -86,8 +86,12 @@ class PromptBuilder:
     ) -> str:
         from app.risk import assess_risk
         from app.models import RiskLevel
-        learned_examples = [e for e in (learned_examples or [])
-                            if assess_risk(e.get('incoming','')).level != RiskLevel.critical
+        # Database.style_feedback returns each source group oldest first. Only
+        # changed drafts are human corrections; approval alone is still AI text.
+        learned_examples = [{**e, 'provenance': 'owner_review_edit'}
+                            for e in reversed(learned_examples or [])
+                            if e.get('scenario') == '本人亲自修改的回复'
+                            and assess_risk(e.get('incoming','')).level != RiskLevel.critical
                             and assess_risk(e.get('preferred_reply','')).level != RiskLevel.critical
                             and not re.search(r'https?://|\d{7,}', e.get('incoming','')+e.get('preferred_reply',''))]
         payload = {
@@ -107,8 +111,8 @@ class PromptBuilder:
             "recent_messages": recent_messages,
             "contact_memories": memories,
             'contact_memory_rule':'这些旧摘要属于当前联系人，不能移植为本人的职业或经历。未带原文依据的旧模型摘要只作待核实线索；按原微信说话人和日期核对。',
-            "style_examples": self.samples + (learned_examples or []),
-            "style_example_rule": "初始配置样例仅是人工模板，不证明本人曾这样说。历史原话用于模仿表达方式，价格、日期、项目状态等不得当作当前事实",
+            "style_examples": [],
+            "style_example_rule": "样例按本人最新手改反馈、已核验本人手发、历史原话的顺序参考。本人仅批准而未修改的模型草稿不作为人工风格样例。初始配置样例仅是人工模板，不证明本人曾这样说。样例用于模仿表达方式，价格、日期、项目状态等不得当作当前事实",
             "output_guidance": {
                 "send": "信息明确、低风险、可以直接以本人身份回复",
                 "hold": "先发送安全占位回复，同时把正式草稿留给本人确认",
@@ -118,21 +122,22 @@ class PromptBuilder:
         }
         from app.style_history import examples
         own_examples = examples(self.config.resolve(self.config.paths.style_history), message.contact, message.content)
+        history_examples = own_examples or self.samples
         if own_examples:
-            payload["style_examples"] = own_examples + (learned_examples or [])
-            payload["style_example_rule"] += "；当前联系人的本人原话样例优先，不机械套用通用客服表达"
+            payload["style_example_rule"] += "；历史层优先参考当前联系人的原话，不机械套用通用客服表达"
         from app.role_profile import load
         payload['owner_role_profile'] = load(self.config.resolve(self.config.paths.role_profile), message.contact, message.content)
         from app.reply_quality import substantive_examples
-        payload['style_examples']=substantive_examples(payload['style_examples'])
         payload['owner_role_profile']=substantive_examples(payload['owner_role_profile'])
         payload['reply_quality_rule']='本人最新要求认真接话，不要用哈哈、笑脸或重复起哄代替实质回复。回答具体内容；无需回复时选择 ignore，不凑字数、不编造本人事实。'
-        payload['owner_feedback_priority'] = '本人审核修改 > 当前明确立场及事实 > 当前联系人相似情境原话 > 当前联系人习惯 > 全局表达统计。不能拿样例内容替代事实判断。'
+        payload['owner_feedback_priority'] = '本人最新审核修改 > 当前明确立场及事实 > 已核验本人手发原话 > 当前联系人相似情境历史原话 > 当前联系人习惯 > 全局表达统计。不能拿样例内容替代事实判断。'
         from app.personal_memory import PersonalMemory
         personal=PersonalMemory(self.config.resolve(self.config.paths.personal_database))
         verified_examples=personal.human_style_examples(message.contact,message.content)
-        if verified_examples:payload['style_examples']=verified_examples+payload['style_examples'][:2]
-        payload['style_examples']=personal.exclude_ai_style(message.contact,payload['style_examples'])
+        # Text matching is useful for legacy history with no origin metadata,
+        # but must not erase a separately evidenced human edit or hand sent reply.
+        history_examples=personal.exclude_ai_style(message.contact,history_examples)
+        payload['style_examples']=substantive_examples(learned_examples+verified_examples+history_examples)
         latest=personal.recent(message.contact)
         payload['current_personal_conversation']=latest
         payload['personal_database_rule']='这是当前联系人最新的双向聊天记录，含本人亲手发出的原文。ai_generated 是模型生成，不是新的本人事实或人工风格样例；automatic_transcription 是待核实听写。先理解本人刚说过什么及对方回应的对象，不要把对方的话当作本人经历。'
