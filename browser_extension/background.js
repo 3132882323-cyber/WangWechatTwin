@@ -10,18 +10,31 @@ chrome.alarms.create('poll',{periodInMinutes:.5});
 chrome.runtime.onInstalled.addListener(()=>chrome.alarms.create('poll',{periodInMinutes:.5}));
 chrome.action.onClicked.addListener(()=>chrome.runtime.openOptionsPage());
 async function store(slots){await chrome.storage.session.set({bridgePool:slots});}
+let chatgptRecoveryInFlight=null;
+function recoverChatgptPage(){if(!chatgptRecoveryInFlight)chatgptRecoveryInFlight=recoverChatgptPageInner().finally(()=>{chatgptRecoveryInFlight=null;});return chatgptRecoveryInFlight;}
+async function recoverChatgptPageInner(){
+ let b={};try{b=await (await fetch(chrome.runtime.getURL('chatgpt-bootstrap.local.json'))).json();}catch{return;}
+ if(!/^[a-zA-Z0-9_-]{8,80}$/.test(b.recovery_id||'')||b.owned_url!==rootUrl)return;
+ const saved=await chrome.storage.local.get('chatgptRecoveryApplied');if(saved.chatgptRecoveryApplied===b.recovery_id)return;
+ const open=await chrome.tabs.query({url:'https://chatgpt.com/*'});const matches=open.filter(t=>t.url===rootUrl);if(matches.length!==1)throw Error('chatgpt_recovery_page_unavailable');
+ const t=matches[0];const check=await chrome.scripting.executeScript({target:{tabId:t.id},func:()=>{const editor=document.querySelector('[role="textbox"][contenteditable="true"]');return {blank:document.readyState!=='loading'&&!!editor&&!editor.textContent.trim()&&!document.querySelector('[data-message-author-role], [data-content-search-unit-key$=":user"], [data-content-search-unit-key$=":assistant"]'),temporary:location.href==='https://chatgpt.com/?temporary-chat=true'};}});
+ if(!check[0]?.result?.blank||!check[0]?.result?.temporary)throw Error('chatgpt_recovery_page_not_blank');
+ await store([{tabId:t.id,slotId:0,url:rootUrl,turns:0,bootstrapIdle:true,used:Date.now()}]);await chrome.storage.local.set({chatgptRecoveryApplied:b.recovery_id});
+}
+recoverChatgptPage().catch(()=>console.warn('ChatGPT explicit page recovery pending'));
 async function acquire(key){
+ await recoverChatgptPage();
  const {bridgePool=[]}=await chrome.storage.session.get('bridgePool');
  const slots=[];
  for(const s of bridgePool){try{const t=await chrome.tabs.get(s.tabId);if(t.url===s.url&&WechatPool.validUrl(t.url))slots.push(s);}catch{}}
- const choice=WechatPool.choose(slots,key,Date.now());let s=choice.slot;
+ const idle=slots.find(slot=>slot.bootstrapIdle);const choice=idle?{slot:idle,reset:false,reused:false}:WechatPool.choose(slots,key,Date.now());let s=choice.slot;
  if(!s){const t=await chrome.tabs.create({url:rootUrl,active:false});s={tabId:t.id,slotId:[0,1,2].find(i=>!slots.some(x=>x.slotId===i)),turns:0};slots.push(s);}
  else if(choice.reset){
   try{const old=await chrome.scripting.executeScript({target:{tabId:s.tabId},func:()=>performance.timeOrigin});s.navigationOriginBefore=old[0]?.result;}catch{s.navigationOriginBefore=null;}
   await chrome.tabs.update(s.tabId,{url:rootUrl});
  }else{s.navigationOriginBefore=null;}
  if(choice.reset){s.turns=0;s.failed=false;s.url=rootUrl;}
- s.key=key;s.used=Date.now();await store(slots);
+ delete s.bootstrapIdle;s.key=key;s.used=Date.now();await store(slots);
  return {slots,slot:s,reused:choice.reused};
 }
 async function loadTab(id,expectedUrl,oldOrigin){

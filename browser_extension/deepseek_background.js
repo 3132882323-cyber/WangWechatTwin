@@ -2,25 +2,35 @@
 let deepseekBusy=false,deepseekSocket=null;
 async function deepseekPump(){
  if(deepseekBusy)return;
- const {token}=await chrome.storage.local.get('token');if(!token)return;
+ const {token}=await chrome.storage.local.get('token');if(!token||deepseekBusy)return;
  const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Provider':'deepseek'};
  const base='http://127.0.0.1:18769/browser-bridge';let job=null;deepseekBusy=true;
  try{
-  const bridgeStarted=Date.now();
-  const next=await fetch(base+'/next',{headers});if(!next.ok)return;job=(await next.json()).job;if(!job)return;
-  if(job.images?.length)throw Error('deepseek_visual_not_verified');
-  const key=job.conversation_key;
-  const previous=await chrome.storage.local.get(['deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','deepseekSeedApplied']);
+  const previous=await chrome.storage.local.get(['deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','deepseekSeedApplied','deepseekRecoveryApplied']);
   const conversations=previous.deepseekConversations||{};
   const home='https://chat.deepseek.com/';
   const chatUrl=/^https:\/\/chat\.deepseek\.com\/a\/chat\/s\/[^/?#]+$/;
   let bootstrap={};try{bootstrap=await (await fetch(chrome.runtime.getURL('deepseek-bootstrap.local.json'))).json();}catch{}
-  const seed=bootstrap.seed;let tab;
-  if(seed&&/^[0-9a-f]{64}$/.test(seed.conversation_key||'')&&chatUrl.test(seed.url||'')&&previous.deepseekSeedApplied!==seed.url){
+  const recoveryId=bootstrap.recovery_id;let tab;
+  if(recoveryId&&previous.deepseekRecoveryApplied!==recoveryId){
+   const ownedUrl=bootstrap.owned_url;
+   const known=previous.deepseekOwnedUrl===ownedUrl||Object.values(conversations).some(value=>value?.url===ownedUrl);
+   if(typeof recoveryId!=='string'||!/^[a-zA-Z0-9_-]{16,128}$/.test(recoveryId)||!chatUrl.test(ownedUrl||'')||!known)throw Error('deepseek_recovery_unproven');
+   const matches=(await chrome.tabs.query({url:'https://chat.deepseek.com/*'})).filter(candidate=>candidate.url===ownedUrl);
+   if(matches.length!==1)throw Error('deepseek_recovery_tab_unavailable');
+   tab=matches[0];
+   await chrome.storage.local.set({deepseekOwnedTab:tab.id,deepseekOwnedUrl:ownedUrl,deepseekRecoveryApplied:recoveryId});
+  }
+  const bridgeStarted=Date.now();
+  const next=await fetch(base+'/next',{headers});if(!next.ok)return;job=(await next.json()).job;if(!job)return;
+  if(job.images?.length)throw Error('deepseek_visual_not_verified');
+  const key=job.conversation_key;
+  const seed=bootstrap.seed;
+  if(!tab&&!recoveryId&&seed&&/^[0-9a-f]{64}$/.test(seed.conversation_key||'')&&chatUrl.test(seed.url||'')&&previous.deepseekSeedApplied!==seed.url){
    const open=await chrome.tabs.query({url:'https://chat.deepseek.com/*'});
    tab=open.find(candidate=>candidate.url===seed.url);
    if(!tab)throw Error('deepseek_seed_tab_unavailable');
-   conversations[seed.conversation_key]={url:seed.url,name:String(seed.name||''),used:Date.now(),lastTurnId:''};
+   if(!conversations[seed.conversation_key])conversations[seed.conversation_key]={url:seed.url,name:String(seed.name||''),used:Date.now(),lastTurnId:''};
    await chrome.storage.local.set({deepseekConversations:conversations,deepseekOwnedTab:tab.id,deepseekOwnedUrl:tab.url,deepseekSeedApplied:seed.url});
   }
   const known=conversations[key];

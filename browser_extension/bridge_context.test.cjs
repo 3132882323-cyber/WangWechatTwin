@@ -456,3 +456,104 @@ test('DeepSeek migrates once to the exact verified latest conversation tab',asyn
  assert.equal(saved.deepseekSeedApplied,seedUrl);
  assert.equal(saved.deepseekConversations[seedKey].url,seedUrl);
 });
+
+for(const [provider,ownedUrl,otherUrl] of [
+ ['deepseek','https://chat.deepseek.com/a/chat/s/recovered','https://chat.deepseek.com/a/chat/s/other'],
+ ['doubao','https://www.doubao.com/chat/666','https://www.doubao.com/chat/777']
+]){
+ function recoveryHarness(){
+  const key='c'.repeat(64),recoveryId='recover-20261007-one-time';
+  const saved={
+   [provider+'OwnedTab']:10,[provider+'OwnedUrl']:otherUrl,[provider+'SeedApplied']:ownedUrl,
+   [provider+'Conversations']:{[key]:{url:ownedUrl,name:'虚构备注',lastTurnId:'kept-turn',used:123,pending:false},other:{url:otherUrl,lastTurnId:'other-turn'}}
+  };
+  const bootstrap={owned_url:ownedUrl,recovery_id:recoveryId,seed:{conversation_key:key,url:ownedUrl,name:'不可覆盖原备注'}};
+  const calls={queries:0,creates:0,updates:0,scripts:0,results:[],writes:[]};
+  let openTabs=[{id:30,url:ownedUrl+'?not-exact=1'},{id:31,url:otherUrl},{id:32,url:ownedUrl}],liveId=32,job=null;
+  const chrome={
+   storage:{
+    local:{async get(item){return item==='token'?{token:'test-token'}:structuredClone(saved);},async set(values){calls.writes.push(Object.keys(values));Object.assign(saved,structuredClone(values));}},
+    session:{async set(){}}
+   },
+   tabs:{
+    async query(){calls.queries++;return openTabs;},
+    async get(id){if(id===liveId)return {id,url:ownedUrl};throw Error('tab closed');},
+    async create(){calls.creates++;throw Error('must not create');},
+    async update(){calls.updates++;throw Error('must not navigate');}
+   },
+   runtime:{getURL:()=>`chrome-extension://test/${provider}-bootstrap.local.json`},
+   scripting:{async executeScript(){calls.scripts++;throw Error('must not generate a reply');}},
+   alarms:{onAlarm:{addListener(){}}}
+  };
+  const fetch=async(url,options)=>{
+   if(url.endsWith('-bootstrap.local.json'))return {json:async()=>structuredClone(bootstrap)};
+   if(url.endsWith('/next'))return {ok:true,json:async()=>({job})};
+   if(url.endsWith('/result')){calls.results.push(JSON.parse(options.body));return {ok:true};}
+   throw Error('unexpected fetch');
+  };
+  const makeContext=()=>{
+   const context={chrome,fetch,WebSocket:class{},URL,setTimeout,console:{warn(){}}};
+   load(provider+'_background.js',context);return context;
+  };
+  return {saved,bootstrap,calls,key,recoveryId,makeContext,setTabs(tabs){openTabs=tabs;},closeTab(){liveId=null;},queueJob(){job={id:'after-close',conversation_key:key,prompt:'虚构提示',images:[]};}};
+ }
+
+ test(`${provider} recovers one exact reopened tab without a queued job and preserves every conversation`,async()=>{
+  const fixture=recoveryHarness(),before=structuredClone(fixture.saved[provider+'Conversations']);
+  const context=fixture.makeContext();
+  await context[provider+'Pump']();
+  assert.equal(fixture.saved[provider+'OwnedTab'],32);
+  assert.equal(fixture.saved[provider+'OwnedUrl'],ownedUrl);
+  assert.equal(fixture.saved[provider+'RecoveryApplied'],fixture.recoveryId);
+  assert.deepEqual(fixture.saved[provider+'Conversations'],before);
+  assert.equal(fixture.calls.writes.some(keys=>keys.includes(provider+'Conversations')),false);
+  assert.equal(fixture.calls.queries,1);
+  assert.equal(fixture.calls.creates+fixture.calls.updates+fixture.calls.scripts,0);
+  assert.equal(fixture.calls.results.length,0);
+ });
+
+ test(`${provider} cannot reuse a consumed recovery nonce after closure or a worker restart`,async()=>{
+  const fixture=recoveryHarness(),before=structuredClone(fixture.saved[provider+'Conversations']);
+  await fixture.makeContext()[provider+'Pump']();
+  delete fixture.saved[provider+'SeedApplied'];
+  fixture.closeTab();fixture.setTabs([{id:99,url:ownedUrl}]);fixture.queueJob();
+  await fixture.makeContext()[provider+'Pump']();
+  assert.equal(fixture.saved[provider+'OwnedTab'],32);
+  assert.equal(fixture.saved[provider+'RecoveryApplied'],fixture.recoveryId);
+  assert.equal(fixture.calls.queries,1);
+  assert.equal(fixture.calls.results.at(-1).error,'reply');
+  delete fixture.saved[provider+'OwnedTab'];
+  await fixture.makeContext()[provider+'Pump']();
+  assert.equal(fixture.calls.queries,1);
+  assert.equal(fixture.calls.creates+fixture.calls.updates+fixture.calls.scripts,0);
+  assert.deepEqual(fixture.saved[provider+'Conversations'],before);
+ });
+
+ test(`${provider} leaves recovery unused until exactly one known conversation tab is present`,async()=>{
+  const fixture=recoveryHarness(),context=fixture.makeContext();
+  fixture.setTabs([{id:33,url:ownedUrl+'?not-exact=1'}]);
+  await context[provider+'Pump']();
+  assert.equal(fixture.saved[provider+'RecoveryApplied'],undefined);
+  assert.equal(fixture.saved[provider+'OwnedTab'],10);
+  fixture.setTabs([{id:34,url:ownedUrl},{id:35,url:ownedUrl}]);
+  await context[provider+'Pump']();
+  assert.equal(fixture.saved[provider+'RecoveryApplied'],undefined);
+  fixture.setTabs([{id:32,url:ownedUrl}]);
+  await context[provider+'Pump']();
+  assert.equal(fixture.saved[provider+'OwnedTab'],32);
+  assert.equal(fixture.saved[provider+'RecoveryApplied'],fixture.recoveryId);
+  assert.equal(fixture.calls.creates+fixture.calls.updates+fixture.calls.scripts,0);
+ });
+
+ test(`${provider} refuses recovery without ownership proof or a valid nonce`,async()=>{
+  const fixture=recoveryHarness(),before=structuredClone(fixture.saved);
+  fixture.bootstrap.owned_url=ownedUrl+'-unknown';
+  fixture.setTabs([{id:32,url:fixture.bootstrap.owned_url}]);
+  const context=fixture.makeContext();await context[provider+'Pump']();
+  fixture.bootstrap.owned_url=ownedUrl;fixture.bootstrap.recovery_id='short';
+  fixture.setTabs([{id:32,url:ownedUrl}]);await context[provider+'Pump']();
+  assert.deepEqual(fixture.saved,before);
+  assert.equal(fixture.calls.queries,0);
+  assert.equal(fixture.calls.creates+fixture.calls.updates+fixture.calls.scripts,0);
+ });
+}
