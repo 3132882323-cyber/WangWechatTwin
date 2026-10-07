@@ -61,7 +61,10 @@ def assess_risk(text: str) -> RiskAssessment:
             reasons=high + medium,
             safe_holding_reply="收到，这个我先把具体情况核对清楚，确认后给你一个准话。",
         )
-    if medium or DATE_OR_MONEY.search(normalized):
+    date_match=DATE_OR_MONEY.search(normalized)
+    numeric_fact=bool(re.search(r'\d+(?:\.\d+)?\s*(?:元|万|块|天|号|日|周|个月|套|个|米|平米)',normalized))
+    date_arrangement=bool(date_match and re.search(r'能来|过来|出发|见面|见个面|到达|送到|送货|完成|做好|交付|开工|开始做|截止|到期|订票|订房|几点|什么时候|约|安排|计划',normalized))
+    if medium or numeric_fact or date_arrangement:
         reasons = medium or ["包含日期、数量、金额或交付信息"]
         return RiskAssessment(
             level=RiskLevel.medium,

@@ -16,3 +16,10 @@ def test_critical_bank():
 
 def test_medium_material():
     assert assess_risk("外墙板材料怎么选").level == RiskLevel.medium
+
+def test_dates_in_casual_feelings_do_not_create_commitments():
+    assert assess_risk('我今天有点累，想早点休息').level == RiskLevel.low
+    assert assess_risk('今天心情挺好').level == RiskLevel.low
+    assert assess_risk('明天能来吗').level == RiskLevel.medium
+    assert assess_risk('今天送货').level != RiskLevel.low
+    assert assess_risk('今天报价多少钱').level == RiskLevel.high
