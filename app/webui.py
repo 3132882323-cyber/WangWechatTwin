@@ -143,7 +143,7 @@ setInterval(function(){{
 def create_app(config: AppConfig, db: Database) -> FastAPI:
     app = FastAPI(title="微信聊天分身")
     app.state.csrf_token = secrets.token_urlsafe(32)
-    if config.openai.provider == 'web':
+    if config.openai.provider in {'web','deepseek_web','hybrid_web'}:
         from app.web_llm import WebReplyLLM
         queue = WebReplyLLM(config)
         token_path = config.resolve(config.paths.browser_bridge) / 'pairing_token.txt'
@@ -351,3 +351,4 @@ def start_webui(config: AppConfig, db: Database) -> threading.Thread | None:
     thread = threading.Thread(target=runner, daemon=True, name="webui")
     thread.start()
     return thread
+

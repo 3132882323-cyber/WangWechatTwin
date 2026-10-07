@@ -1,7 +1,9 @@
-window.wechatDeepseekDraft=async function(prompt,key){
+window.wechatDeepseekDraft=async function(prompt,key,reuse=false){
  const root=document.documentElement;
- if(location.origin!=='https://chat.deepseek.com'||location.pathname!=='/')throw Error('deepseek_not_fresh_home');
- if(document.querySelector('.ds-assistant-message-main-content'))throw Error('deepseek_existing_conversation');
+ if(location.origin!=='https://chat.deepseek.com'||(!reuse&&location.pathname!=='/')||(reuse&&!location.pathname.startsWith('/a/chat/s/')))throw Error('deepseek_not_fresh_home');
+ const before=document.querySelectorAll('.ds-assistant-message-main-content').length;
+ if(!reuse&&before)throw Error('deepseek_existing_conversation');
+ if(root.dataset.wechatDeepseekOwner&&root.dataset.wechatDeepseekOwner!==key)throw Error('deepseek_wrong_contact');
  const editor=document.querySelector('textarea[placeholder="给 DeepSeek 发送消息 "]');
  if(!editor||editor.value.trim())throw Error('deepseek_user_editing_or_not_logged_in');
  for(const label of ['深度思考','智能搜索']){
@@ -19,7 +21,8 @@ window.wechatDeepseekDraft=async function(prompt,key){
  const deadline=Date.now()+180000;
  while(Date.now()<deadline){
   if(root.dataset.wechatDeepseekOwner!==key)throw Error('deepseek_ownership_lost');
-  const answer=document.querySelector('.ds-assistant-message-main-content');
+  const answers=document.querySelectorAll('.ds-assistant-message-main-content');
+  const answer=answers.length>before?answers[answers.length-1]:null;
   if(answer){
    let text=(answer.innerText||answer.textContent||'').trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'');
    const first=text.indexOf('{'),last=text.lastIndexOf('}');if(first>=0&&last>first)text=text.slice(first,last+1);

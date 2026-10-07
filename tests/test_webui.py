@@ -51,3 +51,21 @@ def test_dashboard_shows_incoming_and_learns_edit(tmp_path: Path):
     assert client.post(f"/draft/{did}/approve", data={"reply": "untrusted post"}).status_code == 403
     config.mode = "shadow"
     assert client.post(f"/draft/{did}/approve", data={"reply": "不应发送"}).status_code == 403
+
+def test_hybrid_registers_authenticated_provider_queues(tmp_path):
+    from app.config import AppConfig
+    from app.web_llm import WebReplyLLM
+    import time
+    cfg=AppConfig(project_root=tmp_path);cfg.openai.provider='hybrid_web'
+    cfg.paths.browser_bridge=str(tmp_path/'bridge');cfg.paths.database=str(tmp_path/'review.sqlite3')
+    db=Database(cfg.resolve(cfg.paths.database));app=create_app(cfg,db);client=TestClient(app)
+    token=(tmp_path/'bridge'/'pairing_token.txt').read_text().strip()
+    assert client.get('/browser-bridge/next').status_code==403
+    queue=WebReplyLLM(cfg)
+    with queue.connect() as conn:
+        for provider in ('chatgpt','deepseek'):
+            conn.execute("INSERT INTO jobs(id,prompt,status,created,expires,provider) VALUES(?,?,'pending',?,?,?)",(provider,'test',time.time(),time.time()+60,provider))
+    headers={'Authorization':'Bearer '+token,'X-Wechat-Bridge-Provider':'deepseek'}
+    assert client.get('/browser-bridge/next',headers=headers).json()['job']['id']=='deepseek'
+    headers['X-Wechat-Bridge-Provider']='chatgpt'
+    assert client.get('/browser-bridge/next',headers=headers).json()['job']['id']=='chatgpt'
