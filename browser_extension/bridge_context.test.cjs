@@ -181,8 +181,8 @@ test('Doubao fresh home refuses pre-existing conversation messages',async()=>{
  await assert.rejects(()=>context.window.wechatDoubaoReply('虚构提示','new-contact',false,[],home,'turn-foreign'),/doubao_unowned_conversation/);
 });
 
-test('Doubao ignores delayed history and returns the reply after its visible marked prompt',async()=>{
- const time=clock(),home='https://www.doubao.com/chat/',url='https://www.doubao.com/chat/333';
+test('Doubao accepts normalized home and ignores delayed history after its visible marked prompt',async()=>{
+ const time=clock(),home='https://www.doubao.com/chat',url='https://www.doubao.com/chat/333';
  let sent=false,renamed='';
  const editor={textContent:'',focus(){},dispatchEvent(){}};
  const oldBody={innerText:'{"reply":"旧答案"}',getAttribute:()=> 'false'};
@@ -209,7 +209,7 @@ test('Doubao ignores delayed history and returns the reply after its visible mar
  load('doubao_web.js',context);
  context.window.wechatDoubaoRename=async name=>{renamed=name;return true;};
  const prompt='系统\n\n以下是本轮微信数据：\n{"contact_profile":{"name":"虚构备注"}}\n\n只输出符合结构';
- const result=await context.window.wechatDoubaoReply(prompt,'contact-c',false,[],home,'turn-c');
+ const result=await context.window.wechatDoubaoReply(prompt,'contact-c',false,[],home+'/','turn-c');
  assert.equal(JSON.parse(result.reply).reply,'新答案');
  assert.equal(result.url,url);
  assert.equal(renamed,'虚构备注');
@@ -249,8 +249,9 @@ test('Doubao accepts a new message ID when a virtual list recycles the old answe
  assert.equal(JSON.parse(dataset.wechatDoubaoGuard).afterIds[0],'new-reply-id');
 });
 
-test('Doubao fresh image turn allows home to upload URL to final URL only for its image and marked prompt',async()=>{
- const time=clock(),home='https://www.doubao.com/chat/',temporary=home+'local_555',final=home+'666';
+for(const home of ['https://www.doubao.com/chat/','https://www.doubao.com/chat']){
+test(`Doubao fresh image turn allows ${home} to its marked upload and final URLs`,async()=>{
+ const time=clock(),temporary='https://www.doubao.com/chat/local_555',final='https://www.doubao.com/chat/666';
  let uploaded=false,sent=false;
  const dataset={},editor={textContent:'',focus(){},dispatchEvent(){}};
  const idElement=id=>({getAttribute(name){return name==='data-message-id'?id:null;}});
@@ -299,6 +300,7 @@ test('Doubao fresh image turn allows home to upload URL to final URL only for it
  assert.equal(JSON.parse(dataset.wechatDoubaoGuard).userId,'user-id');
  assert.equal(time.longFired(),0);
 });
+}
 
 test('Doubao keeps the verified local chat mapping when its marked turn times out',async()=>{
  const time=clock(),home='https://www.doubao.com/chat/',local=home+'local_123456';
@@ -362,6 +364,40 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
  assert.equal(saved.doubaoConversations.new.url,'https://www.doubao.com/chat/999');
 });
 
+for(const reused of [false,true]){
+ test(`Doubao ${reused?'rejects a saved chat redirected to':'prepares a new contact at'} home without a trailing slash`,async()=>{
+  const time=clock(),home='https://www.doubao.com/chat',oldUrl='https://www.doubao.com/chat/111';
+  const old={url:oldUrl,name:'保留的虚构备注',lastTurnId:'old-turn'};
+  const tab={id:228,url:oldUrl},saved={doubaoOwnedTab:228,doubaoOwnedUrl:oldUrl,doubaoConversations:{old,...(reused?{new:{...old}}:{})}};
+  const updates=[];let scripts=0,creates=0,resultBody;
+  const chrome={
+   storage:{local:{async get(item){return item==='token'?{token:'test-token'}:saved;},async set(values){Object.assign(saved,values);}}},
+   tabs:{async get(){return tab;},async update(id,change){assert.equal(id,228);updates.push(change.url);tab.url=home;return tab;},async create(){creates++;throw Error('must use owned tab');}},
+   scripting:{async executeScript(options){
+    assert.equal(options.target.tabId,228);
+    if(options.files){scripts++;return [{result:null}];}
+    if(options.args?.length===7){
+     scripts++;assert.equal(options.args[2],false);assert.equal(options.args[4],home);assert.equal(options.args[3].length,1);
+     tab.url='https://www.doubao.com/chat/999';return [{result:{reply:'{"reply":"虚构图片答复"}',url:tab.url}}];
+    }
+    if(options.args?.length===1)return [{result:{url:home,editor:true,draft:false,attachments:false,answers:0,users:0,lastAnswerLength:0,hasKnownTurn:!reused}}];
+    return [{result:false}];
+   }},
+   alarms:{onAlarm:{addListener(){}}}
+  };
+  const fetch=async(url,options)=>{
+   if(url.endsWith('/next'))return {ok:true,json:async()=>({job:{id:'slash-test',conversation_key:'new',contact_name:'虚构备注',prompt:'虚构图片提示',images:[{data:'AA==',name:'test.png',mime:'image/png'}]}})};
+   if(url.endsWith('/result')){resultBody=JSON.parse(options.body);return {ok:true};}
+   throw Error('no bootstrap');
+  };
+  const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,console:{warn(){}}};
+  load('doubao_background.js',context);await context.doubaoPump();
+  assert.equal(creates,0);assert.deepEqual(saved.doubaoConversations.old,old);assert.ok(time.now()<3000);
+  if(reused){assert.equal(resultBody.error,'doubao_known_conversation_missing');assert.equal(resultBody.stage,'ready');assert.equal(scripts,0);assert.equal(updates.length,0);}
+  else{assert.equal(resultBody.result,'{"reply":"虚构图片答复"}');assert.equal(scripts,2);assert.deepEqual(updates,[home+'/']);assert.equal(saved.doubaoConversations.new.url,tab.url);}
+ });
+}
+
 test('Doubao refuses an invalid persisted tab instead of creating another page',async()=>{
  let creates=0,resultBody;
  const saved={doubaoOwnedTab:77,doubaoOwnedUrl:'https://www.doubao.com/chat/777',doubaoConversations:{}};
@@ -380,7 +416,34 @@ test('Doubao refuses an invalid persisted tab instead of creating another page',
  load('doubao_background.js',context);
  await context.doubaoPump();
  assert.equal(creates,0);
- assert.equal(resultBody.error,'reply');
+ assert.equal(resultBody.error,'doubao_owned_tab_unavailable');
+ assert.equal(resultBody.stage,'owned_tab');
+ assert.equal(saved.doubaoLastFailure.code,resultBody.error);
+ assert.equal(saved.doubaoLastFailure.stage,resultBody.stage);
+ assert.equal(saved.doubaoLastFailure.job_id,'unsafe');
+});
+
+test('Doubao diagnostics preserve fixed failure codes and never expose raw exception details',async()=>{
+ const saved={},privateDetail='private-message-token-or-contact';let resultCalls=0;
+ const chrome={
+  storage:{local:{async get(item){return item==='token'?{token:'test-token'}:saved;},async set(values){Object.assign(saved,values);}}},
+  alarms:{onAlarm:{addListener(){}}}
+ };
+ const fetch=async url=>{
+  if(url.endsWith('/next'))throw Error(privateDetail);
+  if(url.endsWith('/result'))resultCalls++;
+  throw Error('no bootstrap');
+ };
+ const context={chrome,fetch,WebSocket:class{},URL,setTimeout,console:{warn(){}}};
+ load('doubao_background.js',context);
+ assert.equal(context.doubaoErrorCode(Error('Error: doubao_user_editing '+privateDetail)),'doubao_user_editing');
+ assert.equal(context.doubaoErrorCode(Error('doubao_unknown_dynamic_'+privateDetail)),'doubao_unexpected_error');
+ await context.doubaoPump();
+ assert.equal(saved.doubaoLastFailure.code,'doubao_unexpected_error');
+ assert.equal(saved.doubaoLastFailure.stage,'queue');
+ assert.equal(saved.doubaoLastFailure.job_id,'');
+ assert.equal(resultCalls,0);
+ assert.equal(JSON.stringify(saved).includes(privateDetail),false);
 });
 
 test('Doubao migrates once to an exact verified seed page without creating a tab',async()=>{
@@ -521,7 +584,7 @@ for(const [provider,ownedUrl,otherUrl] of [
   assert.equal(fixture.saved[provider+'OwnedTab'],32);
   assert.equal(fixture.saved[provider+'RecoveryApplied'],fixture.recoveryId);
   assert.equal(fixture.calls.queries,1);
-  assert.equal(fixture.calls.results.at(-1).error,'reply');
+  assert.equal(fixture.calls.results.at(-1).error,provider==='doubao'?'doubao_owned_tab_unavailable':'reply');
   delete fixture.saved[provider+'OwnedTab'];
   await fixture.makeContext()[provider+'Pump']();
   assert.equal(fixture.calls.queries,1);
@@ -552,6 +615,7 @@ for(const [provider,ownedUrl,otherUrl] of [
   const context=fixture.makeContext();await context[provider+'Pump']();
   fixture.bootstrap.owned_url=ownedUrl;fixture.bootstrap.recovery_id='short';
   fixture.setTabs([{id:32,url:ownedUrl}]);await context[provider+'Pump']();
+  if(provider==='doubao')delete fixture.saved.doubaoLastFailure;
   assert.deepEqual(fixture.saved,before);
   assert.equal(fixture.calls.queries,0);
   assert.equal(fixture.calls.creates+fixture.calls.updates+fixture.calls.scripts,0);

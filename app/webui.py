@@ -203,6 +203,10 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             if config.resolve(config.paths.pause_file).exists() and not (test_row and test_row[0]):
                 raise HTTPException(409, '已暂停')
             if body.get('error'):
+                code=str(body.get('error',''))
+                if not __import__('re').fullmatch(r'[a-z_]{1,80}',code):code='unclassified'
+                if test_row:
+                    db.set_state(test_row[1]+'_last_failure',{'code':code,'seen_at':time.time(),'is_test':bool(test_row[0])})
                 with queue.connect() as conn:
                     changed=conn.execute("UPDATE jobs SET status='failed',prompt='' WHERE id=? AND status='claimed'", (body['id'],)).rowcount
                 if changed != 1:

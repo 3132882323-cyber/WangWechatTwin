@@ -28,6 +28,7 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
  try{
  const root=document.documentElement,previousOwner=root.dataset.wechatDoubaoOwner;
  const home='https://www.doubao.com/chat/',chatUrl=/^https:\/\/www\.doubao\.com\/chat\/\d+$/,localUrl=/^https:\/\/www\.doubao\.com\/chat\/local_\d+$/;
+ const isHomeUrl=url=>url===home||url==='https://www.doubao.com/chat';
  const marker='[wechat-turn:'+turnId+']';let activeUrl=expectedUrl,submittedTurn=false,visualReady=false,finalUrlLocked=false;
  let persistedUrl='';
  const messageId=node=>node?.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id')||node?.getAttribute?.('data-message-id')||'';
@@ -46,7 +47,7 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
  const assertUrl=(phase='setup')=>{
   const current=location.href;
   if(current===activeUrl)return true;
-  if(!reused&&activeUrl===home&&(chatUrl.test(current)||localUrl.test(current))){activeUrl=current;return true;}
+  if(!reused&&isHomeUrl(activeUrl)&&(isHomeUrl(current)||chatUrl.test(current)||localUrl.test(current))){activeUrl=current;return true;}
   if(phase==='reply'&&submittedTurn&&!finalUrlLocked&&chatUrl.test(current)&&
      ((!reused&&localUrl.test(activeUrl))||(reused&&localUrl.test(activeUrl))||(!reused&&visualReady&&chatUrl.test(activeUrl)))){
    const users=visibleUsers(),mine=users.find(node=>node.textContent.includes(marker));
@@ -59,7 +60,8 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
   }
   throw Error('doubao_conversation_changed');
  };
- if(location.href!==expectedUrl||!(expectedUrl===home||chatUrl.test(expectedUrl)||localUrl.test(expectedUrl))||(reused&&expectedUrl===home))throw Error('doubao_wrong_conversation');
+ if((location.href!==expectedUrl&&!(!reused&&isHomeUrl(location.href)&&isHomeUrl(expectedUrl)))||!(isHomeUrl(expectedUrl)||chatUrl.test(expectedUrl)||localUrl.test(expectedUrl))||(reused&&isHomeUrl(expectedUrl)))throw Error('doubao_wrong_conversation');
+ if(!reused&&isHomeUrl(expectedUrl))activeUrl=location.href;
  if(previousOwner&&previousOwner!==key)throw Error('doubao_wrong_contact');
  const editor=document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');
  if(!editor||editor.textContent.trim())throw Error('doubao_user_editing');
