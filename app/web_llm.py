@@ -28,6 +28,8 @@ class WebReplyLLM:
                 db.execute("ALTER TABLE jobs ADD COLUMN browser_meta TEXT NOT NULL DEFAULT '{}'")
             if 'images' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN images TEXT NOT NULL DEFAULT '[]'")
+            if 'contact_name' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute("ALTER TABLE jobs ADD COLUMN contact_name TEXT NOT NULL DEFAULT ''")
             if 'provider' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT 'chatgpt'")
 
@@ -41,6 +43,7 @@ class WebReplyLLM:
         schema = json.dumps(ReplyDecision.model_json_schema(), ensure_ascii=False)
         try:
             parsed_payload=json.loads(user_payload)
+            contact_name=str(parsed_payload.get('contact_profile',{}).get('name','')).strip()[:128]
             media_paths=parsed_payload.pop('__media_paths',[])
             namespace = parsed_payload.get('conversation_key','')
             is_test=parsed_payload.pop('__is_local_test',False) is True
@@ -53,6 +56,7 @@ class WebReplyLLM:
                 system_prompt=system_prompt.split('以下是从本人微信文字回复离线统计的表达习惯')[0]
             user_payload=json.dumps(parsed_payload,ensure_ascii=False)
         except (ValueError, AttributeError):
+            contact_name=''
             namespace = ''
             media_paths=[]
             is_test=False
@@ -72,7 +76,7 @@ class WebReplyLLM:
         prompt += '\n此网页对话里先前的 assistant 回复是模型生成结果，不是新的本人自述或已确认事实。不得把自己的旧输出当作本人原话强化；本人亲自修改和本轮已核验微信资料优先。'
         with self.connect() as db:
             provider='deepseek' if self.config.openai.provider=='deepseek_web' else 'chatgpt'
-            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test,provider) VALUES(?,?,?,NULL,?,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test),provider))
+            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test,provider,contact_name) VALUES(?,?,?,NULL,?,?,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test),provider,contact_name))
         try:
             while time.time() < expires:
                 if self.config.resolve(self.config.paths.pause_file).exists():

@@ -189,10 +189,10 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                row = conn.execute("SELECT id,prompt,conversation_key,images,created FROM jobs WHERE status='pending' AND provider=? AND expires>? AND (?=0 OR is_test=1) ORDER BY is_test ASC,created LIMIT 1", (provider,time.time(), int(paused))).fetchone()
+                row = conn.execute("SELECT id,prompt,conversation_key,images,created,contact_name FROM jobs WHERE status='pending' AND provider=? AND expires>? AND (?=0 OR is_test=1) ORDER BY is_test ASC,created LIMIT 1", (provider,time.time(), int(paused))).fetchone()
                 if row:
                     conn.execute("UPDATE jobs SET status='claimed' WHERE id=?", (row[0],))
-            return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0],'images':json.loads(row[3]),'created':row[4]} if row else None}
+            return {'job': {'id': row[0], 'prompt': row[1], 'conversation_key':row[2] or 'isolated:'+row[0],'images':json.loads(row[3]),'created':row[4],'contact_name':row[5]} if row else None}
 
         @app.post('/browser-bridge/result')
         async def browser_result(request: Request):
