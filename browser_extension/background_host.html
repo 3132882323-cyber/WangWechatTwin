@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
+ <title>WeChatTwin Background</title>
+ <style>
+  :root{color-scheme:light;--foreground:#171717;--secondary:#475569;--background:#fff;--border:#e5e5e5}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--background);color:var(--foreground);font:16px/1.6 system-ui,"Microsoft YaHei",sans-serif}
+  main{max-width:38rem;margin:12vh auto;padding:2rem;border:1px solid var(--border);border-radius:.75rem}
+  h1{margin:0 0 1rem;font-size:1.5rem;line-height:1.4}
+  p{margin:.75rem 0;color:var(--secondary)}
+  @media(max-width:640px){main{margin:1.5rem;padding:1.5rem}}
+ </style>
+ <script src="background_host.js" defer></script>
+</head>
+<body>
+ <main>
+  <h1>微信网页连接后台</h1>
+  <p>模型页面在这个专用窗口中运行，日常浏览器可以照常使用。</p>
+  <p>需要登录或查看模型页面时，请从本机审核台打开后台窗口。</p>
+ </main>
+</body>
+</html>

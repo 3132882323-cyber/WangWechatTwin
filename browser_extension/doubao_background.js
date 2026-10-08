@@ -19,7 +19,9 @@ async function doubaoBlockedHeartbeat(){
 }
 function doubaoErrorCode(error){
  const allowed=new Set(['doubao_bridge_timeout','doubao_script_timeout','doubao_reply_script_timeout','doubao_recovery_unproven','doubao_recovery_tab_unavailable','doubao_seed_tab_unavailable','doubao_owned_tab_unavailable','doubao_owned_tab_unproven','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified','doubao_login_or_load','doubao_empty_or_wrong_conversation','doubao_result_url_changed','doubao_result_rejected','doubao_conversation_changed','doubao_unowned_conversation','doubao_wrong_conversation','doubao_wrong_contact','doubao_turn_already_present','doubao_user_attachments','doubao_upload_not_available','doubao_ownership_lost','doubao_image_upload_not_verified','doubao_prompt_or_send_not_ready','doubao_newer_user_turn','doubao_reply_timeout','doubao_rename_timeout']);
- const code=String(error?.message||'').match(/\bdoubao_[a-z_]+\b/)?.[0];
+ const message=String(error?.message||'');
+ if(/^background_window_[a-z_]+$/.test(message))return 'doubao_background_window_unavailable';
+ const code=message.match(/\bdoubao_[a-z_]+\b/)?.[0];
  return allowed.has(code)?code:'doubao_unexpected_error';
 }
 async function doubaoPump(){
@@ -48,9 +50,6 @@ async function doubaoPump(){
    tab=matches[0];
    await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:ownedUrl,doubaoRecoveryApplied:recoveryId});
   }
-  stage='queue';const next=await doubaoFetch(base+'/next',{headers},response=>response.ok?response.json():null);if(!next)return;job=next.job;if(!job)return;
-  const started=Date.now(),key=job.conversation_key;
-  stage='owned_tab';
   const seed=bootstrap.seed;
   const validSeed=seed&&/^[0-9a-f]{64}$/.test(seed.conversation_key||'')&&chatUrl.test(seed.url||'');
   if(!recoveryId&&validSeed&&!conversations[seed.conversation_key]){
@@ -63,6 +62,10 @@ async function doubaoPump(){
    if(!tab)throw Error('doubao_seed_tab_unavailable');
    await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:tab.url,doubaoSeedApplied:seed.url});
   }
+  stage='background_window';await WechatBackgroundWindow.ensure();
+  stage='queue';const next=await doubaoFetch(base+'/next',{headers},response=>response.ok?response.json():null);if(!next)return;job=next.job;if(!job)return;
+  const started=Date.now(),key=job.conversation_key;
+  stage='owned_tab';
   if(!tab&&Number.isInteger(saved.doubaoOwnedTab)){
    try{tab=await chrome.tabs.get(saved.doubaoOwnedTab);}catch{}
    if(!tab||!tab.url||new URL(tab.url).origin!=='https://www.doubao.com')throw Error('doubao_owned_tab_unavailable');
@@ -73,9 +76,10 @@ async function doubaoPump(){
   }else if(!tab&&(saved.doubaoOwnedUrl||Object.keys(conversations).length)){
    throw Error('doubao_owned_tab_unproven');
   }else if(!tab){
-   tab=await chrome.tabs.create({url:home,active:false});
+   tab=await WechatBackgroundWindow.createModelTab({url:home});
   }
   ownedTabId=tab.id;await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:tab.url||home});
+  tab=await WechatBackgroundWindow.ensureOwnedTab(tab.id,'doubao');
   const known=conversations[key];let reused=chatUrl.test(known?.url||'')||localUrl.test(known?.url||''),expectedUrl=reused?known.url:home;
   stage='navigate';
   if(tab.url!==expectedUrl){

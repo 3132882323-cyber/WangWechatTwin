@@ -104,3 +104,11 @@ GPT 网页通道默认精确选择 GPT-6 与 Pro 最高强度，仍使用不个�
 可在管理员 PowerShell 中执行 `scripts/install_watchdog.ps1` 注册独立 Windows 后台任务。任务在用户登录后运行，每分钟检查一次启动机会，同一任务仍运行时忽略重复触发。卸载或主动完全停止看护时先禁用 `WangWechatTwin-Backend` 任务；普通暂停回复仍使用审核台暂停按钮。
 
 进程归属和 Windows venv 启动器识别复用现有 psutil（BSD-3-Clause；[源码与许可](https://github.com/giampaolo/psutil)），不管理其他应用进程。媒体流式解码复用已安装的 pysilk 0.2.8，网络连接生命周期参考 Chrome 官方样例，未复制第三方代码。
+
+## 后台专用窗口与内部候选
+
+模型网页仍使用浏览器进程和原登录 profile，但桥接器把可证明归属本项目的固定标签移入独立窗口。Windows 端核对随机登记标题、Chrome 程序路径、当前用户和进程身份后真正隐藏，并以 `IsWindowVisible=false` 验证；不是只最小化。普通用户网页不会迁移。审核台提供“显示后台网页”和“完成操作，恢复后台”，临时显示时暂停新网页任务，已有任务可能完成。误激活后台模型标签会恢复控制页并再次隐藏，手动显示模式不抢回窗口。
+
+日常回复在一次模型输出内生成 A/B/C 三条候选，再按安全、边界、语境、本人表达与自然续聊次序选择一条；这些 0–5 分是主观排序，不能称为真实概率。专业知识及业务问题直接生成答案。未入选候选不作为人工风格样例，格式不完整、含虚构标记或不安全的选择进入审核，不追加三次模型请求。若对方直接询问 AI 身份，继续如实说明。
+
+Chrome 窗口和标签迁移使用[官方 Windows API](https://developer.chrome.com/docs/extensions/reference/api/windows)及[Tabs API](https://developer.chrome.com/docs/extensions/reference/api/tabs)；本机隐藏适配自行实现，候选比较参考 [BEST-Route](https://github.com/microsoft/best-route-llm) 思路，没有复制第三方代码或新增模型依赖。

@@ -25,6 +25,10 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
     except (OSError, ValueError):
         labels = {}
     paused = config.resolve(config.paths.pause_file).exists()
+    window_state=db.get_state('browser_bridge_window') or {}
+    window_feedback=db.get_state('browser_window_feedback') or {}
+    window_status=('临时显示，新网页任务已暂停' if window_state.get('manual_reveal') else
+                   '已真正隐藏' if window_state.get('hidden') and window_state.get('verified') and window_state.get('visible') is False else '等待后台窗口连接')
     drafts = db.list_drafts(status="pending", limit=60)
     events = db.recent_events(limit=60)
     rows = []
@@ -122,6 +126,10 @@ small{{color:#9ca3af}}
 <section class="card"><strong>本人的专属聊天数据库</strong><p>已保存 {personal_count} 条双向记录，识别纠正 {correction_count} 条。本人原文、AI 回复与听写结果分开记录；本人发出的文字和已解码媒体也进入当前聊天上下文。{'日常文字与语音转写由 DeepSeek 回复，图片表情交给豆包，专业与激动情绪交给 GPT；共用本机审核及发送规则。' if config.openai.provider=='hybrid_web' else 'DeepSeek 仅生成对照草稿，不直接发送。'}</p></section>
 <div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
 <form method="post" action="/{'resume' if paused else 'pause'}"><input type="hidden" name="_csrf" value="{csrf_token}"><button class="pause">{'恢复处理' if paused else '立即暂停'}</button></form>
+<section class="card"><strong>后台网页：{window_status}</strong><p>专用网页与日常浏览器窗口分开。需要登录或检查时显示，完成后恢复后台；显示期间不启动新网页任务，已开始的一轮可能完成。</p>
+<div role="status" aria-live="polite">{html.escape(window_feedback.get('message',''))}</div>
+<form method="post" action="/browser-window/show" style="display:inline-block"><input type="hidden" name="_csrf" value="{csrf_token}"><button type="submit" style="min-height:44px;margin-right:8px">显示后台网页</button></form>
+<form method="post" action="/browser-window/resume" style="display:inline-block"><input type="hidden" name="_csrf" value="{csrf_token}"><button type="submit" style="min-height:44px">完成操作，恢复后台</button></form></section>
 <section class="card"><strong>主动聊天：{'已开启建议' if config.proactive.enabled else '未开启'}</strong><p>问候与话题跟进均先生成草稿，你批准后才联系对方。每天最多 {config.proactive.max_drafts_per_day} 条；同一联系人至少间隔 {config.proactive.cooldown_hours:g} 小时；北京时间 {config.proactive.active_start_hour}:00—{config.proactive.active_end_hour}:00 生成建议。已有未回复消息时不再催聊。</p></section>
 <section class="card"><strong>表情图片：{'已启用审核建议' if config.stickers.enabled else '未启用'}</strong><p>对方明确分享好消息时，建议使用已批准的表情图片。预览后批准才发送；通过本机接口发送原图，每个联系人每天最多 {config.stickers.max_per_contact_per_day} 条建议。</p></section>
 <section class="card"><strong>语音、图片和表情识别</strong><p>语音在本机转文字：{'已启用' if config.media.voice_enabled else '未启用'}，处理中 {(db.get_state('media_worker_voice') or {}).get('pending_count',0)} 条。图片和表情取图：{'已启用' if config.media.images_enabled else '未启用'}，处理中 {(db.get_state('media_worker_visual') or {}).get('pending_count',0)} 条。普通图片回复先审核；识别不清楚的表情和语音不会自动发送。</p></section>
@@ -177,6 +185,23 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             supplied = request.headers.get('authorization', '')
             if not secrets.compare_digest(supplied, 'Bearer ' + bridge_token):
                 raise HTTPException(403, '网页连接未配对')
+
+        @app.post('/browser-bridge/window/register')
+        async def register_browser_window(request: Request):
+            bridge_auth(request)
+            body = await request.json()
+            from app.browser_window import register
+            return await asyncio.to_thread(register, db, body.get('window_id'), body.get('host_tab_id'))
+
+        @app.post('/browser-bridge/window/hide')
+        async def hide_browser_window(request: Request):
+            bridge_auth(request)
+            body = await request.json()
+            from app.browser_window import STATE_KEY, hide
+            state = db.get_state(STATE_KEY) or {}
+            if any(body.get(key) != state.get(key) for key in ('window_id','host_tab_id','title')):
+                raise HTTPException(409, '后台窗口身份不匹配')
+            return await asyncio.to_thread(hide, db)
 
         @app.post('/browser-bridge/heartbeat')
         async def browser_heartbeat(request: Request):
@@ -276,6 +301,24 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         with path.open('rb') as source:
             if source.read(8)!=b'\x89PNG\r\n\x1a\n':raise HTTPException(404,'图片预览无效')
         return FileResponse(path,media_type='image/png',headers={'Cache-Control':'no-store'})
+
+    @app.post('/browser-window/show')
+    async def show_browser_window(request: Request):
+        await owner_action(request)
+        from app.browser_window import show
+        result = await asyncio.to_thread(show, db)
+        db.set_state('browser_window_feedback', {'ok':result.get('ok',False),
+                     'message':'后台网页已显示，新网页任务暂时停止；操作完成后请恢复后台。' if result.get('ok') else '后台窗口尚未就绪，请等待网页连接后再试。'})
+        return RedirectResponse('/',status_code=303)
+
+    @app.post('/browser-window/resume')
+    async def resume_browser_window(request: Request):
+        await owner_action(request)
+        from app.browser_window import resume
+        result = await asyncio.to_thread(resume, db)
+        db.set_state('browser_window_feedback', {'ok':result.get('ok',False),
+                     'message':'已结束手动操作，等待连接器重新隐藏窗口并恢复生成。' if result.get('ok') else '后台窗口尚未登记，请等待连接。'})
+        return RedirectResponse('/',status_code=303)
 
     @app.post("/pause")
     async def pause(request: Request) -> RedirectResponse:

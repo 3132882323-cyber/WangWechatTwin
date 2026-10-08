@@ -30,6 +30,8 @@ class WebReplyLLM:
                 db.execute("ALTER TABLE jobs ADD COLUMN images TEXT NOT NULL DEFAULT '[]'")
             if 'contact_name' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN contact_name TEXT NOT NULL DEFAULT ''")
+            if 'selection_mode' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute("ALTER TABLE jobs ADD COLUMN selection_mode TEXT NOT NULL DEFAULT 'direct'")
             if 'provider' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT 'chatgpt'")
 
@@ -45,12 +47,17 @@ class WebReplyLLM:
         if self.config.openai.provider in {'deepseek_web','doubao_web'}:
             schema=json.dumps({'action':'send','risk':'low','reply':'实际回复正文','confidence':.9,'reason':'简短理由','facts_to_confirm':[],'memory_updates':[],'media_description':'','media_confidence':0,'sticker_id':''},ensure_ascii=False)
             schema+='\n这是输出示例，不是要复制的内容；action 只能为 send/review/hold/ignore，risk 只能为 low/medium/high/critical。不要输出 JSON Schema 或 properties/defs。'
+        selection_mode = 'direct'
         try:
             parsed_payload=json.loads(user_payload)
             contact_name=str(parsed_payload.get('contact_profile',{}).get('name','')).strip()[:128]
             media_paths=parsed_payload.pop('__media_paths',[])
             namespace = parsed_payload.get('conversation_key','')
             is_test=parsed_payload.pop('__is_local_test',False) is True
+            selection_mode = 'abc' if parsed_payload.get('reply_selection',{}).get('mode')=='abc' else 'direct'
+            if selection_mode=='abc' and self.config.openai.provider in {'deepseek_web','doubao_web'}:
+                example={'action':'send','risk':'low','reply':'入选候选的实际正文','confidence':.9,'reason':'简短理由','facts_to_confirm':[],'memory_updates':[],'media_description':'','media_confidence':0,'sticker_id':'','candidates':[{'label':label,'reply':'真实候选正文'+label,'style_match':4,'context_fit':4,'continuation':4,'boundary_respect':5,'invented_facts':False,'risk':'low'} for label in ['A','B','C']],'selected_candidate':'A'}
+                schema=json.dumps(example,ensure_ascii=False)+'\n以上只是字段结构示例，不得复制候选正文或分数；三条必须贴合本轮微信信息，判断分数不是概率。'
             if self.config.openai.provider in {'deepseek_web','doubao_web'}:
                 # Keep current two-way context and a few relevant examples; avoid replaying a giant style report.
                 parsed_payload['style_examples']=parsed_payload.get('style_examples',[])[:4]
@@ -86,7 +93,7 @@ class WebReplyLLM:
         prompt += '\n此网页对话里先前的 assistant 回复是模型生成结果，不是新的本人自述或已确认事实。不得把自己的旧输出当作本人原话强化；本人亲自修改和本轮已核验微信资料优先。'
         with self.connect() as db:
             provider={'deepseek_web':'deepseek','doubao_web':'doubao'}.get(self.config.openai.provider,'chatgpt')
-            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test,provider,contact_name) VALUES(?,?,?,NULL,?,?,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test),provider,contact_name))
+            db.execute("INSERT INTO jobs(id,prompt,status,result,created,expires,conversation_key,images,is_test,provider,contact_name,selection_mode) VALUES(?,?,?,NULL,?,?,?,?,?,?,?,?)", (job_id, prompt, "pending", time.time(), expires,namespace,json.dumps(images),int(is_test),provider,contact_name,selection_mode))
         waiting_started=time.time()
         try:
             while time.time() < expires:
@@ -111,6 +118,12 @@ class WebReplyLLM:
                 db.execute("UPDATE jobs SET prompt='',images='[]',status=CASE WHEN status='done' THEN status ELSE 'expired' END WHERE id=?", (job_id,))
 
     def complete(self, job_id, result, browser_meta=None):
+        with self.connect() as connection:
+            row=connection.execute('SELECT selection_mode FROM jobs WHERE id=?',(job_id,)).fetchone()
+        if row and row[0]=='direct':
+            raw=json.loads(result)
+            raw.pop('candidates',None);raw.pop('selected_candidate',None)
+            result=json.dumps(raw,ensure_ascii=False)
         parsed = ReplyDecision.model_validate_json(result)
         allowed = {'tab_id','slot_id','turn','reused','managed_tabs','conversation_fingerprint','queue_wait_ms','web_reply_ms','bridge_total_ms','restored_from_local_context'}
         meta = {k:v for k,v in (browser_meta or {}).items() if k in allowed and isinstance(v,(int,str,bool))}

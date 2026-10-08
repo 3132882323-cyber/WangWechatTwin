@@ -30,3 +30,5 @@ native_transport/*.exp
 native_transport/*.obj
 
 *-bootstrap.local.json
+
+*-migration.local.json

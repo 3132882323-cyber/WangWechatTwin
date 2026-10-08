@@ -45,7 +45,26 @@ function turnNode(order,text,body){
 }
 
 function load(name,context){
- if(name==='doubao_background.js'){context.AbortController??=AbortController;context.clearTimeout??=clearTimeout;}
+ if(name==='doubao_background.js'){
+  context.AbortController??=AbortController;context.clearTimeout??=clearTimeout;
+  context.WechatBackgroundWindow??={
+   async ensure(){},
+   async createModelTab({url}){return context.chrome.tabs.create({url,active:false});},
+   async ensureOwnedTab(id){
+    const tab=await context.chrome.tabs.get(id);
+    if(tab.id===id)return tab;
+    const saved=await context.chrome.storage.local.get('doubaoOwnedUrl');
+    return {id,url:saved.doubaoOwnedUrl};
+   }
+  };
+ }
+ if(name==='deepseek_background.js'){
+  context.WechatBackgroundWindow??={
+   async ensure(){},
+   async createModelTab({url}){return context.chrome.tabs.create({url,active:false});},
+   async ensureOwnedTab(id){return context.chrome.tabs.get(id);}
+  };
+ }
  vm.runInNewContext(fs.readFileSync(path.join(__dirname,name),'utf8'),context,{filename:name});
 }
 
@@ -426,7 +445,7 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
  const time=clock(),home='https://www.doubao.com/chat/';
  const tab={id:148,url:'https://www.doubao.com/chat/111'};
  const saved={doubaoOwnedTab:148,doubaoOwnedUrl:tab.url,doubaoConversations:{old:{url:tab.url}}};
- const updates=[];let setupCalls=0,resultBody;
+ const updates=[],backgroundCalls=[];let setupCalls=0,resultBody;
  const chrome={
   storage:{local:{
    async get(key){return key==='token'?{token:'test-token'}:saved;},
@@ -446,13 +465,15 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
   alarms:{onAlarm:{addListener(){}}}
  };
  const fetch=async(url,options)=>{
-  if(url.endsWith('/next'))return {ok:true,json:async()=>({job:{id:'turn-fresh',conversation_key:'new',prompt:'虚构提示',images:[],contact_name:'虚构备注'}})};
+  if(url.endsWith('/next')){assert.deepEqual(backgroundCalls,['ensure']);return {ok:true,json:async()=>({job:{id:'turn-fresh',conversation_key:'new',prompt:'虚构提示',images:[],contact_name:'虚构备注'}})};}
   if(url.endsWith('/result')){resultBody=JSON.parse(options.body);return {ok:true};}
   throw Error('unexpected fetch');
  };
- const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout,console};
+ const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout,console,
+  WechatBackgroundWindow:{async ensure(){backgroundCalls.push('ensure');},async ensureOwnedTab(id,provider){assert.equal(id,148);assert.equal(provider,'doubao');backgroundCalls.push('owned');return tab;},async createModelTab(){throw Error('must not create');}}};
  load('doubao_background.js',context);
  await context.doubaoPump();
+ assert.deepEqual(backgroundCalls,['ensure','owned']);
  assert.deepEqual(updates,[home]);
  assert.equal(resultBody.id,'turn-fresh');
  assert.equal(resultBody.result,'{"reply":"新答案"}');
@@ -541,8 +562,24 @@ test('Doubao diagnostics preserve fixed failure codes and never expose raw excep
  assert.equal(JSON.stringify(saved).includes(privateDetail),false);
 });
 
+test('Doubao does not claim a job while the native background window is revealed',async()=>{
+ const saved={};let queueCalls=0,creates=0;
+ const chrome={storage:{local:{async get(item){return item==='token'?{token:'test-token'}:saved;},async set(values){Object.assign(saved,values);}}},alarms:{onAlarm:{addListener(){}}}};
+ const fetch=async url=>{if(url.endsWith('/next'))queueCalls++;throw Error('unexpected fetch');};
+ const context={chrome,fetch,WebSocket:class{},URL,setTimeout,console:{warn(){}},WechatBackgroundWindow:{
+  async ensure(){throw Error('background_window_manual_reveal');},
+  async ensureOwnedTab(){throw Error('must not touch model tab');},
+  async createModelTab(){creates++;throw Error('must not create');}
+ }};
+ load('doubao_background.js',context);
+ await context.doubaoPump();
+ assert.equal(queueCalls,0);assert.equal(creates,0);
+ assert.equal(saved.doubaoLastFailure.stage,'background_window');
+ assert.equal(saved.doubaoLastFailure.code,'doubao_background_window_unavailable');
+});
+
 test('Doubao migrates once to an exact verified seed page without creating a tab',async()=>{
- let creates=0;
+ let creates=0,hiddenBeforeQueue=false;
  const seedUrl='https://www.doubao.com/chat/666',seedKey='a'.repeat(64);
  const saved={doubaoOwnedTab:189,doubaoOwnedUrl:'https://www.doubao.com/chat/old',doubaoConversations:{}};
  const chrome={
@@ -553,11 +590,15 @@ test('Doubao migrates once to an exact verified seed page without creating a tab
   alarms:{onAlarm:{addListener(){}}}
  };
  const fetch=async(url)=>{
-  if(url.endsWith('/next'))return {ok:true,json:async()=>({job:{id:'seed',conversation_key:seedKey,prompt:'虚构提示',images:[]}})};
+  if(url.endsWith('/next')){assert.equal(hiddenBeforeQueue,true);return {ok:true,json:async()=>({job:{id:'seed',conversation_key:seedKey,prompt:'虚构提示',images:[]}})};}
   if(url.endsWith('doubao-bootstrap.local.json'))return {json:async()=>({owned_url:seedUrl,seed:{conversation_key:seedKey,url:seedUrl,name:'虚构B'}})};
   return {ok:true};
  };
- const context={chrome,fetch,WebSocket:class{},URL,setTimeout,console};
+ const context={chrome,fetch,WebSocket:class{},URL,setTimeout,console,WechatBackgroundWindow:{
+  async ensure(){assert.equal(saved.doubaoOwnedTab,195);hiddenBeforeQueue=true;},
+  async ensureOwnedTab(id,provider){assert.equal(id,195);assert.equal(provider,'doubao');return {id,url:seedUrl};},
+  async createModelTab(){throw Error('must not create');}
+ }};
  load('doubao_background.js',context);
  await context.doubaoPump();
  assert.equal(creates,0);

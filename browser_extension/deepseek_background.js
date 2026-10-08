@@ -21,6 +21,7 @@ async function deepseekPump(){
    tab=matches[0];
    await chrome.storage.local.set({deepseekOwnedTab:tab.id,deepseekOwnedUrl:ownedUrl,deepseekRecoveryApplied:recoveryId});
   }
+  await WechatBackgroundWindow.ensure();
   const bridgeStarted=Date.now();
   const next=await fetch(base+'/next',{headers});if(!next.ok)return;job=(await next.json()).job;if(!job)return;
   if(job.images?.length)throw Error('deepseek_visual_not_verified');
@@ -41,9 +42,10 @@ async function deepseekPump(){
   }else if(!tab&&(previous.deepseekOwnedUrl||Object.keys(conversations).length)){
    throw Error('deepseek_owned_tab_unproven');
   }else if(!tab){
-   tab=await chrome.tabs.create({url:home,active:false});
+   tab=await WechatBackgroundWindow.createModelTab({url:home});
    await chrome.storage.local.set({deepseekOwnedTab:tab.id,deepseekOwnedUrl:home});
   }
+  tab=await WechatBackgroundWindow.ensureOwnedTab(tab.id,'deepseek');
   if(tab.url!==url){
    const editing=await chrome.scripting.executeScript({target:{tabId:tab.id},func:()=>!!document.querySelector('textarea')?.value.trim()});
    if(editing[0]?.result)throw Error('deepseek_user_editing');

@@ -3,6 +3,13 @@ from __future__ import annotations
 
 from app.config import AppConfig, openai_credentials
 from app.models import ReplyDecision, RiskLevel
+from app.reply_selection import (
+    is_emotional_request,
+    is_professional_request,
+    payload_data,
+    prepare_selection_request,
+    select_reply,
+)
 
 
 class LLMError(RuntimeError):
@@ -49,15 +56,20 @@ class ReplyLLM:
 
     @staticmethod
     def route(user_payload,risk):
-        import json,re
-        parsed=json.loads(user_payload);text=parsed.get('incoming',{}).get('content','')
+        parsed=payload_data(user_payload)
         visual=parsed.get('incoming',{}).get('message_type') in {'image','sticker'} or bool(parsed.get('__media_paths'))
-        emotional=bool(re.search('气死|气炸|气疯|愤怒|崩溃|烦死|激动|受不了了|忍不住哭|别烦我|你是不是有病|骗子|混蛋|滚开|分手|不想活|吵架|绝交|别再联系',text))
-        professional=risk in {RiskLevel.high,RiskLevel.critical} or bool(re.search('分析|方案|对比|合同|解释清楚|报价|施工|工期|工程|安装|配置|材料|板材|保温|门窗|排期|调度|财务|电路|代码|技术|法律|税|保险|投资|诊断|治疗|药物|预算|尺寸|图纸',text))
-        if professional or emotional:return 'chatgpt'
+        import re
+        legacy_complex = bool(re.search('分析|对比', parsed.get('incoming',{}).get('content','')))
+        if risk in {RiskLevel.high,RiskLevel.critical} or legacy_complex or is_professional_request(parsed) or is_emotional_request(parsed):
+            return 'chatgpt'
         return 'doubao' if visual else 'deepseek'
 
     def decide(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
+        system_prompt, prepared_payload, mode = prepare_selection_request(system_prompt, user_payload)
+        decision = self._decide_once(system_prompt, prepared_payload, risk)
+        return select_reply(decision, mode=mode, user_payload=user_payload, incoming_risk=risk)
+
+    def _decide_once(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
         if self.hybrid:
             return self.hybrid[self.route(user_payload,risk)].decide(system_prompt,user_payload,risk)
         if self.account is not None:

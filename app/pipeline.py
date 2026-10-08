@@ -285,7 +285,14 @@ class ReplyPipeline:
                 self.db.add_event("llm_error", str(exc), level="error", contact=message.contact)
                 decision = self._fallback(risk.level, risk.safe_holding_reply, str(exc))
 
-        if decision.action!='ignore' and (laughter_only(decision.reply) or not decision.reply.strip()):
+        if decision.candidates:
+            self.db.add_event('reply_candidate_selection',json.dumps({
+                'selected':decision.selected_candidate,'subjective_scores_not_probabilities':True,
+                'candidates':[{'label':c.label,'risk':c.risk.value,'style_match':c.style_match,
+                               'context_fit':c.context_fit,'continuation':c.continuation,
+                               'boundary_respect':c.boundary_respect,'invented_facts':c.invented_facts}
+                              for c in decision.candidates]},ensure_ascii=False),contact=message.contact)
+        if decision.action!='ignore' and (laughter_only(decision.reply) or not decision.reply.strip()) and not any('A/B/C 候选未通过' in fact for fact in decision.facts_to_confirm):
             try:
                 corrected=json.loads(payload)
                 corrected['reply_quality_feedback']={'rejected_reply':decision.reply,

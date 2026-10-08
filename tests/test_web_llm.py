@@ -23,6 +23,19 @@ def test_late_browser_output_cannot_be_replayed(tmp_path):
         queue.complete('old','{"action":"send","risk":"low","reply":"你好"}')
 
 
+def test_professional_direct_completion_ignores_invalid_unused_candidates(tmp_path):
+    import time
+    from app.web_llm import WebReplyLLM
+    queue = WebReplyLLM(AppConfig(project_root=tmp_path))
+    with queue.connect() as connection:
+        connection.execute("INSERT INTO jobs(id,prompt,status,created,expires,selection_mode) VALUES('direct-check','','claimed',?,?,'direct')", (time.time(),time.time()+60))
+    queue.complete('direct-check','{"action":"review","risk":"low","reply":"专业直接答案","candidates":"not needed","selected_candidate":"Z"}')
+    with queue.connect() as connection:
+        raw = connection.execute("SELECT result FROM jobs WHERE id='direct-check'").fetchone()[0]
+    assert '专业直接答案' in raw
+    assert 'not needed' not in raw
+
+
 def test_contact_namespace_is_stable_and_unknown_jobs_never_share_chat(tmp_path):
     import json
     c=AppConfig(project_root=tmp_path,openai={'provider':'web','web_reply_timeout_seconds':0})
