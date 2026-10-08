@@ -23,13 +23,29 @@ class Database:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path, timeout=20, isolation_level=None)
-        conn.row_factory = sqlite3.Row
+        failed = False
         try:
+            conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             yield conn
+        except BaseException:
+            failed = True
+            # Preserve the operation's error if resource exhaustion also
+            # prevents rollback or close. Still attempt both cleanup steps.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
-            conn.close()
+            if failed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            else:
+                conn.close()
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
@@ -355,6 +371,27 @@ class Database:
 
     def approved_drafts(self, limit: int = 20) -> list[DraftRecord]:
         return self.list_drafts(status="approved", limit=limit)
+
+    def quarantine_reply_job(self, connection, identity: int, reason: str) -> bool:
+        """Retain the original queue payload and add one static review draft.
+
+        The scheduler calls this inside its queue transaction. Never parse or
+        copy the potentially oversized payload to build the review notice.
+        """
+        row = connection.execute(
+            "SELECT contact FROM reply_jobs WHERE id=? AND status IN ('pending','working','failed')",
+            (identity,),
+        ).fetchone()
+        if row is None:
+            return False
+        connection.execute("UPDATE reply_jobs SET status='quarantined',updated=? WHERE id=?", (datetime.now().timestamp(), identity))
+        now = utc_now()
+        connection.execute(
+            """INSERT INTO drafts(contact,reply,action,risk,reason,confidence,status,created_at,updated_at)
+               VALUES(?,'','review','medium',?,0,'pending',?,?)""",
+            (row[0], f'{reason}；原始队列记录 {identity} 已保留，需本人核对，未调用模型或发送。', now, now),
+        )
+        return True
 
     def add_event(
         self,

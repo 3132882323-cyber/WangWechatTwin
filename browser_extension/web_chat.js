@@ -37,7 +37,7 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  const work=Array.from(document.querySelectorAll('[role="radio"],input[type="radio"]')).filter(visible).find(e=>(e.getAttribute('aria-label')||e.textContent||'').trim()==='Work');
  if(work&& (work.getAttribute('aria-checked')==='true'||work.checked))throw Error('work mode');
  const modelButton=find('button','选择 ChatGPT 模型');
- const cachedModel=reused&&root.dataset.wechatBridgeModel==='gpt56-maximum'&&modelButton?.textContent.includes('Pro');
+ const cachedModel=reused&&root.dataset.wechatBridgeModel==='gpt6-maximum'&&modelButton?.textContent.includes('Pro');
  if(!cachedModel){
  let modelView=null;
  for(let attempt=0;attempt<8&&!modelView;attempt++){
@@ -47,7 +47,7 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  if(!modelView)throw Error('model_menu_not_ready_before_input');
  click(modelView);
  stage('model-choice');
- click(await wait(()=>find('[role="menuitemradio"]','GPT-5.6 Sol')));
+ click(await wait(()=>Array.from(document.querySelectorAll('[role="menuitemradio"]')).find(e=>visible(e)&&e.textContent.trim()==='GPT-6')));
  // Select the highest available effort through documented keyboard interaction.
  const effort=await wait(()=>find('[role="menuitem"]','强度'));effort.focus();
  const effortSlider=()=>effort.querySelector('[role="slider"]')||effort.closest('[role="menu"]')?.querySelector('[role="slider"]');
@@ -60,7 +60,7 @@ window.wechatWebReplyInner=async function(prompt,key,reused=false,images=[]){
  const slider=effortSlider();
  if(!slider||Number(slider.getAttribute('aria-valuenow'))!==Number(slider.getAttribute('aria-valuemax'))||!Array.from(document.querySelectorAll('[role="menu"]')).some(e=>visible(e)&&e.textContent.includes('Pro')))throw Error('Maximum reasoning not verified');
  click(await wait(()=>find('button','选择 ChatGPT 模型')));
- root.dataset.wechatBridgeModel='gpt56-maximum';
+ root.dataset.wechatBridgeModel='gpt6-maximum';
  if(!window.wechatModelWatch){
   window.wechatModelWatch=true;
   document.addEventListener('pointerdown',e=>{if(e.isTrusted&&e.target.closest('button[aria-label="选择 ChatGPT 模型"]'))root.dataset.wechatBridgeModel='';},true);

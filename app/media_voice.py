@@ -18,13 +18,30 @@ class VoiceNotReady(ValueError):
     pass
 
 
+class _BoundedPCMWriter(io.RawIOBase):
+    def __init__(self, output, max_bytes):
+        super().__init__()
+        self.output, self.max_bytes, self.size = output, max_bytes, 0
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        if self.size + len(data) > self.max_bytes:
+            raise ValueError('语音时长超出自动转写范围')
+        self.output.writeframesraw(data)
+        self.size += len(data)
+        return len(data)
+
+
 def resolve_voice(reader,message):
     origin=json.loads(message.raw_summary or '{}')
     server=int(origin.get('server_id') or 0);local=int(origin.get('local_id') or 0)
     keys_path=reader.root/'media_keys.json'
     if not keys_path.exists():raise ValueError('尚未连接经认证的语音媒体库')
     keys=json.loads(keys_path.read_text())
-    matches=[]
+    unique={}
+    max_voice_bytes=4*1024*1024
     for rel,info in keys.items():
         with tempfile.TemporaryDirectory(dir=reader.root) as tmp:
             snapshot,_=authenticated_snapshot(info,Path(tmp))
@@ -32,14 +49,18 @@ def resolve_voice(reader,message):
                 chat=db.execute('SELECT rowid FROM Name2Id WHERE user_name=?',(message.contact,)).fetchone()
                 if not chat:continue
                 if server:
-                    rows=db.execute('SELECT voice_data FROM VoiceInfo WHERE chat_name_id=? AND svr_id=?',(chat[0],server)).fetchall()
+                    rows=db.execute('SELECT CASE WHEN length(voice_data)<=? THEN voice_data ELSE NULL END,length(voice_data) FROM VoiceInfo WHERE chat_name_id=? AND svr_id=?',(max_voice_bytes,chat[0],server))
                 else:
                     # Local IDs are safe only in the media shard corresponding to this message shard.
                     source=Path(origin.get('source','')).name
                     if Path(info['source']).name!='media_'+source.removeprefix('message_'):continue
-                    rows=db.execute('SELECT voice_data FROM VoiceInfo WHERE chat_name_id=? AND local_id=?',(chat[0],local)).fetchall()
-                matches.extend(bytes(row[0]) for row in rows if row[0])
-    unique={hashlib.sha256(data).hexdigest():data for data in matches}
+                    rows=db.execute('SELECT CASE WHEN length(voice_data)<=? THEN voice_data ELSE NULL END,length(voice_data) FROM VoiceInfo WHERE chat_name_id=? AND local_id=?',(max_voice_bytes,chat[0],local))
+                for raw,size in rows:
+                    if size and size>max_voice_bytes:raise ValueError('语音格式或大小不受支持')
+                    if not raw:continue
+                    data=bytes(raw);digest=hashlib.sha256(data).hexdigest()
+                    if unique and digest not in unique:raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
+                    unique[digest]=data
     if not unique:raise VoiceNotReady('语音音频尚未写入本机媒体库')
     if len(unique)!=1:raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
     digest,data=next(iter(unique.items()))
@@ -92,14 +113,14 @@ class OfflineVoiceProcessor:
             if saved.get('model_stamp')==model_stamp and saved.get('audio_sha256')==digest:
                 return self._result(message,saved,True)
         import pysilk
-        pcm=io.BytesIO()
-        with path.open('rb') as source:pysilk.decode(source,pcm,24000)
-        data=pcm.getvalue();seconds=len(data)/(24000*2)
-        if not .2<=seconds<=self.config.media.max_voice_seconds:raise ValueError('语音时长超出自动转写范围')
         with tempfile.TemporaryDirectory(dir=self.reader.root) as tmp:
             wav_path=Path(tmp)/'speech.wav'
             with wave.open(str(wav_path),'wb') as output:
-                output.setnchannels(1);output.setsampwidth(2);output.setframerate(24000);output.writeframes(data)
+                output.setnchannels(1);output.setsampwidth(2);output.setframerate(24000)
+                pcm=_BoundedPCMWriter(output,int(self.config.media.max_voice_seconds*24000*2))
+                with path.open('rb') as source:pysilk.decode(source,pcm,24000)
+            seconds=pcm.size/(24000*2)
+            if not .2<=seconds<=self.config.media.max_voice_seconds:raise ValueError('语音时长超出自动转写范围')
             if self.model is None:
                 from faster_whisper import WhisperModel
                 self.model=WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=4,local_files_only=True)
@@ -127,6 +148,7 @@ class OfflineVoiceProcessor:
         for key,(message,future) in list(self.pending.items()):
             owner_done=json.loads(message.raw_summary or '{}').get('owner_message') and hasattr(self.reader,'personal') and self.reader.personal.observed(message.external_id)
             if self.db.seen(message.external_id) or owner_done:
+                future.cancel()
                 del self.pending[key];changed=True;continue
             if not future.done():continue
             try:output.append(future.result())
@@ -135,6 +157,8 @@ class OfflineVoiceProcessor:
                 output.append(message.model_copy(update={'raw_summary':json.dumps(origin)}))
         for message in messages:
             if not self._accept(message):output.append(message);continue
+            owner_done=json.loads(message.raw_summary or '{}').get('owner_message') and hasattr(self.reader,'personal') and self.reader.personal.observed(message.external_id)
+            if self.db.seen(message.external_id) or owner_done:continue
             if message.external_id in self.pending:continue
             if len(self.pending)>=self.config.media.max_pending_voice:output.append(message);continue
             self.pending[message.external_id]=(message,self.pool.submit(self._transcribe,message))

@@ -1,21 +1,43 @@
 // One owned Doubao page; no access to pre-existing personal conversations.
-let doubaoBusy=false,doubaoSocket=null;
+let doubaoBusy=false,doubaoSocket=null,doubaoBlocked=false,doubaoHeartbeatBusy=false;
+function doubaoDeadline(pending,timeoutMs,code,onTimeout){
+ let timer;
+ const deadline=new Promise((_,reject)=>{timer=setTimeout(()=>{try{onTimeout?.();}finally{reject(Error(code));}},timeoutMs);});
+ return Promise.race([pending,deadline]).finally(()=>clearTimeout(timer));
+}
+async function doubaoFetch(url,options={},readBody){
+ const controller=new AbortController();
+ const pending=(async()=>{const response=await fetch(url,{...options,signal:controller.signal});return readBody?await readBody(response):response;})();
+ return doubaoDeadline(pending,10000,'doubao_bridge_timeout',()=>controller.abort());
+}
+async function doubaoBlockedHeartbeat(){
+ if(!doubaoBlocked||doubaoHeartbeatBusy)return;doubaoHeartbeatBusy=true;
+ try{
+  const {token}=await chrome.storage.local.get('token');if(!token)return;
+  await doubaoFetch('http://127.0.0.1:18769/browser-bridge/heartbeat',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Provider':'doubao'},body:JSON.stringify({blocked:true})});
+ }catch{}finally{doubaoHeartbeatBusy=false;}
+}
 function doubaoErrorCode(error){
- const allowed=new Set(['doubao_recovery_unproven','doubao_recovery_tab_unavailable','doubao_seed_tab_unavailable','doubao_owned_tab_unavailable','doubao_owned_tab_unproven','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified','doubao_login_or_load','doubao_empty_or_wrong_conversation','doubao_result_url_changed','doubao_result_rejected','doubao_conversation_changed','doubao_unowned_conversation','doubao_wrong_conversation','doubao_wrong_contact','doubao_turn_already_present','doubao_user_attachments','doubao_upload_not_available','doubao_ownership_lost','doubao_image_upload_not_verified','doubao_prompt_or_send_not_ready','doubao_newer_user_turn','doubao_reply_timeout','doubao_rename_timeout']);
+ const allowed=new Set(['doubao_bridge_timeout','doubao_script_timeout','doubao_reply_script_timeout','doubao_recovery_unproven','doubao_recovery_tab_unavailable','doubao_seed_tab_unavailable','doubao_owned_tab_unavailable','doubao_owned_tab_unproven','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified','doubao_login_or_load','doubao_empty_or_wrong_conversation','doubao_result_url_changed','doubao_result_rejected','doubao_conversation_changed','doubao_unowned_conversation','doubao_wrong_conversation','doubao_wrong_contact','doubao_turn_already_present','doubao_user_attachments','doubao_upload_not_available','doubao_ownership_lost','doubao_image_upload_not_verified','doubao_prompt_or_send_not_ready','doubao_newer_user_turn','doubao_reply_timeout','doubao_rename_timeout']);
  const code=String(error?.message||'').match(/\bdoubao_[a-z_]+\b/)?.[0];
  return allowed.has(code)?code:'doubao_unexpected_error';
 }
 async function doubaoPump(){
- if(doubaoBusy)return;const {token}=await chrome.storage.local.get('token');if(!token||doubaoBusy)return;
+ if(doubaoBusy){await doubaoBlockedHeartbeat();return;}const {token}=await chrome.storage.local.get('token');if(!token||doubaoBusy)return;
  const base='http://127.0.0.1:18769/browser-bridge';const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Provider':'doubao'};
- let job=null,stage='bootstrap',ownedTabId=null;const pumpStarted=Date.now();doubaoBusy=true;
+ let job=null,stage='bootstrap',ownedTabId=null,blockedScript=null;const pumpStarted=Date.now();doubaoBusy=true;
+ const execute=async(options,reply=false)=>{
+  const pending=chrome.scripting.executeScript(options),code=reply?'doubao_reply_script_timeout':'doubao_script_timeout';
+  try{return await doubaoDeadline(pending,reply?120000:8000,code);}
+  catch(error){if(error?.message===code)blockedScript=pending;throw error;}
+ };
  try{
   const home='https://www.doubao.com/chat/';
   const isHomeUrl=url=>url===home||url==='https://www.doubao.com/chat';
   const chatUrl=/^https:\/\/www\.doubao\.com\/chat\/\d+$/;
   const localUrl=/^https:\/\/www\.doubao\.com\/chat\/local_\d+$/;
   const saved=await chrome.storage.local.get(['doubaoOwnedTab','doubaoOwnedUrl','doubaoConversations','doubaoSeedApplied','doubaoRecoveryApplied']);const conversations=saved.doubaoConversations||{};let tab,bootstrap={};
-  try{bootstrap=await (await fetch(chrome.runtime.getURL('doubao-bootstrap.local.json'))).json();}catch{}
+  try{bootstrap=await doubaoFetch(chrome.runtime.getURL('doubao-bootstrap.local.json'),{},response=>response.json());}catch(error){if(error?.message==='doubao_bridge_timeout')throw error;}
   const recoveryId=bootstrap.recovery_id;
   if(recoveryId&&saved.doubaoRecoveryApplied!==recoveryId){
    const ownedUrl=bootstrap.owned_url;
@@ -26,7 +48,7 @@ async function doubaoPump(){
    tab=matches[0];
    await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:ownedUrl,doubaoRecoveryApplied:recoveryId});
   }
-  stage='queue';const next=await fetch(base+'/next',{headers});if(!next.ok)return;job=(await next.json()).job;if(!job)return;
+  stage='queue';const next=await doubaoFetch(base+'/next',{headers},response=>response.ok?response.json():null);if(!next)return;job=next.job;if(!job)return;
   const started=Date.now(),key=job.conversation_key;
   stage='owned_tab';
   const seed=bootstrap.seed;
@@ -57,14 +79,14 @@ async function doubaoPump(){
   const known=conversations[key];let reused=chatUrl.test(known?.url||'')||localUrl.test(known?.url||''),expectedUrl=reused?known.url:home;
   stage='navigate';
   if(tab.url!==expectedUrl){
-   const editing=await chrome.scripting.executeScript({target:{tabId:tab.id},func:()=>!!(document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]')?.textContent.trim()||document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'))});
+   const editing=await execute({target:{tabId:tab.id},func:()=>!!(document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]')?.textContent.trim()||document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'))});
    if(editing[0]?.result)throw Error('doubao_user_editing');
   }
   let freshFallback=false;
   if(reused){
    if(tab.url!==expectedUrl)await chrome.tabs.update(tab.id,{url:expectedUrl});
   }else{
-   const changed=await chrome.scripting.executeScript({target:{tabId:tab.id},func:()=>{
+   const changed=await execute({target:{tabId:tab.id},func:()=>{
     if(location.origin!=='https://www.doubao.com')return false;
     if(document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]')?.textContent.trim()||document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'))throw Error('doubao_user_editing');
     if(location.href==='https://www.doubao.com/chat/'||location.href==='https://www.doubao.com/chat')return true;
@@ -76,7 +98,7 @@ async function doubaoPump(){
   }
   stage='ready';let ready=false,stableSince=0,lastSignature='';const freshStarted=Date.now(),deadline=freshStarted+30000;
   while(Date.now()<deadline){
-   try{const state=await chrome.scripting.executeScript({target:{tabId:tab.id},func:(lastTurnId)=>{const replies=document.querySelectorAll('[data-testid="receive_message"]');const editor=document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');return {url:location.href,editor:!!editor,draft:!!editor?.textContent.trim(),attachments:!!document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'),answers:replies.length,users:document.querySelectorAll('[data-testid="send_message"]').length,lastAnswerLength:replies.length?(replies[replies.length-1].textContent||'').length:0,hasKnownTurn:!lastTurnId||Array.from(document.querySelectorAll('[data-testid="send_message"]')).some(node=>node.textContent.includes('[wechat-turn:'+lastTurnId+']'))};},args:[reused?known?.lastTurnId||'':'']});
+   try{const state=await execute({target:{tabId:tab.id},func:(lastTurnId)=>{const replies=document.querySelectorAll('[data-testid="receive_message"]');const editor=document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');return {url:location.href,editor:!!editor,draft:!!editor?.textContent.trim(),attachments:!!document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'),answers:replies.length,users:document.querySelectorAll('[data-testid="send_message"]').length,lastAnswerLength:replies.length?(replies[replies.length-1].textContent||'').length:0,hasKnownTurn:!lastTurnId||Array.from(document.querySelectorAll('[data-testid="send_message"]')).some(node=>node.textContent.includes('[wechat-turn:'+lastTurnId+']'))};},args:[reused?known?.lastTurnId||'':'']});
     const value=state[0]?.result;
     if(reused&&isHomeUrl(value?.url)&&value.editor)throw Error('doubao_known_conversation_missing');
    if(reused&&localUrl.test(expectedUrl)&&chatUrl.test(value?.url||'')&&known?.lastTurnId&&value.hasKnownTurn){
@@ -94,7 +116,7 @@ async function doubaoPump(){
     const signature=eligible?JSON.stringify([value.url,value.users,value.answers,value.lastAnswerLength]):'';
     if(signature&&signature===lastSignature&&Date.now()-stableSince>=900){ready=true;break;}
     if(signature!==lastSignature){lastSignature=signature;stableSince=Date.now();}
-  }catch(error){if(['doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified'].includes(error?.message))throw error;}await new Promise(r=>setTimeout(r,300));
+  }catch(error){if(['doubao_script_timeout','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified'].includes(error?.message))throw error;}await new Promise(r=>setTimeout(r,300));
   }
   if(!ready)throw Error('doubao_login_or_load');
   if(!reused&&localUrl.test(expectedUrl)){
@@ -102,21 +124,26 @@ async function doubaoPump(){
    await chrome.storage.local.set({doubaoConversations:conversations});
   }
   stage='setup';await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:expectedUrl});
-  await chrome.scripting.executeScript({target:{tabId:tab.id},files:['doubao_web.js']});
+  await execute({target:{tabId:tab.id},files:['doubao_web.js']});
   stage='reply';
-  const result=await chrome.scripting.executeScript({target:{tabId:tab.id},func:async(prompt,key,reused,images,expectedUrl,turnId,contactName)=>await window.wechatDoubaoReply(prompt,key,reused,images,expectedUrl,turnId,contactName),args:[job.prompt,key,reused,job.images||[],expectedUrl,job.id,job.contact_name||'']});
+  const result=await execute({target:{tabId:tab.id},func:async(prompt,key,reused,images,expectedUrl,turnId,contactName)=>await window.wechatDoubaoReply(prompt,key,reused,images,expectedUrl,turnId,contactName),args:[job.prompt,key,reused,job.images||[],expectedUrl,job.id,job.contact_name||'']},true);
   const outcome=result[0]?.result;if(!outcome?.reply||!chatUrl.test(outcome.url)||(reused&&outcome.url!==expectedUrl))throw Error('doubao_empty_or_wrong_conversation');
   stage='complete';const finished=await chrome.tabs.get(tab.id);if(finished.url!==outcome.url)throw Error('doubao_result_url_changed');
   conversations[key]={url:finished.url,name:job.contact_name||'',lastTurnId:job.id};await chrome.storage.local.set({doubaoConversations:conversations,doubaoOwnedUrl:finished.url});
-  const accepted=await fetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,result:outcome.reply,browser_meta:{tab_id:tab.id,reused,managed_tabs:1,bridge_total_ms:Date.now()-started}})});
+  const accepted=await doubaoFetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,result:outcome.reply,browser_meta:{tab_id:tab.id,reused,managed_tabs:1,bridge_total_ms:Date.now()-started}})});
   if(!accepted.ok)throw Error('doubao_result_rejected');
  }catch(error){
   const code=doubaoErrorCode(error),failure={code,stage,job_id:job?.id||'',at:Date.now(),elapsed_ms:Date.now()-pumpStarted};
   if(Number.isInteger(ownedTabId))failure.tab_id=ownedTabId;
+  if(blockedScript){failure.pending_script=true;doubaoBlocked=true;doubaoBlockedHeartbeat();}
   await chrome.storage.local.set({doubaoLastFailure:failure}).catch(()=>{});
-  if(job)await fetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,error:code,stage})}).catch(()=>{});
+  if(job)await doubaoFetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,error:code,stage})}).catch(()=>{});
  }
- finally{doubaoBusy=false;}
+ finally{
+  // executeScript cannot be cancelled. Discard its late value and keep the page fenced until it settles.
+  if(blockedScript){const release=()=>{doubaoBusy=false;doubaoBlocked=false;};blockedScript.then(release,release);}
+  else doubaoBusy=false;
+ }
 }
 async function connectDoubao(){
  if(doubaoSocket)return;const {token}=await chrome.storage.local.get('token');if(!token)return;

@@ -45,7 +45,102 @@ function turnNode(order,text,body){
 }
 
 function load(name,context){
+ if(name==='doubao_background.js'){context.AbortController??=AbortController;context.clearTimeout??=clearTimeout;}
  vm.runInNewContext(fs.readFileSync(path.join(__dirname,name),'utf8'),context,{filename:name});
+}
+
+async function settleMicrotasks(){for(let i=0;i<20;i++)await Promise.resolve();}
+
+for(const bodyStalls of [false,true]){
+ test(`Doubao bridge deadline aborts a stalled ${bodyStalls?'response body':'fetch'} even when it ignores cancellation`,async()=>{
+  const time=clock();let signal;
+  const chrome={storage:{local:{async get(){return {};}}},alarms:{onAlarm:{addListener(){}}}};
+  const fetch=async(_,options)=>{signal=options.signal;return bodyStalls?{json:()=>new Promise(()=>{})}:new Promise(()=>{});};
+  const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout};
+  load('doubao_background.js',context);
+  const pending=context.doubaoFetch('http://127.0.0.1/test',{},response=>response.json());
+  const rejected=assert.rejects(pending,/doubao_bridge_timeout/);
+  await settleMicrotasks();time.advance(10000);await rejected;
+  assert.equal(signal.aborted,true);
+ });
+}
+
+test('Doubao clears the bridge deadline after a complete response body',async()=>{
+ const time=clock();let signal;
+ const chrome={storage:{local:{async get(){return {};}}},alarms:{onAlarm:{addListener(){}}}};
+ const fetch=async(_,options)=>{signal=options.signal;return {json:async()=>({ok:true})};};
+ const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout};
+ load('doubao_background.js',context);
+ assert.deepEqual(await context.doubaoFetch('http://127.0.0.1/test',{},response=>response.json()),{ok:true});
+ time.advance(10000);
+ assert.equal(signal.aborted,false);assert.equal(time.longFired(),0);
+});
+
+test('Doubao queue fetch timeout leaves a fixed failure and releases busy without claiming another job',async()=>{
+ const time=clock(),saved={};let queueCalls=0,signal,reached;
+ const queued=new Promise(resolve=>{reached=resolve;});
+ const chrome={storage:{local:{async get(item){return item==='token'?{token:'test-token'}:saved;},async set(values){Object.assign(saved,values);}}},alarms:{onAlarm:{addListener(){}}}};
+ const fetch=async(url,options)=>{
+  if(url.endsWith('/next')){queueCalls++;signal=options.signal;reached();return new Promise(()=>{});}
+  throw Error('no bootstrap');
+ };
+ const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout};
+ load('doubao_background.js',context);
+ const pumping=context.doubaoPump();await queued;time.advance(10000);await pumping;
+ assert.equal(saved.doubaoLastFailure.code,'doubao_bridge_timeout');
+ assert.equal(saved.doubaoLastFailure.stage,'queue');assert.equal(saved.doubaoLastFailure.job_id,'');
+ assert.equal(signal.aborted,true);assert.equal(queueCalls,1);
+ assert.equal(vm.runInNewContext('doubaoBusy',context),false);
+});
+
+for(const hungStage of ['ready','setup','reply']){
+ test(`Doubao ${hungStage} script timeout keeps the same page fenced, sends a heartbeat, and discards its late result`,async()=>{
+  const time=clock(),url='https://www.doubao.com/chat/666',key='d'.repeat(64);
+  const saved={doubaoOwnedTab:32,doubaoOwnedUrl:url,doubaoConversations:{[key]:{url,name:'保留虚构备注',lastTurnId:'kept-turn'},other:{url:'https://www.doubao.com/chat/777',lastTurnId:'other-turn'}}};
+  const before=structuredClone(saved.doubaoConversations),calls={next:0,results:[],heartbeats:[],setup:0,reply:0,creates:0,updates:0};
+  let settleScript,rejectScript,reached;
+  const pendingScript=new Promise((resolve,reject)=>{settleScript=resolve;rejectScript=reject;});
+  const scriptReached=new Promise(resolve=>{reached=resolve;});
+  const ready={url,editor:true,draft:false,attachments:false,users:1,answers:1,lastAnswerLength:5,hasKnownTurn:true};
+  const chrome={
+   storage:{local:{async get(item){return item==='token'?{token:'test-token'}:saved;},async set(values){Object.assign(saved,values);}}},
+   tabs:{async get(id){assert.equal(id,32);return {id,url};},async create(){calls.creates++;throw Error('must not create');},async update(){calls.updates++;throw Error('must not navigate');}},
+   scripting:{executeScript(options){
+    assert.equal(options.target.tabId,32);
+    const stage=options.files?'setup':options.args?.length===7?'reply':'ready';
+    if(stage==='setup')calls.setup++;if(stage==='reply')calls.reply++;
+    if(stage===hungStage){reached();return pendingScript;}
+    return Promise.resolve([{result:stage==='ready'?ready:null}]);
+   }},
+   alarms:{onAlarm:{addListener(){}}}
+  };
+  const fetch=async(endpoint,options)=>{
+   if(endpoint.endsWith('/next')){calls.next++;return {ok:true,json:async()=>({job:calls.next===1?{id:'timed-turn',conversation_key:key,prompt:'虚构提示',images:[],contact_name:'保留虚构备注'}:null})};}
+   if(endpoint.endsWith('/result')){calls.results.push(JSON.parse(options.body));return {ok:true};}
+   if(endpoint.endsWith('/heartbeat')){calls.heartbeats.push(JSON.parse(options.body));assert.equal(options.headers['X-Wechat-Bridge-Provider'],'doubao');return {ok:true};}
+   throw Error('no bootstrap');
+  };
+  const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout};
+  load('doubao_background.js',context);
+  const pumping=context.doubaoPump();await scriptReached;time.advance(hungStage==='reply'?120000:8000);await pumping;
+  assert.equal(saved.doubaoLastFailure.code,hungStage==='reply'?'doubao_reply_script_timeout':'doubao_script_timeout');
+  assert.equal(saved.doubaoLastFailure.stage,hungStage);assert.equal(saved.doubaoLastFailure.pending_script,true);
+  assert.equal(vm.runInNewContext('doubaoBusy',context),true);
+  await context.doubaoPump();await settleMicrotasks();
+  assert.equal(calls.next,1);assert.ok(calls.heartbeats.length>=1);
+  assert.ok(calls.heartbeats.every(body=>body.blocked===true&&Object.keys(body).length===1));
+  assert.equal(calls.creates+calls.updates,0);
+  assert.equal(calls.results.length,1);assert.equal(calls.results[0].stage,hungStage);
+  assert.equal(calls.results[0].result,undefined);
+  if(hungStage==='setup')rejectScript(Error('late failure'));
+  else settleScript([{result:hungStage==='reply'?{reply:'{"reply":"迟到结果"}',url}:ready}]);
+  await settleMicrotasks();
+  assert.equal(vm.runInNewContext('doubaoBusy',context),false);
+  assert.equal(vm.runInNewContext('doubaoBlocked',context),false);
+  assert.deepEqual(saved.doubaoConversations,before);assert.equal(calls.results.length,1);
+  if(hungStage!=='reply')assert.equal(calls.reply,0);
+  await context.doubaoPump();assert.equal(calls.next,2);
+ });
 }
 
 test('Doubao observer resolves on a DOM mutation when the deadline timer never fires',async()=>{
@@ -355,7 +450,7 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
   if(url.endsWith('/result')){resultBody=JSON.parse(options.body);return {ok:true};}
   throw Error('unexpected fetch');
  };
- const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,console};
+ const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout,console};
  load('doubao_background.js',context);
  await context.doubaoPump();
  assert.deepEqual(updates,[home]);
@@ -390,7 +485,7 @@ for(const reused of [false,true]){
    if(url.endsWith('/result')){resultBody=JSON.parse(options.body);return {ok:true};}
    throw Error('no bootstrap');
   };
-  const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,console:{warn(){}}};
+  const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout,console:{warn(){}}};
   load('doubao_background.js',context);await context.doubaoPump();
   assert.equal(creates,0);assert.deepEqual(saved.doubaoConversations.old,old);assert.ok(time.now()<3000);
   if(reused){assert.equal(resultBody.error,'doubao_known_conversation_missing');assert.equal(resultBody.stage,'ready');assert.equal(scripts,0);assert.equal(updates.length,0);}

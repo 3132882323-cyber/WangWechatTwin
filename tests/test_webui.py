@@ -9,6 +9,41 @@ from app.models import IncomingMessage, ReplyDecision, RiskLevel
 from app.webui import create_app
 
 
+def test_health_detects_dead_reply_lane_and_stale_runtime(tmp_path):
+    import time
+    from app.config import AppConfig
+    config = AppConfig(project_root=tmp_path)
+    db = Database(tmp_path / 'health.sqlite3')
+    client = TestClient(create_app(config, db))
+    db.set_state('reply_scheduler_health', {'dead_lanes': ['doubao']})
+    assert client.get('/health').json()['ok'] is False
+    db.set_state('reply_scheduler_health', {'dead_lanes': []})
+    db.set_state('runtime_heartbeat', {'seen_at': time.time() - 180})
+    assert client.get('/health').json()['heartbeat_stale'] is True
+    db.set_state('runtime_heartbeat', {'seen_at': time.time()})
+    assert client.get('/health').json()['ok'] is True
+
+
+def test_blocked_browser_heartbeat_never_claims_a_reply(tmp_path):
+    from app.config import AppConfig
+    from app.web_llm import WebReplyLLM
+    import time
+    config = AppConfig(project_root=tmp_path)
+    config.openai.provider = 'hybrid_web'
+    db = Database(tmp_path / 'review.sqlite3')
+    client = TestClient(create_app(config, db))
+    queue = WebReplyLLM(config)
+    token = (config.resolve(config.paths.browser_bridge) / 'pairing_token.txt').read_text().strip()
+    with queue.connect() as connection:
+        connection.execute("INSERT INTO jobs(id,prompt,status,created,expires,provider) VALUES('blocked-check','test','pending',?,?,'doubao')", (time.time(), time.time()+60))
+    assert client.post('/browser-bridge/heartbeat', json={'blocked': True}).status_code == 403
+    response = client.post('/browser-bridge/heartbeat', json={'blocked': True}, headers={'authorization': 'Bearer '+token, 'x-wechat-bridge-provider': 'doubao'})
+    assert response.status_code == 200
+    assert db.get_state('doubao_bridge')['ready'] is False
+    with queue.connect() as connection:
+        assert connection.execute("SELECT status FROM jobs WHERE id='blocked-check'").fetchone()[0] == 'pending'
+
+
 def test_dashboard_shows_incoming_and_learns_edit(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     raw = yaml.safe_load((root / "config.example.yaml").read_text(encoding="utf-8"))

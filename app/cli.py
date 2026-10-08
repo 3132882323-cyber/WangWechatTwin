@@ -106,8 +106,6 @@ def merge_incoming_messages(messages: list[IncomingMessage], *, separate_media: 
         if len(items) == 1:
             merged.append(items[0])
             continue
-        identity = "|".join(item.external_id for item in items)
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
         origins=[]
         for item in items:
             try:origin=json.loads(item.raw_summary or '{}')
@@ -115,10 +113,26 @@ def merge_incoming_messages(messages: list[IncomingMessage], *, separate_media: 
             origins.append(origin if isinstance(origin,dict) else {})
         latest_index=max(range(len(items)),key=lambda index:items[index].received_at)
         summary=dict(origins[latest_index])
-        members=[]
-        for item,origin in zip(items,origins):members.extend([item.external_id]+origin.get('member_external_ids',[]))
-        summary.update(merged_count=len(items),member_external_ids=list(dict.fromkeys(members)),
-                       asr_uncertain=any(origin.get('asr_uncertain') for origin in origins))
+        members=[];parts=[];seen=set();truncated=False
+        for item,origin in zip(items,origins):
+            leaf_ids=[value for value in origin.get('member_external_ids',[]) if not value.startswith('merged:')]
+            if not leaf_ids:leaf_ids=[item.external_id]
+            candidates=origin.get('merged_parts') or [{'ids':leaf_ids,'content':item.content,'sender':item.sender}]
+            for part in candidates:
+                ids=[value for value in part.get('ids',[]) if isinstance(value,str)]
+                if ids and set(ids).issubset(seen):continue
+                seen.update(ids);members.extend(ids)
+                parts.append({'ids':ids,'content':str(part.get('content','')),'sender':str(part.get('sender',''))})
+            truncated=truncated or bool(origin.get('merge_truncated'))
+        if len(parts)>128:parts=parts[-128:];truncated=True
+        text='\n'.join((part['sender']+'：'+part['content']) if items[-1].chat_type=='group' else part['content'] for part in parts if part['content'].strip())
+        if len(text)>32768:
+            text=text[-32768:];parts=[{'ids':list(dict.fromkeys(members))[-512:],'content':text,'sender':items[-1].sender}];truncated=True
+        members=list(dict.fromkeys(members))
+        if len(members)>512:members=members[-512:];truncated=True
+        digest=hashlib.sha256('|'.join(members).encode('utf-8')).hexdigest()[:32]
+        summary.update(merged_count=len(members),member_external_ids=members,merged_parts=parts,
+                       merge_truncated=truncated,asr_uncertain=any(origin.get('asr_uncertain') for origin in origins))
         if any(origin.get('original_type')=='voice' for origin in origins):
             summary.update(original_type='voice',transcription_source='offline_whisper')
         all_paths=list(dict.fromkeys(path for item in items for path in item.media_paths))
@@ -132,7 +146,7 @@ def merge_incoming_messages(messages: list[IncomingMessage], *, separate_media: 
                 sender='群中多位成员' if items[-1].chat_type=='group' and len({m.sender_key or m.sender for m in items})>1 else items[-1].sender,
                 sender_key=items[-1].sender_key if len({m.sender_key or m.sender for m in items})==1 else '',
                 display_name=items[-1].display_name,
-                content="\n".join((item.sender+'：'+item.content) if item.chat_type=='group' else item.content for item in items if item.content.strip()),
+                content=text,
                 media_paths=all_paths[:3],
                 message_type=merged_type,
                 chat_type=items[-1].chat_type,
@@ -278,6 +292,18 @@ def command_run(args: argparse.Namespace) -> int:
 
         try:
             while True:
+                from app.resource_health import available_commit_bytes, under_pressure
+                available = available_commit_bytes()
+                db.set_state("resource_pressure", {"active": under_pressure(available), "available_commit_bytes": available})
+                worker_health = scheduler.health()
+                db.set_state("reply_scheduler_health", worker_health)
+                db.set_state("runtime_heartbeat", {"seen_at": time.time(), "pid": os.getpid()})
+                if worker_health.get("dead_lanes"):
+                    print("回复线程已退出，交由后台看护安全恢复", file=sys.stderr)
+                    return 3
+                if under_pressure(available):
+                    time.sleep(5)
+                    continue
                 if config.resolve(config.paths.pause_file).exists():
                     time.sleep(max(config.wechat.poll_seconds, 1.0))
                 try:

@@ -178,6 +178,18 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             if not secrets.compare_digest(supplied, 'Bearer ' + bridge_token):
                 raise HTTPException(403, '网页连接未配对')
 
+        @app.post('/browser-bridge/heartbeat')
+        async def browser_heartbeat(request: Request):
+            bridge_auth(request)
+            provider = request.headers.get('x-wechat-bridge-provider', '')
+            if provider not in {'chatgpt', 'deepseek', 'doubao'}:
+                raise HTTPException(400, '未知网页提供方')
+            body = await request.json()
+            blocked = body.get('blocked') is True
+            db.set_state('browser_bridge' if provider == 'chatgpt' else provider + '_bridge',
+                         {'seen_at': time.time(), 'ready': not blocked, 'blocked': blocked})
+            return {'ok': True}
+
         @app.get('/browser-bridge/next')
         async def browser_next(request: Request):
             bridge_auth(request)
@@ -238,7 +250,12 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        return JSONResponse({"ok": True, "paused": config.resolve(config.paths.pause_file).exists()})
+        workers = db.get_state("reply_scheduler_health") or {}
+        heartbeat = db.get_state("runtime_heartbeat") or {}
+        stale = bool(heartbeat) and time.time() - heartbeat.get("seen_at", 0) > 120
+        return JSONResponse({"ok": not bool(workers.get("dead_lanes")) and not stale,
+                             "paused": config.resolve(config.paths.pause_file).exists(),
+                             "workers": workers, "heartbeat_stale": stale})
 
     @app.get('/sticker-preview/{digest}')
     async def sticker_preview(digest:str):

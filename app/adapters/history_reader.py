@@ -44,17 +44,24 @@ def authenticated_snapshot(info, directory):
     before = signature(source)
     shutil.copyfile(source, encrypted)
     wal_source = Path(str(source) + "-wal")
-    wal = wal_source.read_bytes() if wal_source.exists() else b""
+    wal_snapshot = directory / "encrypted.db-wal"
+    if wal_source.exists():
+        shutil.copyfile(wal_source, wal_snapshot)
     if signature(source) != before:
         raise SnapshotBusyError("微信记录正在更新，稍后重试读取")
     key, salt = bytes.fromhex(info["enc_key"]), bytes.fromhex(info["salt"])
     mac_key = hashlib.pbkdf2_hmac("sha512", key, bytes(v ^ 0x3a for v in salt), 2, dklen=32)
 
-    def decode(page, pg):
+    def authenticate(page, pg):
+        if len(page) != 4096:
+            raise RuntimeError("微信数据库认证失败，停止本次读取")
         payload = page[16 if pg == 1 else 0:4032]
         expected = hmac.new(mac_key, payload + struct.pack("<I", pg), hashlib.sha512).digest()
-        if len(page) != 4096 or not hmac.compare_digest(expected, page[4032:]):
+        if not hmac.compare_digest(expected, page[4032:]):
             raise RuntimeError("微信数据库认证失败，停止本次读取")
+
+    def decode(page, pg):
+        authenticate(page, pg)
         return _decrypt_page(key, page, pg)
 
     with encrypted.open("rb") as src, target.open("wb") as dst:
@@ -62,34 +69,42 @@ def authenticated_snapshot(info, directory):
         while page := src.read(4096):
             pg += 1
             dst.write(decode(page, pg))
-    if len(wal) >= 32:
-        magic, version, page_size, seq, s1, s2, c1, c2 = struct.unpack(">8I", wal[:32])
-        if magic not in (0x377f0682, 0x377f0683) or page_size != 4096:
-            raise RuntimeError("微信日志格式尚不支持")
-        endian = "<" if magic == 0x377f0682 else ">"
-        state = wal_checksum(wal[:24], endian=endian)
-        if state != (c1, c2):
-            raise RuntimeError("微信日志头校验失败")
-        frames, commit_end, db_size = [], 0, 0
-        for offset in range(32, len(wal) - 4119, 4120):
-            header = wal[offset:offset + 24]
-            pg, size, fs1, fs2, fc1, fc2 = struct.unpack(">6I", header)
-            page = wal[offset + 24:offset + 4120]
-            if (fs1, fs2) != (s1, s2) or pg == 0:
-                break
-            expected = wal_checksum(header[:8] + page, state, endian)
-            if expected != (fc1, fc2):
-                break
-            state = expected
-            frames.append((pg, decode(page, pg)))
-            if size:
-                commit_end, db_size = len(frames), size
-        with target.open("r+b") as dst:
-            for pg, page in frames[:commit_end]:
-                dst.seek((pg - 1) * 4096)
-                dst.write(page)
-            if commit_end:
-                dst.truncate(db_size * 4096)
+    if wal_snapshot.exists():
+        with wal_snapshot.open("rb") as wal:
+            wal_header = wal.read(32)
+            if len(wal_header) == 32:
+                magic, version, page_size, seq, s1, s2, c1, c2 = struct.unpack(">8I", wal_header)
+                if magic not in (0x377f0682, 0x377f0683) or page_size != 4096:
+                    raise RuntimeError("微信日志格式尚不支持")
+                endian = "<" if magic == 0x377f0682 else ">"
+                state = wal_checksum(wal_header[:24], endian=endian)
+                if state != (c1, c2):
+                    raise RuntimeError("微信日志头校验失败")
+                commit_end, db_size = 0, 0
+                # Keep only the last verified commit offset, never all WAL pages.
+                while True:
+                    header, page = wal.read(24), wal.read(4096)
+                    if len(header) != 24 or len(page) != 4096:
+                        break
+                    pg, size, fs1, fs2, fc1, fc2 = struct.unpack(">6I", header)
+                    if (fs1, fs2) != (s1, s2) or pg == 0:
+                        break
+                    expected = wal_checksum(header[:8] + page, state, endian)
+                    if expected != (fc1, fc2):
+                        break
+                    state = expected
+                    authenticate(page, pg)
+                    if size:
+                        commit_end, db_size = wal.tell(), size
+                if commit_end:
+                    wal.seek(32)
+                    with target.open("r+b") as dst:
+                        while wal.tell() < commit_end:
+                            header, page = wal.read(24), wal.read(4096)
+                            pg = struct.unpack(">I", header[:4])[0]
+                            dst.seek((pg - 1) * 4096)
+                            dst.write(decode(page, pg))
+                        dst.truncate(db_size * 4096)
     connection = sqlite3.connect(target.as_uri() + "?mode=ro&immutable=1", uri=True)
     try:
         if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
@@ -97,6 +112,17 @@ def authenticated_snapshot(info, directory):
     finally:
         connection.close()
     return target, before
+
+
+def bounded_decompress(data, max_bytes=8*1024*1024):
+    """Enforce the limit even when a Zstd frame declares its output size."""
+    declared = zstandard.frame_content_size(data)
+    if declared not in (zstandard.CONTENTSIZE_UNKNOWN, zstandard.CONTENTSIZE_ERROR) and declared > max_bytes:
+        raise ValueError("微信消息解压大小超出读取限制")
+    decoded = zstandard.ZstdDecompressor().decompress(data, max_output_size=max_bytes)
+    if len(decoded) > max_bytes:
+        raise ValueError("微信消息解压大小超出读取限制")
+    return decoded
 
 
 class HistoryReadOnlyAdapter(MessageAdapter):
@@ -196,19 +222,20 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                         columns = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
                         source_cols = "source,WCDB_CT_source" if "source" in columns else "NULL,NULL"
                         packed_col='packed_info_data' if 'packed_info_data' in columns else 'NULL'
+                        last_own_id = conn.execute(
+                            f'SELECT max(local_id) FROM "{table}" WHERE local_id>? AND real_sender_id=?',
+                            (previous, own_id)).fetchone()[0] or previous
                         rows = conn.execute(
                             f'SELECT local_id,server_id,local_type,real_sender_id,create_time,message_content,'
                             f'WCDB_CT_message_content,{source_cols},{packed_col} FROM "{table}" WHERE local_id>? ORDER BY local_id',
                             (previous,))
-                        rows = list(rows)
-                        last_own_id = max((r[0] for r in rows if r[3] == own_id), default=previous)
                         for local_id, server_id, typ, sender, ts, content, compression, source_text, source_compression, packed_info in rows:
                             if new_table and ts < self.started_at:
                                 continue
                             if (typ & 0xffffffff) == 1:
                                 memory_text = content
                                 if isinstance(memory_text, bytes):
-                                    memory_text = (zstandard.ZstdDecompressor().decompress(memory_text, max_output_size=8*1024*1024) if compression else memory_text).decode('utf-8')
+                                    memory_text = (bounded_decompress(memory_text) if compression else memory_text).decode('utf-8')
                                 if isinstance(memory_text, str) and memory_text.strip():
                                     identity = hashlib.sha256(f'{account}|{contact}|{server_id or name+str(local_id)}'.encode()).hexdigest()
                                     memory_rows.append((identity, contact, 'out' if sender == own_id else 'in', ts, memory_text,'本人' if sender==own_id else self.names.get(users.get(sender,''),'群成员（未确认）' if contact.endswith('@chatroom') else '对方')))
@@ -219,7 +246,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                     if provenance=='ai_generated':memory_rows[-1]=(*memory_rows[-1][:6],'本人（AI生成，仅作已发送上下文）')
                             if sender==own_id and (typ&0xffffffff) in {3,34,47}:
                                 own_content=content
-                                if isinstance(own_content,bytes):own_content=(zstandard.ZstdDecompressor().decompress(own_content,max_output_size=8*1024*1024) if compression else own_content).decode('utf-8',errors='replace')
+                                if isinstance(own_content,bytes):own_content=(bounded_decompress(own_content) if compression else own_content).decode('utf-8',errors='replace')
                                 own_type={3:'image',34:'voice',47:'sticker'}[typ&0xffffffff]
                                 own_meta={'source':name,'local_id':local_id,'server_id':server_id,'created_at':ts,'owner_message':True}
                                 if own_type=='image':
@@ -237,7 +264,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                             if sender == own_id or local_id <= last_own_id or (typ & 0xffffffff) in {10000, 10002}:
                                 continue
                             if isinstance(content, bytes):
-                                content = (zstandard.ZstdDecompressor().decompress(content, max_output_size=8*1024*1024)
+                                content = (bounded_decompress(content)
                                            if compression else content).decode("utf-8")
                             if (typ & 0xffffffff) == 1 and (not isinstance(content, str) or not content.strip()):
                                 continue
@@ -245,7 +272,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                 content = ""
                             if contact.endswith("@chatroom") and self.config.wechat.group_only_mentions:
                                 if isinstance(source_text, bytes):
-                                    source_text = (zstandard.ZstdDecompressor().decompress(source_text, max_output_size=1024*1024)
+                                    source_text = (bounded_decompress(source_text, max_bytes=1024*1024)
                                                    if source_compression else source_text).decode("utf-8")
                                 at_match = re.search(r"<atuserlist>(.*?)</atuserlist>", source_text or "", re.S)
                                 addressed = (bool(at_match and (account in at_match[1] or "notify@all" in at_match[1]))
