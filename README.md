@@ -112,3 +112,6 @@ GPT 网页通道默认精确选择 GPT-6 与 Pro 最高强度，仍使用不个�
 日常回复在一次模型输出内生成 A/B/C 三条候选，再按安全、边界、语境、本人表达与自然续聊次序选择一条；这些 0–5 分是主观排序，不能称为真实概率。专业知识及业务问题直接生成答案。未入选候选不作为人工风格样例，格式不完整、含虚构标记或不安全的选择进入审核，不追加三次模型请求。若对方直接询问 AI 身份，继续如实说明。
 
 Chrome 窗口和标签迁移使用[官方 Windows API](https://developer.chrome.com/docs/extensions/reference/api/windows)及[Tabs API](https://developer.chrome.com/docs/extensions/reference/api/tabs)；本机隐藏适配自行实现，候选比较参考 [BEST-Route](https://github.com/microsoft/best-route-llm) 思路，没有复制第三方代码或新增模型依赖。
+
+
+三路恢复控制页现使用本机 HTTP：`http://127.0.0.1:18769/browser-window/host`。扩展重载后恢复请求通过配对接口接收，按已登记会话地址重建失效标签，再核验窗口和恢复请求编号；不会把普通用户页面认领为后台页。恢复确认只证明页面连接恢复，实际回复仍须单独验证。

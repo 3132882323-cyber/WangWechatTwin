@@ -189,7 +189,9 @@ test('explicit GPT migration merges the exact ID with a durable pool only after 
  assert.equal(fixture.local.bridgePool[1].tabId,261);assert.equal(fixture.local.bridgePool[1].url,migrationUrl);assert.equal(fixture.local.bridgePool[1].key,migrationKey);
  assert.equal(fixture.calls.scripts,1);assert.equal(fixture.calls.localPoolWrites,1);assert.equal(fixture.calls.sessionPoolWrites,0);
  assert.equal(fixture.calls.queries+fixture.calls.creates+fixture.calls.updates+fixture.calls.network,0);
- for(const pool of fixture.calls.windowPools)assert.equal(pool.find(slot=>slot.tabId===261)?.key,migrationKey);
+ assert.equal(fixture.calls.windowPools[0].some(slot=>slot.tabId===261),false);
+ await fixture.context.WechatBackgroundWindow.ensure();
+ assert.equal(fixture.calls.windowPools.at(-1).find(slot=>slot.tabId===261)?.key,migrationKey);
 });
 
 for(const [name,page] of [
@@ -224,8 +226,9 @@ test('explicit GPT migration cannot overwrite an occupied slot or grow beyond th
 });
 
 const privatePath=path.join(__dirname,'gpt-migration.local.json');
-test('the operator-authorized private existing GPT page is accepted with its exact saved DOM owner and empty editor proof',{skip:!fs.existsSync(privatePath)},async()=>{
- const migration=JSON.parse(fs.readFileSync(privatePath,'utf8')),claim=migration.slots[0];
+let privateMigration;try{privateMigration=JSON.parse(fs.readFileSync(privatePath,'utf8'));}catch{}
+test('the operator-authorized private existing GPT page is accepted with its exact saved DOM owner and empty editor proof',{skip:!Array.isArray(privateMigration?.slots)||!privateMigration.slots.length},async()=>{
+ const migration=privateMigration,claim=migration.slots[0];
  const fixture=harness({migration,bootstrap:{recovery_id:'short'},tabs:[{id:claim.tabId,url:claim.url}],page:{url:claim.url,owner:claim.key,draft:''}});
  await fixture.context.migrateChatgptPool();
  assert.equal(fixture.local.chatgptMigrationApplied,migration.migration_id);assert.equal(fixture.local.bridgePool.length,migration.slots.length);

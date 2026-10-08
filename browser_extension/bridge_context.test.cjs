@@ -465,7 +465,7 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
   alarms:{onAlarm:{addListener(){}}}
  };
  const fetch=async(url,options)=>{
-  if(url.endsWith('/next')){assert.deepEqual(backgroundCalls,['ensure']);return {ok:true,json:async()=>({job:{id:'turn-fresh',conversation_key:'new',prompt:'虚构提示',images:[],contact_name:'虚构备注'}})};}
+  if(url.endsWith('/next')){assert.deepEqual(backgroundCalls,['ensure','ensure']);return {ok:true,json:async()=>({job:{id:'turn-fresh',conversation_key:'new',prompt:'虚构提示',images:[],contact_name:'虚构备注'}})};}
   if(url.endsWith('/result')){resultBody=JSON.parse(options.body);return {ok:true};}
   throw Error('unexpected fetch');
  };
@@ -473,7 +473,7 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
   WechatBackgroundWindow:{async ensure(){backgroundCalls.push('ensure');},async ensureOwnedTab(id,provider){assert.equal(id,148);assert.equal(provider,'doubao');backgroundCalls.push('owned');return tab;},async createModelTab(){throw Error('must not create');}}};
  load('doubao_background.js',context);
  await context.doubaoPump();
- assert.deepEqual(backgroundCalls,['ensure','owned']);
+ assert.deepEqual(backgroundCalls,['ensure','ensure','owned']);
  assert.deepEqual(updates,[home]);
  assert.equal(resultBody.id,'turn-fresh');
  assert.equal(resultBody.result,'{"reply":"新答案"}');
@@ -579,7 +579,7 @@ test('Doubao does not claim a job while the native background window is revealed
 });
 
 test('Doubao migrates once to an exact verified seed page without creating a tab',async()=>{
- let creates=0,hiddenBeforeQueue=false;
+ let creates=0,hiddenBeforeQueue=false;const windowOwners=[];
  const seedUrl='https://www.doubao.com/chat/666',seedKey='a'.repeat(64);
  const saved={doubaoOwnedTab:189,doubaoOwnedUrl:'https://www.doubao.com/chat/old',doubaoConversations:{}};
  const chrome={
@@ -595,7 +595,7 @@ test('Doubao migrates once to an exact verified seed page without creating a tab
   return {ok:true};
  };
  const context={chrome,fetch,WebSocket:class{},URL,setTimeout,console,WechatBackgroundWindow:{
-  async ensure(){assert.equal(saved.doubaoOwnedTab,195);hiddenBeforeQueue=true;},
+  async ensure(){windowOwners.push(saved.doubaoOwnedTab);hiddenBeforeQueue=saved.doubaoOwnedTab===195;},
   async ensureOwnedTab(id,provider){assert.equal(id,195);assert.equal(provider,'doubao');return {id,url:seedUrl};},
   async createModelTab(){throw Error('must not create');}
  }};
@@ -603,6 +603,7 @@ test('Doubao migrates once to an exact verified seed page without creating a tab
  await context.doubaoPump();
  assert.equal(creates,0);
  assert.equal(saved.doubaoOwnedTab,195);
+ assert.deepEqual(windowOwners,[189,195]);
  assert.equal(saved.doubaoSeedApplied,seedUrl);
  assert.equal(saved.doubaoConversations[seedKey].url,seedUrl);
 });

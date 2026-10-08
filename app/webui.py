@@ -191,7 +191,22 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             bridge_auth(request)
             body = await request.json()
             from app.browser_window import register
-            return await asyncio.to_thread(register, db, body.get('window_id'), body.get('host_tab_id'))
+            result = await asyncio.to_thread(register, db, body.get('window_id'), body.get('host_tab_id'))
+            recovery = db.get_state('browser_model_recovery') or {}
+            if result.get('ok') and recovery.get('nonce') and not recovery.get('completed'):
+                result['recovery_requested'] = {'nonce': recovery['nonce']}
+            return result
+
+        @app.post('/browser-bridge/window/recovered')
+        async def browser_models_recovered(request: Request):
+            bridge_auth(request)
+            body = await request.json()
+            recovery = db.get_state('browser_model_recovery') or {}
+            window = db.get_state('browser_bridge_window') or {}
+            if not recovery.get('nonce') or body.get('nonce') != recovery.get('nonce') or any(type(window.get(key)) is not int or window[key] <= 0 or type(body.get(key)) is not int or body[key] != window[key] for key in ('window_id','host_tab_id')):
+                raise HTTPException(409, '恢复登记不匹配')
+            db.set_state('browser_model_recovery', {**recovery, 'completed': True, 'completed_at': time.time()})
+            return {'ok': True, 'nonce':body['nonce'], 'window_id':body['window_id'], 'host_tab_id':body['host_tab_id']}
 
         @app.post('/browser-bridge/window/hide')
         async def hide_browser_window(request: Request):
@@ -202,6 +217,16 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             if any(body.get(key) != state.get(key) for key in ('window_id','host_tab_id','title')):
                 raise HTTPException(409, '后台窗口身份不匹配')
             return await asyncio.to_thread(hide, db)
+
+        @app.post('/browser-bridge/window/diagnostic')
+        async def browser_window_diagnostic(request: Request):
+            bridge_auth(request)
+            body = await request.json()
+            code = str(body.get('code', ''))
+            if not re.fullmatch(r'[a-z_]{1,100}', code):
+                code = 'unclassified_window_failure'
+            db.set_state('browser_window_diagnostic', {'code': code, 'seen_at': time.time()})
+            return {'ok': True}
 
         @app.post('/browser-bridge/heartbeat')
         async def browser_heartbeat(request: Request):
@@ -310,6 +335,23 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         db.set_state('browser_window_feedback', {'ok':result.get('ok',False),
                      'message':'后台网页已显示，新网页任务暂时停止；操作完成后请恢复后台。' if result.get('ok') else '后台窗口尚未就绪，请等待网页连接后再试。'})
         return RedirectResponse('/',status_code=303)
+
+    @app.get('/browser-window/host', response_class=HTMLResponse)
+    async def browser_http_host():
+        return HTMLResponse(f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>微信模型后台控制台</title></head>
+<body style="font:16px/1.6 system-ui;max-width:720px;margin:40px auto;padding:24px"><h1>微信模型后台控制台</h1>
+<p>这是本机控制页。三路模型页与日常浏览器分开运行，不需要进入扩展特殊协议页面。</p>
+<form method="post" action="/browser-window/recover-models"><input type="hidden" name="_csrf" value="{app.state.csrf_token}"><button style="min-height:44px;padding:12px 20px">一起恢复三路模型连接</button></form>
+<p><a href="/" target="_blank" rel="noopener">打开本机审核台</a></p></body></html>''', headers={'Cache-Control':'no-store','X-Frame-Options':'DENY'})
+
+    @app.post('/browser-window/recover-models')
+    async def request_models_recovery(request: Request):
+        await owner_action(request)
+        from app.browser_window import resume
+        await asyncio.to_thread(resume, db)
+        db.set_state('browser_model_recovery', {'nonce': secrets.token_hex(16), 'requested_at': time.time(), 'completed': False})
+        db.set_state('browser_window_feedback', {'ok': True, 'message':'已请求一起恢复三路模型，正在等待连接器执行。'})
+        return RedirectResponse('/browser-window/host',status_code=303)
 
     @app.post('/browser-window/resume')
     async def resume_browser_window(request: Request):

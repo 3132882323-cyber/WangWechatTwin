@@ -4,8 +4,10 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 
-const hostUrl='chrome-extension://bridge-test/background_host.html';
+const hostUrl='http://127.0.0.1:18769/browser-window/host';
+const retiredHostUrl='chrome-extension://bridge-test/background_host.html';
 const title='WeChatTwin Background '+ 'a'.repeat(32);
+const recoveryNonce='c'.repeat(32);
 const gptHome='https://chatgpt.com/?temporary-chat=true';
 const dsHome='https://chat.deepseek.com/';
 const dsUrl='https://chat.deepseek.com/a/chat/s/owned-one';
@@ -18,7 +20,7 @@ function harness(options={}){
  const session=structuredClone(options.session||{});
  const tabs=new Map((options.tabs||[]).map(tab=>[tab.id,{active:false,...structuredClone(tab)}]));
  const windows=new Map((options.windows||[{id:1,type:'normal',incognito:false}]).map(window=>[window.id,structuredClone(window)]));
- const calls={windows:[],creates:[],moves:[],updates:[],requests:[],titles:[],queries:[]};
+ const calls={windows:[],creates:[],moves:[],updates:[],requests:[],titles:[],queries:[],scripts:[],messages:[],storageWrites:[]};
  let nextWindow=100,nextTab=1000;
  const storage=target=>({
   async get(keys){
@@ -26,26 +28,19 @@ function harness(options={}){
    if(Array.isArray(keys))return Object.fromEntries(keys.map(key=>[key,structuredClone(target[key])]));
    return structuredClone(target);
   },
-  async set(values){Object.assign(target,structuredClone(values));},
+  async set(values){calls.storageWrites.push({area:target===local?'local':'session',values:structuredClone(values)});Object.assign(target,structuredClone(values));},
   async remove(key){delete target[key];}
  });
  const chrome={
   storage:{local:storage(local),session:storage(session),onChanged:listener()},
   runtime:{id:'bridge-test',getURL:file=>'chrome-extension://bridge-test/'+file,onStartup:listener(),onInstalled:listener(),onMessage:listener(),openOptionsPage(){},
-   async sendMessage(message){
-    calls.titles.push(structuredClone(message));
-    if(options.rejectHost)throw Error('host not ready');
-    const tab=tabs.get(message.host_tab_id);
-    if(!tab||tab.url!==hostUrl||tab.windowId!==message.window_id)return {ok:false};
-    tab.title=message.title;
-    return {ok:true,window_id:tab.windowId,host_tab_id:tab.id,title:tab.title};
-   }
+   async sendMessage(message){calls.messages.push(structuredClone(message));throw Error('host messaging is retired');}
   },
   windows:{
    async get(windowId){if(!windows.has(windowId))throw Error('window closed');return structuredClone(windows.get(windowId));},
    async create(properties){
     calls.windows.push(structuredClone(properties));const window={id:nextWindow++,type:properties.type,incognito:false,state:properties.state,focused:properties.focused};windows.set(window.id,window);
-    const tab={id:nextTab++,windowId:window.id,url:properties.url,active:true};tabs.set(tab.id,tab);
+    const tab={id:nextTab++,windowId:window.id,url:properties.url,active:true};tabs.set(tab.id,tab);options.onWindowCreate?.(tab,window);
     return structuredClone({...window,tabs:[tab]});
    }
   },
@@ -54,26 +49,40 @@ function harness(options={}){
    async get(tabId){if(!tabs.has(tabId))throw Error('tab closed');options.onGet?.(tabs.get(tabId));return structuredClone(tabs.get(tabId));},
    async query(query){calls.queries.push(structuredClone(query));return [...tabs.values()].filter(tab=>query.windowId===undefined||tab.windowId===query.windowId).map(tab=>structuredClone(tab));},
    async move(tabId,properties){calls.moves.push({tabId,...structuredClone(properties)});const tab=tabs.get(tabId);if(!tab)throw Error('closed');tab.windowId=properties.windowId;tab.active=false;return structuredClone(tab);},
-   async create(properties){calls.creates.push(structuredClone(properties));const tab={id:nextTab++,...structuredClone(properties)};tabs.set(tab.id,tab);options.onCreate?.(tab);return structuredClone(tab);},
+   async create(properties){calls.creates.push(structuredClone(properties));options.beforeCreate?.(properties,{calls,tabs,windows});const tab={id:nextTab++,...structuredClone(properties)};tabs.set(tab.id,tab);options.onCreate?.(tab);return structuredClone(tab);},
    async update(tabId,properties){
     calls.updates.push({tabId,...structuredClone(properties)});const tab=tabs.get(tabId);if(!tab)throw Error('closed');
     if(properties.active)for(const other of tabs.values())if(other.windowId===tab.windowId)other.active=false;
-    Object.assign(tab,structuredClone(properties));return structuredClone(tab);
+    Object.assign(tab,structuredClone(properties));options.onUpdate?.(tab,properties,{calls,tabs,windows});return structuredClone(tab);
    }
   },
+  scripting:{async executeScript(properties){
+   calls.scripts.push({target:structuredClone(properties.target),args:structuredClone(properties.args),func:properties.func?.toString()});
+   if(options.rejectHost)throw Error('host not ready');
+   const tab=tabs.get(properties.target.tabId);if(!tab)throw Error('closed');options.onScript?.(tab,properties);
+   const pageUrl=options.pageUrl?.(tab)||tab.url,parsed=new URL(pageUrl),document={title:tab.title||'WeChatTwin Background'};
+   const result=vm.runInNewContext('('+properties.func.toString()+')(...args)',{location:{href:pageUrl,origin:parsed.origin,pathname:parsed.pathname},document,args:properties.args||[]});
+   tab.title=document.title;
+   calls.titles.push({window_id:tab.windowId,host_tab_id:tab.id,title:tab.title});
+   return [{frameId:options.scriptFrameId??0,result}];
+  }},
   alarms:{create(){},onAlarm:listener()},action:{onClicked:listener()}
  };
  async function fetch(url,request={}){
-  if(url.endsWith('/chatgpt-bootstrap.local.json')||url.endsWith('/gpt-migration.local.json'))return {async json(){return {};}};
-  const body=JSON.parse(request.body),kind=url.split('/').at(-1);
-  calls.requests.push({kind,body,...request,bodyText:request.body});
+  if(url.endsWith('-bootstrap.local.json')||url.endsWith('/gpt-migration.local.json'))return {async json(){return {};}};
+  const body=request.body?JSON.parse(request.body):{},kind=url.split('/').at(-1);
+  calls.requests.push({kind,...request,body,bodyText:request.body});
   const reply={ok:true,window_id:body.window_id,host_tab_id:body.host_tab_id,title,manual_reveal:options.manualReveal===true};
+  if(kind==='next')return {ok:true,async json(){return {job:null};}};
+  if(kind==='register'&&options.recoveryNonce!==undefined)reply.recovery_requested={nonce:options.recoveryNonce};
+  if(kind==='recovered')reply.nonce=body.nonce;
   if(kind==='hide'){
    if(options.manualReveal){Object.assign(reply,{ok:false,hidden:false,visible:null,verified:false,error:'background_window_manual_reveal'});}
    else Object.assign(reply,{hidden:true,visible:false,verified:true});
    options.onHide?.({tabs,windows,calls,reply});
   }
   options.reply?.(kind,reply,body);
+  if(kind==='recovered'&&reply.ok===true&&reply.nonce===body.nonce&&reply.window_id===body.window_id&&reply.host_tab_id===body.host_tab_id)delete options.recoveryNonce;
   return {ok:options.httpOk!==false,async json(){return structuredClone(reply);}};
  }
  const context=vm.createContext({chrome,fetch,URL,Date,AbortController,setTimeout,clearTimeout,console:{warn(){}},WebSocket:class{constructor(){}},
@@ -90,6 +99,14 @@ function ownedOptions(){
   session:{bridgePool:[0,1,2].map(index=>({tabId:20+index,slotId:index,url:gptHome,key:'contact-'+index,turns:5,used:index}))},
   tabs:[{id:11,windowId:1,url:dsUrl},{id:12,windowId:1,url:duoUrl},...[20,21,22].map(id=>({id,windowId:1,url:gptHome})),{id:99,windowId:1,url:'https://example.com/',active:true},{id:98,windowId:1,url:dsUrl}]
  };
+}
+
+function diagnosticOnly(fixture,from,code){
+ const added=fixture.calls.requests.slice(from);
+ assert.equal(added.length,1);
+ assert.equal(added[0].kind,'diagnostic');assert.equal(added[0].method,'POST');
+ assert.equal(added[0].headers.Authorization,'Bearer offline-test-token');assert.deepEqual(added[0].body,{code});
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.error,code);assert.equal(fixture.local.bridgeBackgroundWindowHealth.verified,false);
 }
 
 test('migration keeps every saved model tab ID and contact map and leaves personal tabs in the daily window',async()=>{
@@ -133,6 +150,83 @@ test('window ownership still includes the same GPT IDs after extension reload cl
  assert.equal(fixture.local.bridgeBackgroundWindowHealth.verified,true);
 });
 
+test('extension reload restores only the saved newtab controller ID after registration and committed URL proof',async()=>{
+ const fixture=harness(ownedOptions());const state=await fixture.api().ensure();
+ const preserved=structuredClone({pool:fixture.local.bridgePool,deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations});
+ const before=fixture.calls.updates.length,windows=fixture.calls.windows.length,moves=fixture.calls.moves.length;
+ fixture.tabs.get(state.hostTabId).url='chrome://newtab/';delete fixture.session.bridgePool;
+ let pending=false,reads=0;
+ fixture.options.onUpdate=(tab,properties,{calls})=>{
+  if(properties.url!==hostUrl)return;
+  assert.equal(tab.id,state.hostTabId);assert.equal(calls.requests.at(-1).kind,'register');
+  assert.equal(calls.requests.at(-1).body.window_id,state.windowId);assert.equal(calls.requests.at(-1).body.host_tab_id,state.hostTabId);
+  tab.url='chrome://newtab/';tab.pendingUrl=hostUrl;pending=true;
+ };
+ fixture.options.onGet=tab=>{if(pending&&tab.id===state.hostTabId&&++reads===2){tab.url=hostUrl;delete tab.pendingUrl;}};
+ fixture.load();const restored=await fixture.api().ensure();
+ assert.equal(restored.hostTabId,state.hostTabId);assert.equal(restored.windowId,state.windowId);assert.equal(restored.restoreHost,undefined);
+ assert.equal(fixture.tabs.get(state.hostTabId).url,hostUrl);assert.equal(fixture.calls.windows.length,windows);assert.equal(fixture.calls.moves.length,moves);assert.equal(fixture.calls.creates.length,0);
+ assert.deepEqual(fixture.calls.updates.slice(before).filter(call=>call.url),[{tabId:state.hostTabId,url:hostUrl}]);
+ assert.deepEqual({pool:fixture.local.bridgePool,deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations},preserved);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.verified,true);assert.equal(fixture.local.bridgeBackgroundWindowHealth.visible,false);
+});
+
+for(const blankUrl of ['chrome://newtab/','about:blank']){
+test('manual reveal prevents saved '+blankUrl+' controller restoration and keeps the user account tab selected',async()=>{
+ const fixture=harness(ownedOptions());const state=await fixture.api().ensure();
+ fixture.tabs.get(state.hostTabId).url=blankUrl;fixture.tabs.get(state.hostTabId).active=false;fixture.tabs.get(11).active=true;
+ fixture.options.manualReveal=true;fixture.load();
+ const requests=fixture.calls.requests.length,updates=fixture.calls.updates.length,hides=fixture.calls.requests.filter(call=>call.kind==='hide').length;
+ await assert.rejects(fixture.api().ensure(),/background_window_manual_reveal/);
+ assert.equal(fixture.calls.requests[requests].kind,'register');assert.deepEqual(fixture.calls.requests[requests].body,{window_id:state.windowId,host_tab_id:state.hostTabId});diagnosticOnly(fixture,requests+1,'background_window_manual_reveal');
+ assert.equal(fixture.calls.updates.length,updates);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,hides);
+ assert.equal(fixture.tabs.get(state.hostTabId).url,blankUrl);assert.equal(fixture.tabs.get(11).active,true);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);
+});
+}
+
+test('only the saved proven about:blank controller is restored; an unrelated blank tab and all model pages are untouched',async()=>{
+ const fixture=harness(ownedOptions());const state=await fixture.api().ensure();
+ const before=fixture.calls.updates.length,requests=fixture.calls.requests.length,moves=fixture.calls.moves.length;
+ const maps=structuredClone({pool:fixture.local.bridgePool,deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations});
+ fixture.tabs.get(state.hostTabId).url='about:blank';fixture.tabs.get(99).url='about:blank';delete fixture.session.bridgePool;
+ fixture.options.onUpdate=(tab,properties,{calls})=>{if(properties.url){assert.equal(tab.id,state.hostTabId);assert.equal(calls.requests[requests].kind,'register');assert.deepEqual(calls.requests[requests].body,{window_id:state.windowId,host_tab_id:state.hostTabId});}};
+ fixture.load();await fixture.api().ensure();
+ assert.deepEqual(fixture.calls.updates.slice(before).filter(call=>call.url),[{tabId:state.hostTabId,url:hostUrl}]);
+ assert.equal(fixture.tabs.get(99).url,'about:blank');assert.equal(fixture.tabs.get(99).windowId,1);
+ assert.deepEqual({pool:fixture.local.bridgePool,deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations},maps);
+ assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);assert.equal(fixture.calls.moves.length,moves);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.visible,false);assert.equal(fixture.local.bridgeBackgroundWindowHealth.verified,true);
+});
+
+for(const blankUrl of ['chrome://newtab/','about:blank']){
+test(blankUrl+' controller recovery rejects a window containing an unclaimed personal tab before registration',async()=>{
+ const fixture=harness(ownedOptions());const state=await fixture.api().ensure();
+ fixture.tabs.get(state.hostTabId).url=blankUrl;fixture.tabs.set(999,{id:999,windowId:state.windowId,url:'https://example.org/',active:true});fixture.load();
+ const requests=fixture.calls.requests.length,updates=fixture.calls.updates.length;
+ await assert.rejects(fixture.api().ensure(),/background_window_mixed_tabs/);
+ diagnosticOnly(fixture,requests,'background_window_mixed_tabs');assert.equal(fixture.calls.updates.length,updates);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);
+ assert.equal(fixture.tabs.get(999).url,'https://example.org/');
+});
+}
+
+for(const url of ['https://example.org/','about:blank#user-state','chrome://extensions/','chrome://newtab/#user-state']){
+ test('saved controller navigation to '+url+' is rejected without replacing its page or creating another window',async()=>{
+  const fixture=harness(ownedOptions());const state=await fixture.api().ensure();fixture.tabs.get(state.hostTabId).url=url;fixture.load();
+  const requests=fixture.calls.requests.length,updates=fixture.calls.updates.length;
+  await assert.rejects(fixture.api().ensure(),/background_window_host_changed/);
+  diagnosticOnly(fixture,requests,'background_window_host_changed');assert.equal(fixture.calls.updates.length,updates);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);assert.equal(fixture.tabs.get(state.hostTabId).url,url);
+ });
+}
+
+for(const blankUrl of ['chrome://newtab/','about:blank']){
+test(blankUrl+' controller restoration refuses a changed window ID even though the host tab ID is unchanged',async()=>{
+ const fixture=harness(ownedOptions());const state=await fixture.api().ensure();const tab=fixture.tabs.get(state.hostTabId);tab.url=blankUrl;tab.windowId=1;fixture.load();
+ const requests=fixture.calls.requests.length,updates=fixture.calls.updates.length;
+ await assert.rejects(fixture.api().ensure(),/background_window_host_changed/);
+ diagnosticOnly(fixture,requests,'background_window_host_changed');assert.equal(fixture.calls.updates.length,updates);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);
+});
+}
+
 test('an empty authoritative local pool leaves stale session GPT tabs in the daily browser',async()=>{
  const options=ownedOptions();options.local.bridgePool=[];const fixture=harness(options);await fixture.api().ensure();
  assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[11,12]);
@@ -149,19 +243,17 @@ test('only IDs with saved provider origin proof are moved; matching user website
  assert.equal(fixture.calls.creates.length,0);
 });
 
-for(const [name,record] of [['saved host',true],['exact host URL without a saved record',false]]){
- test('a '+name+' in a window with a personal tab is never hidden or moved',async()=>{
-  const fixture=harness({local:record?{bridgeBackgroundWindow:{windowId:1,hostTabId:50}}:{},tabs:[{id:50,windowId:1,url:hostUrl},{id:99,windowId:1,url:'https://example.com/',active:true}]});
+ test('a saved host in a window with a personal tab is never hidden or moved',async()=>{
+  const fixture=harness({local:{bridgeBackgroundWindow:{windowId:1,hostTabId:50}},tabs:[{id:50,windowId:1,url:hostUrl},{id:99,windowId:1,url:'https://example.com/',active:true}]});
   await assert.rejects(fixture.api().ensure(),/background_window_mixed_tabs/);
-  assert.equal(fixture.calls.requests.length,0);assert.equal(fixture.calls.moves.length,0);assert.equal(fixture.calls.updates.length,0);assert.equal(fixture.calls.windows.length,0);
+  diagnosticOnly(fixture,0,'background_window_mixed_tabs');assert.equal(fixture.calls.moves.length,0);assert.equal(fixture.calls.updates.length,0);assert.equal(fixture.calls.windows.length,0);
   assert.equal(fixture.tabs.get(99).active,true);
  });
-}
 
 test('a saved host dragged into a personal window is refused without hiding that window',async()=>{
  const fixture=harness({local:{bridgeBackgroundWindow:{windowId:7,hostTabId:50}},tabs:[{id:50,windowId:1,url:hostUrl},{id:99,windowId:1,url:'https://example.com/'}]});
- await assert.rejects(fixture.api().ensure(),/background_window_mixed_tabs/);
- assert.equal(fixture.calls.requests.length,0);assert.equal(fixture.calls.windows.length,0);
+ await assert.rejects(fixture.api().ensure(),/background_window_host_changed/);
+ diagnosticOnly(fixture,0,'background_window_host_changed');assert.equal(fixture.calls.windows.length,0);assert.equal(fixture.calls.updates.length,0);assert.equal(fixture.calls.moves.length,0);
 });
 
 test('a proven tab in a popup source is not recreated to bypass the normal-window API constraint',async()=>{
@@ -350,16 +442,160 @@ test('GPT acquisition fails on a lost saved pool tab without allocating a replac
  assert.equal(fixture.calls.creates.length,0);assert.equal(fixture.calls.moves.length,0);assert.equal(fixture.session.bridgePool[0].tabId,20);assert.equal(fixture.tabs.get(98).windowId,1);
 });
 
-test('controller accepts only a bridge title addressed to its exact window and tab',async()=>{
- let onMessage,observer;
- const document={title:'WeChatTwin Background',querySelector(){return {};}};
- const context=vm.createContext({document,MutationObserver:class{constructor(fn){observer=fn;}observe(){}},chrome:{runtime:{id:'bridge-test',onMessage:{addListener(fn){onMessage=fn;}}},tabs:{async getCurrent(){return {id:50,windowId:100};}}}});
- vm.runInContext(fs.readFileSync(path.join(__dirname,'background_host.js'),'utf8'),context,{filename:'background_host.js'});
- const receive=(message,sender={id:'bridge-test'})=>new Promise(resolve=>{const kept=onMessage(message,sender,resolve);if(kept!==true)resolve(undefined);});
- const message={type:'wechat-background-host-title',window_id:100,host_tab_id:50,title};
- assert.equal((await receive(message)).ok,true);assert.equal(document.title,title);
- document.title='foreign title';observer();assert.equal(document.title,title);
- assert.equal((await receive({...message,host_tab_id:51})).ok,false);assert.equal(document.title,title);
- assert.equal(await receive({...message,title:'Google Chrome'}),undefined);assert.equal(document.title,title);
- assert.equal(await receive(message,{id:'other-extension'}),undefined);assert.equal(document.title,title);
+test('HTTP host title injection is limited to its exact top frame and never messages an extension page',async()=>{
+ const fixture=harness();const state=await fixture.api().ensure();
+ assert.equal(fixture.calls.messages.length,0);
+ for(const script of fixture.calls.scripts){
+  assert.deepEqual(script.target,{tabId:state.hostTabId,frameIds:[0]});assert.deepEqual(script.args,[hostUrl,title]);
+ }
+ const func=fixture.calls.scripts[0].func;
+ for(const url of [retiredHostUrl,'https://example.org/',hostUrl+'?extra=true',hostUrl+'/other',hostUrl+'#extra']){
+  const parsed=new URL(url),document={title:'Unchanged'};
+  const result=vm.runInNewContext('('+func+')(...args)',{location:{href:url,origin:parsed.origin,pathname:parsed.pathname},document,args:[hostUrl,title]});
+  assert.equal(result.ok,false);assert.equal(document.title,'Unchanged');
+ }
+});
+
+test('saved legacy host migrates only its proven tab ID to HTTP and retains every owned model and contact map',async()=>{
+ const options=ownedOptions();options.local.bridgeBackgroundWindow={windowId:100,hostTabId:50};
+ options.windows=[{id:1,type:'normal',incognito:false},{id:100,type:'normal',incognito:false}];
+ for(const tab of options.tabs)if([11,12,20,21,22].includes(tab.id))tab.windowId=100;
+ options.tabs.push({id:50,windowId:100,url:retiredHostUrl});
+ const fixture=harness(options),maps=structuredClone({deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations,pool:fixture.session.bridgePool});
+ await fixture.api().ensure();
+ assert.deepEqual(fixture.calls.updates.filter(call=>call.url),[{tabId:50,url:hostUrl}]);
+ assert.equal(fixture.calls.requests[0].kind,'register');assert.equal(fixture.calls.windows.length,0);assert.equal(fixture.calls.moves.length,0);assert.equal(fixture.calls.creates.length,0);assert.equal(fixture.calls.messages.length,0);
+ assert.equal(fixture.tabs.get(50).url,hostUrl);assert.equal(fixture.tabs.get(99).windowId,1);
+ assert.deepEqual({deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations,pool:fixture.local.bridgePool},maps);
+ assert.ok(fixture.calls.scripts.every(call=>call.target.tabId===50&&call.args[0]===hostUrl));
+ assert.equal(fixture.local.bridgeBackgroundWindow.restoreHostUrl,undefined);
+});
+
+test('ordinary public HTTP and unclaimed legacy host pages remain untouched while a new dedicated controller is created',async()=>{
+ const fixture=harness({local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl},tabs:[{id:11,windowId:1,url:dsUrl},{id:50,windowId:1,url:hostUrl,active:true},{id:51,windowId:1,url:retiredHostUrl},{id:99,windowId:1,url:'https://example.org/'}]});
+ const state=await fixture.api().ensure();
+ assert.equal(fixture.calls.windows.length,1);assert.notEqual(state.hostTabId,50);assert.notEqual(state.hostTabId,51);
+ assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[11]);
+ for(const tabId of [50,51,99])assert.equal(fixture.tabs.get(tabId).windowId,1);
+ assert.equal(fixture.tabs.get(50).active,true);assert.equal(fixture.tabs.get(51).url,retiredHostUrl);
+ assert.ok(fixture.calls.queries.every(query=>query.windowId!==undefined));
+ assert.ok(fixture.calls.scripts.every(call=>call.target.tabId===state.hostTabId));
+});
+
+test('a newly created host with a pending HTTP navigation saves its exact identity before registration and commit',async()=>{
+ let reads=0;
+ const fixture=harness({onWindowCreate(tab){tab.pendingUrl=tab.url;tab.url='';},onGet(tab){if(tab.pendingUrl===hostUrl&&++reads===2){tab.url=hostUrl;delete tab.pendingUrl;}},onUpdate(tab,properties){if(properties.url===hostUrl){tab.url='';tab.pendingUrl=hostUrl;}}});
+ const state=await fixture.api().ensure();
+ assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.tabs.get(state.hostTabId).url,hostUrl);
+ const record=fixture.calls.storageWrites.find(write=>write.area==='local'&&write.values.bridgeBackgroundWindow);
+ assert.equal(record.values.bridgeBackgroundWindow.hostTabId,state.hostTabId);assert.equal(record.values.bridgeBackgroundWindow.windowId,state.windowId);
+ assert.equal(fixture.local.bridgeBackgroundWindow.restoreHost,undefined);assert.equal(fixture.local.bridgeBackgroundWindowHealth.verified,true);
+});
+
+test('authenticated recovery recreates only closed saved IDs, preserves contact maps and clears every expired GPT context',async()=>{
+ const options=ownedOptions();options.recoveryNonce=recoveryNonce;
+ options.local.deepseekOwnedUrl=dsHome;options.local.doubaoOwnedUrl=duoHome;
+ const newestDs='https://chat.deepseek.com/a/chat/s/newest-owned',newestDuo='https://www.doubao.com/chat/54321';
+ options.local.deepseekConversations.newer={url:newestDs,name:'C',used:99,lastTurnId:'known-c'};
+ options.local.doubaoConversations.newer={url:newestDuo,name:'D',lastTurnId:'known-d'};
+ options.session.bridgePool[1].url='https://chatgpt.com/c/closed-owned?temporary-chat=true';options.session.bridgePool[1].failed=true;options.session.bridgePool[1].navigationOriginBefore=123;
+ options.tabs=options.tabs.filter(tab=>![11,12,20,21].includes(tab.id));options.tabs.push({id:85,windowId:1,url:newestDuo});
+ const fixture=harness(options),maps=structuredClone({deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations}),live=structuredClone(fixture.session.bridgePool[2]);
+ const state=await fixture.api().ensure();
+ assert.deepEqual(fixture.calls.creates.map(call=>call.url),[newestDs,newestDuo,gptHome,gptHome]);
+ assert.ok(fixture.calls.creates.every(call=>call.windowId===state.windowId&&call.active===false));
+ assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[22]);
+ assert.equal(fixture.tabs.get(98).windowId,1);assert.equal(fixture.tabs.get(85).windowId,1);
+ assert.deepEqual({deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations},maps);
+ assert.equal(fixture.local.deepseekOwnedUrl,newestDs);assert.equal(fixture.local.doubaoOwnedUrl,newestDuo);
+ assert.equal(fixture.local.bridgePool.length,3);assert.deepEqual(fixture.local.bridgePool[2],live);
+ for(const [index,slot] of fixture.local.bridgePool.slice(0,2).entries()){
+  assert.equal(slot.slotId,index);assert.notEqual(slot.tabId,20+index);assert.equal(slot.url,gptHome);assert.equal(slot.turns,0);assert.equal(slot.bootstrapIdle,true);
+  for(const name of ['key','failed','navigationOriginBefore'])assert.equal(Object.hasOwn(slot,name),false);
+ }
+ assert.deepEqual(fixture.local.bridgePool,fixture.session.bridgePool);
+ const acknowledgement=fixture.calls.requests.filter(call=>call.kind==='recovered');assert.equal(acknowledgement.length,1);
+ assert.deepEqual(acknowledgement[0].body,{nonce:recoveryNonce,window_id:state.windowId,host_tab_id:state.hostTabId});
+ assert.equal(acknowledgement[0].headers.Authorization,'Bearer offline-test-token');assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.recovery_pending,false);assert.equal(fixture.local.bridgeBackgroundWindowHealth.ready,true);
+ for(const ownedKey of ['deepseekOwnedTab','doubaoOwnedTab']){
+  assert.ok(fixture.calls.storageWrites.some(write=>write.area==='local'&&write.values[ownedKey]&&write.values.bridgeBackgroundPendingTabs.some(item=>item.tabId===write.values[ownedKey])));
+ }
+ await fixture.api().ensure();assert.equal(fixture.calls.creates.length,4);
+});
+
+test('acknowledgement failure and extension reload cannot duplicate atomically recorded recovery pages',async()=>{
+ let acknowledgements=0;
+ const fixture=harness({local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl,deepseekConversations:{known:{url:dsUrl}}},recoveryNonce,reply(kind,reply){if(kind==='recovered'&&++acknowledgements===1)reply.ok=false;}});
+ await fixture.api().ensure();const tabId=fixture.local.deepseekOwnedTab;
+ assert.equal(fixture.calls.creates.length,1);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,undefined);assert.equal(fixture.local.bridgeBackgroundWindowHealth.recovery_pending,true);
+ for(const key of Object.keys(fixture.session))delete fixture.session[key];fixture.load();
+ await fixture.api().ensure();
+ assert.equal(fixture.calls.creates.length,1);assert.equal(fixture.local.deepseekOwnedTab,tabId);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);assert.equal(acknowledgements,2);
+});
+
+test('one provider creation failure leaves recovery pending and lets another owned provider recover without duplication',async()=>{
+ let fail=true;
+ const fixture=harness({local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl,doubaoOwnedTab:12,doubaoOwnedUrl:duoUrl},recoveryNonce,beforeCreate(properties){if(fail&&properties.url===dsUrl)throw Error('temporary create failure');}});
+ await fixture.api().ensure();const duoId=fixture.local.doubaoOwnedTab;
+ assert.equal(fixture.local.deepseekOwnedTab,11);assert.notEqual(duoId,12);assert.equal(fixture.calls.requests.filter(call=>call.kind==='recovered').length,0);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.ready,true);assert.equal(fixture.local.bridgeBackgroundWindowHealth.recovery_pending,true);assert.equal(fixture.local.bridgeBackgroundWindowHealth.model_errors.deepseek,'background_window_recovery_failed');
+ assert.equal((await fixture.api().ensureOwnedTab(duoId,'doubao')).id,duoId);
+ fail=false;await fixture.api().ensure();
+ assert.notEqual(fixture.local.deepseekOwnedTab,11);assert.equal(fixture.local.doubaoOwnedTab,duoId);
+ assert.equal([...fixture.tabs.values()].filter(tab=>tab.url===duoUrl).length,1);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+});
+
+test('a live saved ID navigated away is never recreated by a recovery request',async()=>{
+ const fixture=harness({local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl,doubaoOwnedTab:12,doubaoOwnedUrl:duoUrl},tabs:[{id:11,windowId:1,url:'https://example.org/',active:true}],recoveryNonce});
+ await fixture.api().ensure();
+ assert.deepEqual(fixture.calls.creates.map(call=>call.url),[duoUrl]);assert.equal(fixture.local.deepseekOwnedTab,11);assert.equal(fixture.tabs.get(11).windowId,1);assert.equal(fixture.tabs.get(11).active,true);
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='recovered').length,0);assert.equal(fixture.local.bridgeBackgroundWindowHealth.ready,true);
+});
+
+for(const nonce of ['', 'not-a-backend-issued-nonce', null, 123]){
+ test('malformed recovery nonce '+String(nonce)+' causes no model creation or migration',async()=>{
+  const fixture=harness({local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl},recoveryNonce:nonce});
+  await assert.rejects(fixture.api().ensure(),/background_window_recovery_rejected/);
+  assert.equal(fixture.calls.creates.length,0);assert.equal(fixture.calls.moves.length,0);assert.equal(fixture.calls.scripts.length,0);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide'||call.kind==='recovered').length,0);
+ });
+}
+
+test('a failed stale GPT migration does not gate valid DeepSeek and Doubao window preparation',async()=>{
+ const fixture=harness({local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl,doubaoOwnedTab:12,doubaoOwnedUrl:duoUrl},tabs:[{id:11,windowId:1,url:dsUrl},{id:12,windowId:1,url:duoUrl}]});
+ fixture.context.migrateChatgptPool=async()=>{throw Error('chatgpt_migration_tab_unavailable');};
+ await fixture.api().ensure();
+ assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[11,12]);assert.equal(fixture.local.bridgeBackgroundWindowHealth.ready,true);assert.equal(fixture.local.bridgeBackgroundWindowHealth.model_errors.chatgpt,'chatgpt_migration_tab_unavailable');
+ assert.equal((await fixture.api().ensureOwnedTab(11,'deepseek')).id,11);
+});
+
+for(const contained of [true,false]){
+ test('changed GPT page '+(contained?'inside its saved container stays fenced':'in an ordinary window is never moved')+' while DeepSeek remains available',async()=>{
+  const fixture=harness({local:{bridgeBackgroundWindow:{windowId:100,hostTabId:50},deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl,bridgePool:[{tabId:20,slotId:0,url:gptHome,key:'known',turns:1}]},windows:[{id:1,type:'normal',incognito:false},{id:100,type:'normal',incognito:false}],tabs:[{id:50,windowId:100,url:hostUrl},{id:11,windowId:1,url:dsUrl},{id:20,windowId:contained?100:1,url:'https://chatgpt.com/auth/login',active:!contained}]});
+  await fixture.api().ensure();
+  assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[11]);assert.equal(fixture.tabs.get(20).windowId,contained?100:1);assert.equal(fixture.calls.creates.length,0);assert.equal(fixture.local.bridgeBackgroundWindowHealth.ready,true);
+  await assert.rejects(fixture.api().ensureOwnedTab(20,'chatgpt'),/background_window_tab_unproven/);assert.equal((await fixture.api().ensureOwnedTab(11,'deepseek')).id,11);
+ });
+}
+
+test('initial pending model proof survives cleared SESSION storage and blocks duplicate creation after a hide failure',async()=>{
+ let hides=0;const fixture=harness({onCreate(tab){tab.pendingUrl=tab.url;tab.url='';},reply(kind,reply){if(kind==='hide'&&++hides===3)reply.verified=false;}});
+ await assert.rejects(fixture.api().createModelTab({url:dsHome}),/background_window_not_hidden/);
+ const original=fixture.local.bridgeBackgroundPendingTabs[0];assert.ok(original);
+ for(const key of Object.keys(fixture.session))delete fixture.session[key];fixture.load();
+ await assert.rejects(fixture.api().createModelTab({url:dsHome}),/background_window_model_capacity/);
+ assert.equal(fixture.calls.creates.length,1);assert.equal(fixture.local.bridgeBackgroundPendingTabs[0].tabId,original.tabId);assert.equal(fixture.tabs.get(original.tabId).windowId,original.windowId);
+});
+
+test('all three provider entry points recover before they capture stored ownership',async()=>{
+ for(const provider of ['deepseek','doubao','chatgpt']){
+  const fixture=harness({local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl,doubaoOwnedTab:12,doubaoOwnedUrl:duoUrl,bridgePool:[{tabId:20,slotId:0,url:gptHome,key:'expired',turns:8}]},recoveryNonce});
+  const name=provider==='chatgpt'?'background.js':provider+'_background.js';
+  vm.runInContext(fs.readFileSync(path.join(__dirname,name),'utf8'),fixture.context,{filename:name});
+  if(provider==='chatgpt'){
+   const acquired=await fixture.context.acquire('new-contact');assert.notEqual(acquired.slot.tabId,20);assert.equal(acquired.reused,false);assert.equal(acquired.slot.key,'new-contact');
+  }else await fixture.context[provider+'Pump']();
+  assert.notEqual(fixture.local.deepseekOwnedTab,11);assert.notEqual(fixture.local.doubaoOwnedTab,12);assert.notEqual(fixture.local.bridgePool[0].tabId,20);
+  assert.equal(fixture.calls.creates.length,3);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+ }
 });

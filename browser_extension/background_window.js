@@ -3,18 +3,20 @@
 // confirm hiding; minimized is used solely while the empty host is created.
 (function(root){
  const base='http://127.0.0.1:18769/browser-bridge/window';
- const stateKey='bridgeBackgroundWindow',pendingKey='bridgeBackgroundPendingTabs';
+ const stateKey='bridgeBackgroundWindow',pendingKey='bridgeBackgroundPendingTabs',recoveryKey='bridgeBackgroundRecoveryApplied';
  const titlePattern=/^WeChatTwin Background [0-9a-f]{32}$/;
+ const recoveryPattern=/^[0-9a-f]{32}$/;
  const home={deepseek:'https://chat.deepseek.com/',doubao:'https://www.doubao.com/chat/',chatgpt:'https://chatgpt.com/?temporary-chat=true'};
  let serial=Promise.resolve(),ensureFlight=null,cached=null,activationTimer=null;
  const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
  const enqueue=task=>{const next=serial.then(task,task);serial=next.catch(()=>{});return next;};
- const hostUrl=()=>chrome.runtime.getURL('background_host.html');
+ const hostUrl=()=> 'http://127.0.0.1:18769/browser-window/host';
  const id=value=>Number.isInteger(value)&&value>=0;
  function providerUrl(provider,url){
   if(typeof url!=='string')return false;
   try{
    const parsed=new URL(url);
+   if(parsed.username||parsed.password)return false;
    if(provider==='deepseek')return parsed.origin==='https://chat.deepseek.com'&&(parsed.pathname==='/'||/^\/a\/chat\/s\/[^/?#]+$/.test(parsed.pathname))&&!parsed.search&&!parsed.hash;
    if(provider==='doubao')return parsed.origin==='https://www.doubao.com'&&/^\/chat(?:\/(?:\d+|local_\d+)?)?$/.test(parsed.pathname)&&!parsed.search&&!parsed.hash;
    return provider==='chatgpt'&&parsed.origin==='https://chatgpt.com'&&parsed.searchParams.get('temporary-chat')==='true';
@@ -25,16 +27,25 @@
   if(typeof url!=='string'||!home[provider])return false;
   try{const value=new URL(url);return value.origin===new URL(home[provider]).origin&&!value.username&&!value.password;}catch{return false;}
  }
+ function retiredHostUrl(url){
+  // A legacy URL is only compared on the saved host ID. It is never visited.
+  try{const value=new URL(url);return value.protocol==='chrome-extension:'&&value.hostname===chrome.runtime.id&&value.pathname==='/background_host.html'&&!value.search&&!value.hash;}catch{return false;}
+ }
+ function repairableHostUrl(url){return ['chrome://newtab/','about:blank'].includes(url)||retiredHostUrl(url);}
  async function readOwnership(){
   // The explicitly authorized migration must claim an orphaned GPT ID before
   // the window is inspected; it never searches model pages by their URL.
-  if(typeof root.migrateChatgptPool==='function')await root.migrateChatgptPool();
+  const modelErrors={};
+  if(typeof root.migrateChatgptPool==='function'){
+   try{await root.migrateChatgptPool();}catch(error){modelErrors.chatgpt=/^chatgpt_[a-z_]+$/.test(error?.message||'')?error.message:'chatgpt_migration_failed';}
+  }
   const [local,session]=await Promise.all([
-   chrome.storage.local.get([stateKey,'token','bridgePool','deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','doubaoOwnedTab','doubaoOwnedUrl','doubaoConversations']),
+   chrome.storage.local.get([stateKey,pendingKey,recoveryKey,'token','bridgePool','deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','doubaoOwnedTab','doubaoOwnedUrl','doubaoConversations']),
    chrome.storage.session.get(['bridgePool',pendingKey])
   ]);
-  const pool=local.bridgePool!==undefined?local.bridgePool:(session.bridgePool||[]),pending=session[pendingKey]||[];
+  const pool=local.bridgePool!==undefined?local.bridgePool:(session.bridgePool||[]),pending=local[pendingKey]!==undefined?local[pendingKey]:(session[pendingKey]||[]);
   if(local.bridgePool===undefined&&session.bridgePool!==undefined)await chrome.storage.local.set({bridgePool:pool});
+  if(local[pendingKey]===undefined)await chrome.storage.local.set({[pendingKey]:pending});
   if(!Array.isArray(pool)||pool.length>3||!Array.isArray(pending))throw Error('background_window_invalid_ownership');
   const claims=[];
   for(const provider of ['deepseek','doubao']){
@@ -49,7 +60,8 @@
   }
   let retained=[];
   for(const item of pending){
-   if(!item||!id(item.tabId)||!id(item.windowId)||!providerUrl(item.provider,item.url))throw Error('background_window_invalid_ownership');
+   const validPendingUrl=item?.provider==='chatgpt'?providerUrl('chatgpt',item.url):providerOrigin(item?.provider,item?.url);
+   if(!item||!id(item.tabId)||!id(item.windowId)||!validPendingUrl)throw Error('background_window_invalid_ownership');
    const stored=claims.find(claim=>claim.tabId===item.tabId);
    if(stored){if(stored.provider!==item.provider)throw Error('background_window_invalid_ownership');stored.creation=item;}
    else claims.push({...item,created:true,creation:item});
@@ -57,24 +69,37 @@
   }
   if(new Set(claims.map(claim=>claim.tabId)).size!==claims.length)throw Error('background_window_invalid_ownership');
   if(Object.keys(home).some(provider=>claims.filter(claim=>claim.provider===provider).length>(provider==='chatgpt'?3:1)))throw Error('background_window_invalid_ownership');
-  const tabs=[],missing=[];
+  const tabs=[],contained=[],missing=[],absent=[];
   for(const claim of claims){
-   let tab;try{tab=await chrome.tabs.get(claim.tabId);}catch{missing.push(claim.tabId);continue;}
+   let tab;try{tab=await chrome.tabs.get(claim.tabId);}catch{missing.push(claim.tabId);absent.push(claim);continue;}
    const sameOrigin=providerOrigin(claim.provider,tab.url)&&new URL(tab.url).origin===new URL(claim.url).origin;
    const settled=sameOrigin&&(claim.provider!=='chatgpt'||providerUrl('chatgpt',tab.url))&&(!claim.exact||tab.url===claim.url);
    // tabs.create may return before Chrome commits its first navigation. Only
    // our recorded newly-created ID in its exact hidden window may be pending.
    const initialPending=claim.creation&&tab.windowId===claim.creation.windowId&&(!tab.url||tab.url==='about:blank')&&tab.pendingUrl===claim.creation.url;
-   if(!settled&&!initialPending){missing.push(claim.tabId);continue;}
+   if(!settled&&!initialPending){
+    missing.push(claim.tabId);
+    // A GPT login/changed page can stay in its previously owned container, but
+    // it cannot be adopted or moved back from an ordinary user window.
+    const ownWindow=tab.windowId===local[stateKey]?.windowId||tab.windowId===claim.creation?.windowId;
+    if(sameOrigin&&claim.provider==='chatgpt'&&ownWindow){contained.push({claim,tab});modelErrors.chatgpt='chatgpt_owned_url_changed';}
+    continue;
+   }
    // Consume pending proof only after provider storage and live URL agree.
    // An explicit future release then cannot resurrect the previous tab.
    if(settled&&claim.creation&&!claim.created)retained=retained.filter(item=>item.tabId!==claim.tabId);
    tabs.push({claim,tab});
   }
-  if(retained.length!==pending.length){await chrome.storage.session.set({[pendingKey]:retained});session[pendingKey]=retained;}
-  return {local,session,claims,tabs,missing};
+  if(retained.length!==pending.length)await chrome.storage.local.set({[pendingKey]:retained});
+  // LOCAL survives an extension reload; SESSION is only a compatibility mirror.
+  await chrome.storage.session.set({[pendingKey]:retained});
+  local[pendingKey]=retained;session[pendingKey]=retained;
+  return {local,session,pool,claims,tabs,contained,missing,absent,modelErrors};
  }
- async function health(values){await chrome.storage.local.set({bridgeBackgroundWindowHealth:{at:Date.now(),...values}});}
+ async function health(values){
+  await chrome.storage.local.set({bridgeBackgroundWindowHealth:{at:Date.now(),...values}});
+  if(values.error){try{const {token}=await chrome.storage.local.get('token');if(token)await request('/diagnostic',token,{code:String(values.error)});}catch{}}
+ }
  async function request(path,token,body){
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
   try{
@@ -84,12 +109,12 @@
   }catch(error){if(error?.message==='background_window_bridge_unavailable')throw error;throw Error('background_window_bridge_unavailable');}
   finally{clearTimeout(timer);}
  }
- async function validateContents(windowId,hostTabId,ownership){
+ async function validateContents(windowId,hostTabId,ownership,expectedHostUrl=hostUrl()){
   const window=await chrome.windows.get(windowId);
   if(window.type!=='normal'||window.incognito)throw Error('background_window_wrong_type');
   const tabs=await chrome.tabs.query({windowId});
-  const host=tabs.find(tab=>tab.id===hostTabId&&tab.url===hostUrl());
-  const owned=new Set(ownership.tabs.map(item=>item.tab.id));
+  const host=tabs.find(tab=>tab.id===hostTabId&&(tab.url||'')===expectedHostUrl);
+  const owned=new Set([...ownership.tabs,...ownership.contained.filter(item=>item.tab.windowId===windowId)].map(item=>item.tab.id));
   if(!host||tabs.some(tab=>tab.id!==hostTabId&&!owned.has(tab.id)))throw Error('background_window_mixed_tabs');
   return host;
  }
@@ -98,37 +123,69 @@
   if(saved&&id(saved.hostTabId)){
    let tab;try{tab=await chrome.tabs.get(saved.hostTabId);}catch{}
    if(tab?.url===hostUrl()){
+    if(!id(saved.windowId)||tab.windowId!==saved.windowId)throw Error('background_window_host_changed');
     await validateContents(tab.windowId,tab.id,ownership);
     return {windowId:tab.windowId,hostTabId:tab.id};
    }
+   if(tab){
+    // Chrome may invalidate an extension page to newtab on extension reload.
+    // Repair only the persisted host ID in its persisted, proven-only window.
+    const initialPending=(!tab.url||tab.url==='about:blank')&&tab.pendingUrl===hostUrl();
+    if((!repairableHostUrl(tab.url)&&!initialPending)||!id(saved.windowId)||tab.windowId!==saved.windowId)throw Error('background_window_host_changed');
+    await validateContents(saved.windowId,saved.hostTabId,ownership,tab.url||'');
+    return {windowId:saved.windowId,hostTabId:saved.hostTabId,restoreHost:true,restoreHostUrl:tab.url||''};
+   }
   }
-  // Recover only this extension's exact controller URL. Model pages are never
-  // adopted by URL search here, and unrelated tabs are never moved or hidden.
-  const hosts=(await chrome.tabs.query({})).filter(tab=>tab.url===hostUrl());
-  if(hosts.length>1)throw Error('background_window_multiple_hosts');
-  if(hosts.length===1){
-   const tab=hosts[0];await validateContents(tab.windowId,tab.id,ownership);
-   return {windowId:tab.windowId,hostTabId:tab.id};
-  }
+  // Public HTTP pages are never searched, adopted, moved or hidden. Only a
+  // freshly created host ID or the persisted host ID proves our controller.
   const window=await chrome.windows.create({url:hostUrl(),type:'normal',focused:false,state:'minimized'});
   if(!id(window?.id))throw Error('background_window_create_failed');
   const tabs=await chrome.tabs.query({windowId:window.id});
-  const host=tabs.find(tab=>tab.url===hostUrl());
-  if(!host)throw Error('background_window_host_unavailable');
+  const host=tabs.find(tab=>tab.url===hostUrl()||((!tab.url||tab.url==='about:blank')&&tab.pendingUrl===hostUrl()));
+  if(!host||tabs.length!==1)throw Error('background_window_host_unavailable');
   const context={windowId:window.id,hostTabId:host.id};
+  if(host.url!==hostUrl())Object.assign(context,{restoreHost:true,restoreHostUrl:host.url||''});
   // Persist before native registration so a retry reuses this one host window.
   await chrome.storage.local.set({[stateKey]:context});
-  await validateContents(context.windowId,context.hostTabId,ownership);
+  await validateContents(context.windowId,context.hostTabId,ownership,host.url||'');
   return context;
+ }
+ async function restoreHost(context){
+  // Recheck immediately before navigating. No model or unrelated tab changes.
+  const ownership=await readOwnership();
+  const current=await chrome.tabs.get(context.hostTabId);
+  if(current.windowId===context.windowId&&current.url===hostUrl()){
+   await validateContents(context.windowId,context.hostTabId,ownership);
+   delete context.restoreHost;delete context.restoreHostUrl;return;
+  }
+  await validateContents(context.windowId,context.hostTabId,ownership,context.restoreHostUrl);
+  await chrome.tabs.update(context.hostTabId,{url:hostUrl()});
+  const deadline=Date.now()+4000;
+  while(Date.now()<deadline){
+   const tab=await chrome.tabs.get(context.hostTabId);
+   if(tab.windowId!==context.windowId)throw Error('background_window_host_changed');
+   if(tab.url===hostUrl()){delete context.restoreHost;delete context.restoreHostUrl;return;}
+   if(![context.restoreHostUrl,'about:blank',''].includes(tab.url||'')||(tab.pendingUrl&&tab.pendingUrl!==hostUrl()))throw Error('background_window_host_changed');
+   await pause(100);
+  }
+  throw Error('background_window_host_unavailable');
  }
  async function setTitle(context,title){
   const deadline=Date.now()+4000;
   while(Date.now()<deadline){
    try{
-    let timer;
-    const pending=chrome.runtime.sendMessage({type:'wechat-background-host-title',window_id:context.windowId,host_tab_id:context.hostTabId,title});
-    const reply=await Promise.race([pending,new Promise(resolve=>{timer=setTimeout(()=>resolve(null),500);})]).finally(()=>clearTimeout(timer));
-    if(reply?.ok===true&&reply.window_id===context.windowId&&reply.host_tab_id===context.hostTabId&&reply.title===title)return;
+    const tab=await chrome.tabs.get(context.hostTabId);
+    if(tab.windowId!==context.windowId||tab.url!==hostUrl())throw Error('background_window_host_changed');
+    const results=await chrome.scripting.executeScript({target:{tabId:context.hostTabId,frameIds:[0]},func:(expectedUrl,value)=>{
+     if(location.href!==expectedUrl||location.origin!=='http://127.0.0.1:18769'||location.pathname!=='/browser-window/host')return {ok:false};
+     document.title=value;
+     return {ok:true,url:location.href,title:document.title};
+    },args:[hostUrl(),title]});
+    const reply=results.find(result=>result.frameId===0)?.result;
+    if(reply?.ok===true&&reply.url===hostUrl()&&reply.title===title){
+     const current=await chrome.tabs.get(context.hostTabId);
+     if(current.windowId===context.windowId&&current.url===hostUrl())return;
+    }
    }catch{}
    await pause(100);
   }
@@ -154,19 +211,82 @@
    await pause(100);
   }
  }
+ async function persistPending(pending,updates={}){
+  // Record ownership and creation proof together before waiting on navigation.
+  await chrome.storage.local.set({...updates,[pendingKey]:pending});
+  await chrome.storage.session.set({[pendingKey]:pending,...(updates.bridgePool?{bridgePool:updates.bridgePool}:{})});
+ }
+ async function waitCreated(context,tabId,provider){
+  const deadline=Date.now()+15000;
+  while(Date.now()<deadline){
+   let current;try{current=await chrome.tabs.get(tabId);}catch{throw Error('background_window_created_tab_unavailable');}
+   if(current.windowId!==context.windowId)throw Error('background_window_ownership_changed');
+   if(providerOrigin(provider,current.url)&&current.url!=='about:blank')return current;
+   if(current.url&&current.url!=='about:blank')throw Error('background_window_ownership_changed');
+   await pause(100);
+  }
+  throw Error('background_window_created_tab_timeout');
+ }
+ function recoveryUrl(claim,ownership){
+  if(claim.provider==='chatgpt')return home.chatgpt;
+  const isHome=url=>url===home[claim.provider]||(claim.provider==='doubao'&&url==='https://www.doubao.com/chat');
+  if(!isHome(claim.url)&&providerUrl(claim.provider,claim.url))return claim.url;
+  const records=Object.values(ownership.local[claim.provider+'Conversations']||{}).map((value,index)=>({value,index})).filter(item=>providerUrl(claim.provider,item.value?.url)&&!isHome(item.value.url));
+  records.sort((a,b)=>(Number(b.value.used)||0)-(Number(a.value.used)||0)||b.index-a.index);
+  return records[0]?.value.url||claim.url;
+ }
+ async function restoreClosed(context,token,requested,ownership){
+  if(requested===undefined)return {ownership,errors:{}};
+  if(!requested||typeof requested.nonce!=='string'||!recoveryPattern.test(requested.nonce))throw Error('background_window_recovery_rejected');
+  const nonce=requested.nonce,errors={};
+  if(ownership.local[recoveryKey]===nonce)return {ownership,errors,nonce,applied:true};
+  for(const claim of ownership.absent){
+   try{
+    const current=await readOwnership();
+    if(!current.absent.some(item=>item.tabId===claim.tabId&&item.provider===claim.provider&&item.url===claim.url))continue;
+    const url=recoveryUrl(claim,current);
+    if(!providerUrl(claim.provider,url))throw Error('background_window_recovery_unproven');
+    let pool,slotId;
+    if(claim.provider==='chatgpt'){
+     const old=current.pool.find(slot=>slot.tabId===claim.tabId);
+     slotId=old?.slotId??[0,1,2].find(value=>!current.pool.some(slot=>slot.slotId===value));
+     if(!Number.isInteger(slotId)||slotId<0||slotId>2)throw Error('background_window_model_capacity');
+    }
+    const tab=await chrome.tabs.create({url,windowId:context.windowId,active:false});
+    if(!id(tab?.id)||tab.windowId!==context.windowId)throw Error('background_window_create_failed');
+    const pending=[...current.local[pendingKey].filter(item=>item.tabId!==claim.tabId),{tabId:tab.id,provider:claim.provider,url,windowId:context.windowId}];
+    let updates;
+    if(claim.provider==='chatgpt'){
+     // A closed temporary chat cannot prove retained conversation context.
+     // Restore a blank idle slot; the next assigned contact starts afresh.
+     const slot={tabId:tab.id,slotId,url,turns:0,used:Date.now(),bootstrapIdle:true};
+     pool=current.pool.some(item=>item.tabId===claim.tabId)?current.pool.map(item=>item.tabId===claim.tabId?slot:item):[...current.pool,slot];
+     if(pool.length>3)throw Error('background_window_model_capacity');
+     updates={bridgePool:pool};
+    }else updates={[claim.provider+'OwnedTab']:tab.id,[claim.provider+'OwnedUrl']:url};
+    await persistPending(pending,updates);
+    await waitCreated(context,tab.id,claim.provider);
+   }catch(error){errors[claim.provider]=/^background_window_[a-z_]+$/.test(error?.message||'')?error.message:'background_window_recovery_failed';}
+  }
+  return {ownership:await readOwnership(),errors,nonce};
+ }
  async function prepare(){
-  const ownership=await readOwnership(),token=ownership.local.token;
+  let ownership=await readOwnership();const token=ownership.local.token;
   if(!token)throw Error('background_window_token_required');
   const context=await findHost(ownership);
   const reply=await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId});
   if(reply?.ok!==true||reply.window_id!==context.windowId||reply.host_tab_id!==context.hostTabId||!titlePattern.test(reply.title||''))throw Error('background_window_registration_rejected');
   // A controlled reveal pauses work before changing the user's active tab.
   if(reply.manual_reveal===true)throw Error('background_window_manual_reveal');
+  if(reply.recovery_requested!==undefined&&(!reply.recovery_requested||typeof reply.recovery_requested.nonce!=='string'||!recoveryPattern.test(reply.recovery_requested.nonce)))throw Error('background_window_recovery_rejected');
+  // Registration/manual mode is checked before restoring even a blank host.
+  if(context.restoreHost)await restoreHost(context);
   context.title=reply.title;
   await chrome.storage.local.set({[stateKey]:context});cached=context;
   await validateContents(context.windowId,context.hostTabId,ownership);
   // Verify the empty/already-owned window is truly hidden before moving pages.
   await hide(context,token);
+  const recovery=await restoreClosed(context,token,reply.recovery_requested,ownership);ownership=recovery.ownership;
   for(const {tab} of ownership.tabs){
    if(tab.windowId===context.windowId)continue;
    const source=await chrome.windows.get(tab.windowId);
@@ -179,7 +299,17 @@
   const finalOwnership=await readOwnership();
   await validateContents(context.windowId,context.hostTabId,finalOwnership);
   await hide(context,token);
-  await health({ready:true,hidden:true,visible:false,verified:true,window_id:context.windowId,host_tab_id:context.hostTabId,managed_tabs:finalOwnership.tabs.length,missing_tab_ids:finalOwnership.missing});
+  const modelErrors={...finalOwnership.modelErrors,...recovery.errors};
+  for(const claim of finalOwnership.claims)if(finalOwnership.missing.includes(claim.tabId)&&!modelErrors[claim.provider])modelErrors[claim.provider]=claim.provider+'_owned_tab_unavailable';
+  let recoveryPending=!!recovery.nonce,recoveryError;
+  if(recovery.nonce&&!finalOwnership.missing.length&&!Object.keys(modelErrors).length){
+   try{
+    const done=await request('/recovered',token,{nonce:recovery.nonce,window_id:context.windowId,host_tab_id:context.hostTabId});
+    if(done?.ok!==true||done.nonce!==recovery.nonce||done.window_id!==context.windowId||done.host_tab_id!==context.hostTabId)throw Error('background_window_recovery_acknowledgement_rejected');
+    await chrome.storage.local.set({[recoveryKey]:recovery.nonce});recoveryPending=false;
+   }catch(error){recoveryError=error?.message||'background_window_recovery_failed';}
+  }
+  await health({ready:true,hidden:true,visible:false,verified:true,window_id:context.windowId,host_tab_id:context.hostTabId,managed_tabs:finalOwnership.tabs.length,missing_tab_ids:finalOwnership.missing,model_errors:modelErrors,recovery_pending:recoveryPending,...(recoveryError?{recovery_error:recoveryError}:{})});
   return {context,ownership:finalOwnership};
  }
  async function guarded(task){
@@ -208,23 +338,15 @@
    const same=ownership.claims.filter(claim=>claim.provider===provider);
    if((provider==='chatgpt'&&same.length>=3)||(provider!=='chatgpt'&&(same.length||ownership.local[provider+'OwnedUrl']||Object.keys(ownership.local[provider+'Conversations']||{}).length)))throw Error('background_window_model_capacity');
    const tab=await chrome.tabs.create({url:properties.url,windowId:context.windowId,active:false});
-   const pending=ownership.session[pendingKey]||[];
-   await chrome.storage.session.set({[pendingKey]:[...pending,{tabId:tab.id,provider,url:properties.url,windowId:context.windowId}]});
+   const pending=ownership.local[pendingKey]||[];
+   await persistPending([...pending,{tabId:tab.id,provider,url:properties.url,windowId:context.windowId}]);
    // A native hide failure keeps the created page recorded; never create a
    // replacement or expose it in the ordinary current/focused Chrome window.
    await validateContents(context.windowId,context.hostTabId,await readOwnership());
    await hide(context,ownership.local.token);
    // Provider code needs a committed URL before it can navigate or inspect the
    // page. Wait on the same ID; a slow/closed page never causes a replacement.
-   const deadline=Date.now()+15000;
-   while(Date.now()<deadline){
-    let current;try{current=await chrome.tabs.get(tab.id);}catch{throw Error('background_window_created_tab_unavailable');}
-    if(current.windowId!==context.windowId)throw Error('background_window_ownership_changed');
-    if(providerOrigin(provider,current.url)&&current.url!=='about:blank')return current;
-    if(current.url&&current.url!=='about:blank')throw Error('background_window_ownership_changed');
-    await pause(100);
-   }
-   throw Error('background_window_created_tab_timeout');
+   return await waitCreated(context,tab.id,provider);
   }));
  }
  function startup(){return ensure().catch(()=>console.warn('Bridge background window requires attention'));}

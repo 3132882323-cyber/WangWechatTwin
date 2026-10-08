@@ -50,8 +50,9 @@ async function recoverChatgptPageInner(){
  if(!slots.some(slot=>slot.tabId===t.id)){if(slots.length>=3)throw Error('chatgpt_recovery_capacity');slots.push({tabId:t.id,slotId:[0,1,2].find(id=>!slots.some(slot=>slot.slotId===id)),url:rootUrl,turns:0,bootstrapIdle:true,used:Date.now()});}
  await store(slots);await WechatBackgroundWindow.ensureOwnedTab(t.id,'chatgpt');await chrome.storage.local.set({chatgptRecoveryApplied:b.recovery_id});
 }
-migrateChatgptPool().then(()=>recoverChatgptPage()).then(()=>WechatBackgroundWindow.startup()).catch(()=>console.warn('ChatGPT explicit page migration/recovery pending'));
+Promise.resolve(WechatBackgroundWindow.startup()).then(()=>migrateChatgptPool()).then(()=>recoverChatgptPage()).catch(()=>console.warn('ChatGPT explicit page migration/recovery pending'));
 async function acquire(key){
+ await WechatBackgroundWindow.ensure();
  await migrateChatgptPool();
  await recoverChatgptPage();
  const bridgePool=await WechatPool.readPool(chrome.storage);

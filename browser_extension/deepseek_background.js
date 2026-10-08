@@ -6,6 +6,7 @@ async function deepseekPump(){
  const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Provider':'deepseek'};
  const base='http://127.0.0.1:18769/browser-bridge';let job=null;deepseekBusy=true;
  try{
+  await WechatBackgroundWindow.ensure();
   const previous=await chrome.storage.local.get(['deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','deepseekSeedApplied','deepseekRecoveryApplied']);
   const conversations=previous.deepseekConversations||{};
   const home='https://chat.deepseek.com/';

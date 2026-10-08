@@ -34,6 +34,7 @@ async function doubaoPump(){
   catch(error){if(error?.message===code)blockedScript=pending;throw error;}
  };
  try{
+  stage='background_window';await WechatBackgroundWindow.ensure();stage='bootstrap';
   const home='https://www.doubao.com/chat/';
   const isHomeUrl=url=>url===home||url==='https://www.doubao.com/chat';
   const chatUrl=/^https:\/\/www\.doubao\.com\/chat\/\d+$/;
