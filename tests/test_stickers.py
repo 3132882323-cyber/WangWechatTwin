@@ -4,6 +4,8 @@ from app.stickers import _frames, _cached
 from app.stickers import acquire
 from PIL import Image
 import io,hashlib,json
+import httpx
+from app import stickers
 
 
 def test_media_metadata_never_returns_keys_or_sender_identity():
@@ -69,3 +71,45 @@ def test_local_plaintext_asset_requires_matching_md5(tmp_path):
     assert result[0]==digest
     asset.write_bytes(b'wrong asset')
     with pytest.raises(ValueError):acquire(f'<msg><emoji md5="{digest}"/></msg>',tmp_path/'other-output',[account])
+
+
+def test_vetted_cdn_retries_a_transient_failure_then_verifies_image(tmp_path,monkeypatch):
+    image=Image.new('RGB',(10,10),'green');output=io.BytesIO();image.save(output,format='PNG')
+    data=output.getvalue();digest=hashlib.md5(data).hexdigest()
+    calls=[]
+
+    class Response:
+        def __enter__(self):return self
+        def __exit__(self,*args):return False
+        def raise_for_status(self):pass
+        def iter_bytes(self):yield data
+
+    def stream(*args,**kwargs):
+        calls.append((args,kwargs))
+        if len(calls)==1:raise httpx.ReadTimeout('temporary timeout')
+        return Response()
+
+    monkeypatch.setattr(stickers.httpx,'stream',stream)
+    monkeypatch.setattr(stickers.time,'sleep',lambda _seconds:None)
+    result=acquire(f'<msg><emoji md5="{digest}" cdnurl="https://emoji.qpic.cn/a"/></msg>',tmp_path)
+    assert len(calls)==2
+    assert result[0]==digest and len(result[1])==1
+    assert calls[0][1]['follow_redirects'] is False and calls[0][1]['trust_env'] is False
+
+
+def test_vetted_cdn_does_not_retry_forbidden_response(tmp_path,monkeypatch):
+    calls=[];request=httpx.Request('GET','https://emoji.qpic.cn/a')
+
+    class Response:
+        def __enter__(self):return self
+        def __exit__(self,*args):return False
+        def raise_for_status(self):raise httpx.HTTPStatusError('forbidden',request=request,response=httpx.Response(403,request=request))
+
+    def stream(*args,**kwargs):
+        calls.append(1)
+        return Response()
+
+    monkeypatch.setattr(stickers.httpx,'stream',stream)
+    with pytest.raises(httpx.HTTPStatusError):
+        acquire('<msg><emoji md5="'+'a'*32+'" cdnurl="https://emoji.qpic.cn/a"/></msg>',tmp_path)
+    assert len(calls)==1

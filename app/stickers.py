@@ -2,7 +2,7 @@
 from pathlib import Path
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
-import hashlib,io,re,json,os,uuid,logging
+import hashlib,io,re,json,os,uuid,logging,time
 import httpx
 from PIL import Image
 
@@ -125,12 +125,24 @@ def acquire(raw,root,account_dirs=()):
                 return digest,[str(p) for p in paths],meta['label']
             except (OSError,ValueError):continue
     meta=metadata(raw)  # A missing URL is only usable with a verified local asset.
-    data=bytearray()
-    with httpx.stream('GET',meta['url'],timeout=8,follow_redirects=False,trust_env=False) as response:
-        response.raise_for_status()
-        for part in response.iter_bytes():
-            data.extend(part)
-            if len(data)>MAX_BYTES:raise ValueError('表情文件超出限制')
+    # The authenticated local media cache can contain ciphertext. If a vetted
+    # CDN request fails briefly, retry the same URL before giving up on the
+    # incoming sticker. Each attempt starts with an empty bounded buffer.
+    for attempt in range(2):
+        data=bytearray()
+        try:
+            with httpx.stream('GET',meta['url'],timeout=8,follow_redirects=False,trust_env=False) as response:
+                response.raise_for_status()
+                for part in response.iter_bytes():
+                    data.extend(part)
+                    if len(data)>MAX_BYTES:raise ValueError('表情文件超出限制')
+            break
+        except httpx.HTTPStatusError as exc:
+            if attempt or exc.response.status_code not in {408,429,500,502,503,504}:
+                raise
+        except httpx.TransportError:
+            if attempt:raise
+        time.sleep(.6)
     if hashlib.md5(data).hexdigest()!=meta['md5']:raise ValueError('表情文件与消息校验值不一致')
     paths=_frames(bytes(data),meta['md5'],directory)
     return meta['md5'],[str(p) for p in paths],meta['label']
