@@ -38,6 +38,19 @@ class ReplyPipeline:
         self.llm_init_lock=Lock()
         self.contact_map = config.contact_map()
 
+    def _cache_sticker_observation(self, message, decision, provider):
+        if message.message_type != 'sticker' or not message.media_paths:
+            return
+        from app.media_context import record
+        try:
+            observation_risk = self._max_risk(decision.risk, assess_risk(decision.media_description).level)
+            observed = decision.model_copy(update={'risk': observation_risk})
+            record(self.config.resolve(self.config.paths.database), message, observed,
+                   model_provenance=provider or self.config.openai.provider)
+        except Exception:
+            self.db.add_event('sticker_observation_cache_error', 'cache_unavailable',
+                              level='warning', contact=message.contact)
+
     def _sticker_suggestion(self,message,inbound_id):
         if message.message_type!='text' or assess_risk(message.content).level!=RiskLevel.low:return
         from app.sticker_catalog import suggest
@@ -305,9 +318,13 @@ class ReplyPipeline:
                 decision.action='review';decision.reply='';decision.confidence=0
                 decision.facts_to_confirm.append('需要一条真正回应当前内容的回复')
                 decision.reason+='；重新生成仍没有实质内容，不自动发送'
+                self._cache_sticker_observation(message, decision, media_route)
                 draft_id=self.db.create_draft(message.contact,inbound_id,decision)
                 return ProcessResult(status='draft',decision=decision,draft_id=draft_id)
+        self._cache_sticker_observation(message, decision, media_route)
         if not laughter_only(decision.reply):decision.reply=trim_laughter(decision.reply)
+        if payload and json.loads(payload).get('preceding_sticker_context'):
+            decision.memory_updates = []
         mode = self._mode(contact)
         if any(json.loads(message.raw_summary or '{}').get(key) for key in ('owner_corrected_input','resume_incomplete')):
             mode='shadow';decision.reason+='；中断恢复或本人纠正，只起草，不重复发送'
@@ -321,9 +338,10 @@ class ReplyPipeline:
                 observed_risk=assess_risk(decision.media_description)
                 risk.level=self._max_risk(risk.level,observed_risk.level)
                 risk.reasons+=observed_risk.reasons
-                from app.chat_memory import remember
-                caption_prefix='图片可见内容（非当前事实或承诺）：' if recognized_image else '表情包可见内容（非人物事实或承诺）：'
-                remember(self.config.resolve(self.config.paths.chat_memory),[('media:'+message.external_id,message.contact,'in',int(message.received_at.timestamp()),caption_prefix+decision.media_description)])
+                if recognized_image:
+                    from app.chat_memory import remember
+                    caption_prefix='图片可见内容（非当前事实或承诺）：'
+                    remember(self.config.resolve(self.config.paths.chat_memory),[('media:'+message.external_id,message.contact,'in',int(message.received_at.timestamp()),caption_prefix+decision.media_description)])
             if recognized_image:
                 decision.action='review';decision.reason+='；普通图片回复先审核，不自动确认图片中的事实'
                 decision.facts_to_confirm.append('本人确认普通图片的可见内容和拟回复')
