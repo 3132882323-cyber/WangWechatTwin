@@ -25,6 +25,7 @@ window.wechatDoubaoWait= function(check,timeoutMs,errorCode){
 
 window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,turnId,contactName=''){
  let pendingPersist=Promise.resolve();
+ let diagnosticPhase='validate',diagnosticFailure='',diagnosticComplete=false,captureDiagnostic=()=>({});
  window.wechatDoubaoActiveTurn=turnId;
  try{
  const root=document.documentElement,previousOwner=root.dataset.wechatDoubaoOwner;
@@ -45,6 +46,53 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
  };
  const visibleUsers=()=>Array.from(document.querySelectorAll('[data-testid="send_message"]'));
  const imageMessage=node=>!!node.querySelector('img')&&!node.textContent.includes('[wechat-turn:');
+ // Diagnostics contain only structural attributes, IDs and character counts.
+ // Never copy text, input contents, labels, HTML, URLs or uploaded image data.
+ const safeAttrs=node=>{
+  if(!node)return null;
+  const values={tag:String(node.tagName||'').toLowerCase()};
+  for(const attr of ['data-testid','data-message-role','role']){
+   const value=node.getAttribute?.(attr);
+   if(value&&/^[a-zA-Z0-9_-]{1,80}$/.test(value))values[attr]=value;
+  }
+  for(const attr of ['data-message-id','data-local-message-id','data-msg-id']){
+   const value=node.getAttribute?.(attr);
+   if(value!==null&&value!==undefined)values[attr]=/^\d{1,32}$|^[0-9a-fA-F-]{8,80}$/.test(value)?value:'present';
+  }
+  for(const attr of ['data-streaming','aria-busy','aria-disabled']){
+   const value=node.getAttribute?.(attr);
+   if(value!==null&&value!==undefined)values[attr]=['true','false'].includes(value)?value:'present';
+  }
+  const state=node.getAttribute?.('data-state');
+  if(state!==null&&state!==undefined)values['data-state']=['loading','streaming','finished','done','complete','idle','open','closed','active','inactive','busy','error','success','pending'].includes(state)?state:'present';
+  return values;
+ };
+ const count=(node,selector)=>Array.from(node?.querySelectorAll?.(selector)||[]).length;
+ const follows=(first,second)=>!!((first?.compareDocumentPosition?.(second)||0)&4);
+ const idPaths=(node,user)=>{
+  const child=node?.querySelector?.('[data-message-id]'),ancestor=node?.parentElement?.closest?.('[data-message-id]');
+  const union=node?.closest?.('[data-testid="union_message"]');
+  const userAncestor=user?.parentElement?.closest?.('[data-message-id]');
+  return {selected:child?.getAttribute?.('data-message-id')?'descendant':node?.getAttribute?.('data-message-id')?'self':'missing',
+   self:safeAttrs(node),descendant:safeAttrs(child),ancestor:safeAttrs(ancestor),union:safeAttrs(union),
+   ancestorSharedWithUser:!!ancestor&&ancestor===userAncestor,
+   ancestorUserCount:count(ancestor,'[data-testid="send_message"]'),ancestorAnswerCount:count(ancestor,'[data-testid="receive_message"]')};
+ };
+ captureDiagnostic=()=>{
+  const users=visibleUsers(),user=users.find(node=>node.textContent.includes(marker));
+  const answers=Array.from(document.querySelectorAll('[data-testid="receive_message"]'));
+  const after=user?answers.filter(node=>follows(user,node)):[];
+  const current=location.href,urlKind=isHomeUrl(current)?'home':localUrl.test(current)?'local':chatUrl.test(current)?'chat':'other';
+  return {urlKind,sameOwnedUrl:current===activeUrl,userFound:!!user,user:idPaths(user,user),
+   selectors:{send:users.length,receive:answers.length,receiveVariant:count(document,'[data-testid*="receive_message"]'),assistantRole:count(document,'[data-message-role="assistant"],[data-role="assistant"]'),union:count(document,'[data-testid="union_message"]'),messageBlock:count(document,'[data-testid="message-block-container"]'),messageId:count(document,'[data-message-id]'),streaming:count(document,'[data-streaming]')},
+   afterCount:after.length,after:after.slice(-3).map(node=>{
+    const body=node.querySelector?.('[data-testid="message_text_content"]'),ancestors=[];
+    for(let parent=node.parentElement;parent&&ancestors.length<4;parent=parent.parentElement)ancestors.push(safeAttrs(parent));
+    return {id:idPaths(node,user),ancestors,body:safeAttrs(body),bodyCount:count(node,'[data-testid="message_text_content"]'),textLength:String(node.textContent||'').length,bodyTextLength:String(body?.innerText||body?.textContent||'').length,
+     streamingNodes:Array.from(node.querySelectorAll?.('[data-streaming],[aria-busy]')||[]).slice(0,4).map(safeAttrs),
+     alternateIds:Array.from(node.querySelectorAll?.('[data-local-message-id],[data-msg-id]')||[]).slice(0,3).map(safeAttrs)};
+   }),sendButton:safeAttrs(document.querySelector('[data-testid="chat_input_send_button"]'))};
+ };
  const assertUrl=(phase='setup')=>{
   const current=location.href;
   if(current===activeUrl)return true;
@@ -71,12 +119,14 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
  if(visibleUsers().some(node=>node.textContent.includes(marker)))throw Error('doubao_turn_already_present');
  const existing=Array.from(document.querySelectorAll('[data-testid="attachment-image-card"]'));
  if(existing.length){
+  diagnosticPhase='remove_attachments';
   if(previousOwner!==key||existing.some(card=>!images.some(image=>card.getAttribute('aria-label')===image.name)))throw Error('doubao_user_attachments');
   for(const card of existing){card.querySelector('[data-testid="attachment-delete-btn"]')?.dispatchEvent(new MouseEvent('click',{bubbles:true}));}
   await window.wechatDoubaoWait(()=>!document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'),3000,'doubao_user_attachments');
  }
  root.dataset.wechatDoubaoOwner=key;
  if(images.length){
+  diagnosticPhase='upload';
   assertUrl();
   const input=document.querySelector('input[data-testid="upload-file-input"]')||document.querySelector('input[type="file"]');if(!input)throw Error('doubao_upload_not_available');
   const transfer=new DataTransfer();
@@ -96,6 +146,7 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
   if(priorReplies.length||before.length>images.length||before.some(node=>!imageMessage(node)||!messageId(node)))throw Error('doubao_unowned_conversation');
  }
  const submitted=marker+'\n此标记只用于核对本轮网页消息，回复中不要复述。\n\n'+prompt;
+ diagnosticPhase='send_ready';
  editor.focus();document.execCommand('insertText',false,submitted);
  editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:submitted}));
  const send=await window.wechatDoubaoWait(()=>{
@@ -105,6 +156,7 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
   return button&&!button.disabled&&button.getAttribute('aria-disabled')!=='true'?button:null;
  },3000,'doubao_prompt_or_send_not_ready');
  submittedTurn=true;send.click();
+ diagnosticPhase='wait_user';
  const replyDeadline=Date.now()+75000;
  await window.wechatDoubaoWait(()=>{
   if(!assertUrl('reply'))return null;
@@ -119,7 +171,9 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
   }
   return chatUrl.test(activeUrl)||localUrl.test(activeUrl)?user:null;
  },Math.max(1,replyDeadline-Date.now()),'doubao_reply_timeout');
+ diagnosticPhase='persist_user';
  persistTurn();await pendingPersist;
+ diagnosticPhase='wait_answer';
  const decision=await window.wechatDoubaoWait(()=>{
   if(!assertUrl('reply'))return null;
   if(root.dataset.wechatDoubaoOwner!==key)throw Error('doubao_ownership_lost');
@@ -142,14 +196,26 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
   }
   return null;
  },Math.max(1,replyDeadline-Date.now()),'doubao_reply_timeout');
+ diagnosticPhase='persist_answer';
  await pendingPersist;
  const payloadMarker='以下是本轮微信数据：';let name='';
  try{const raw=prompt.split(payloadMarker)[1].split('只输出符合')[0].trim();name=JSON.parse(raw).contact_profile?.name||'';}catch{}
+ diagnosticPhase='rename';
  if(name)await window.wechatDoubaoRename(name);else root.dataset.wechatDoubaoRenameStage='no_payload_name';
  if(!assertUrl('reply')||root.dataset.wechatDoubaoOwner!==key)throw Error('doubao_ownership_lost');
+ diagnosticPhase='complete';diagnosticComplete=true;
  return {reply:JSON.stringify(decision),url:activeUrl};
- }catch(error){await pendingPersist.catch(()=>{});document.documentElement.dataset.wechatDoubaoFailure=String(error.message).match(/doubao_[a-z_]+/)?.[0]||error.name;throw error;}
- finally{if(window.wechatDoubaoActiveTurn===turnId)delete window.wechatDoubaoActiveTurn;}
+ }catch(error){diagnosticFailure=String(error.message).match(/doubao_[a-z_]+/)?.[0]||'doubao_unexpected_error';await pendingPersist.catch(()=>{});document.documentElement.dataset.wechatDoubaoFailure=String(error.message).match(/doubao_[a-z_]+/)?.[0]||error.name;throw error;}
+ finally{
+  if(window.wechatDoubaoActiveTurn===turnId)delete window.wechatDoubaoActiveTurn;
+  try{
+   let structure;try{structure=captureDiagnostic();}catch{structure={captureFailed:true};}
+   const diagnostic={schema:1,at:Date.now(),phase:diagnosticPhase,complete:diagnosticComplete,failure:diagnosticFailure,
+    turn_id:/^[a-zA-Z0-9_-]{1,128}$/.test(turnId||'')?turnId:'invalid',...structure};
+   document.documentElement.dataset.wechatDoubaoDiagnostic=JSON.stringify(diagnostic);
+   if(diagnosticFailure&&typeof chrome==='object'&&chrome.storage?.local?.set)await chrome.storage.local.set({doubaoLastDomFailure:diagnostic});
+  }catch{}
+ }
 };
 
 window.wechatDoubaoRename=async function(name){
