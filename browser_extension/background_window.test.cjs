@@ -3,6 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
+const {webcrypto}=require('node:crypto');
 
 const hostUrl='http://127.0.0.1:18769/browser-window/host';
 const retiredHostUrl='chrome-extension://bridge-test/background_host.html';
@@ -28,7 +29,7 @@ function harness(options={}){
    if(Array.isArray(keys))return Object.fromEntries(keys.map(key=>[key,structuredClone(target[key])]));
    return structuredClone(target);
   },
-  async set(values){calls.storageWrites.push({area:target===local?'local':'session',values:structuredClone(values)});Object.assign(target,structuredClone(values));},
+  async set(values){options.beforeStorageSet?.(values,target===local?'local':'session');calls.storageWrites.push({area:target===local?'local':'session',values:structuredClone(values)});Object.assign(target,structuredClone(values));},
   async remove(key){delete target[key];}
  });
  const chrome={
@@ -61,7 +62,7 @@ function harness(options={}){
    if(options.rejectHost)throw Error('host not ready');
    const tab=tabs.get(properties.target.tabId);if(!tab)throw Error('closed');options.onScript?.(tab,properties);
    const pageUrl=options.pageUrl?.(tab)||tab.url,parsed=new URL(pageUrl),document={title:tab.title||'WeChatTwin Background'};
-   const result=vm.runInNewContext('('+properties.func.toString()+')(...args)',{location:{href:pageUrl,origin:parsed.origin,pathname:parsed.pathname},document,args:properties.args||[]});
+   const result=vm.runInNewContext('('+properties.func.toString()+')(...args)',{location:{href:pageUrl,origin:parsed.origin,pathname:parsed.pathname},document,window:{wechatDoubaoActiveTurn:tab.activeTurn},args:properties.args||[]});
    tab.title=document.title;
    calls.titles.push({window_id:tab.windowId,host_tab_id:tab.id,title:tab.title});
    return [{frameId:options.scriptFrameId??0,result}];
@@ -85,7 +86,7 @@ function harness(options={}){
   if(kind==='recovered'&&reply.ok===true&&reply.nonce===body.nonce&&reply.window_id===body.window_id&&reply.host_tab_id===body.host_tab_id)delete options.recoveryNonce;
   return {ok:options.httpOk!==false,async json(){return structuredClone(reply);}};
  }
- const context=vm.createContext({chrome,fetch,URL,Date,AbortController,setTimeout,clearTimeout,console:{warn(){}},WebSocket:class{constructor(){}},
+ const context=vm.createContext({chrome,fetch,URL,Date,AbortController,crypto:webcrypto,setTimeout:options.setTimeout||setTimeout,clearTimeout:options.clearTimeout||clearTimeout,console:{warn(){}},WebSocket:class{constructor(){}},
   importScripts(file){if(['pool_core.js','background_window.js'].includes(file))vm.runInContext(fs.readFileSync(path.join(__dirname,file),'utf8'),context,{filename:file});else assert.ok(['deepseek_background.js','doubao_background.js'].includes(file));}
  });
  const load=()=>vm.runInContext(fs.readFileSync(path.join(__dirname,'background_window.js'),'utf8'),context,{filename:'background_window.js'});
@@ -100,6 +101,101 @@ function ownedOptions(){
   tabs:[{id:11,windowId:1,url:dsUrl},{id:12,windowId:1,url:duoUrl},...[20,21,22].map(id=>({id,windowId:1,url:gptHome})),{id:99,windowId:1,url:'https://example.com/',active:true},{id:98,windowId:1,url:dsUrl}]
  };
 }
+
+function renderingHarness(){
+ let next=0;const timers=new Map();
+ const fixture=harness({...ownedOptions(),
+  setTimeout(done,ms){const timer=++next;timers.set(timer,{done,ms});return timer;},
+  clearTimeout(timer){timers.delete(timer);}
+ });
+ fixture.fireRenderingRetry=async()=>{
+  const timer=[...timers].find(([,value])=>value.ms===1000);
+  assert.ok(timer,'a rendering recovery retry is scheduled');
+  timers.delete(timer[0]);timer[1].done();
+  await fixture.api().releaseRendering('not-the-owner');
+ };
+ return fixture;
+}
+
+test('Doubao exclusively renders in the hidden owned window while DeepSeek and GPT stay inactive',async()=>{
+ const fixture=renderingHarness();const state=await fixture.api().ensure();
+ const lease=await fixture.api().acquireRendering(12,'doubao','render-turn');
+ const before={updates:fixture.calls.updates.length,hides:fixture.calls.requests.filter(call=>call.kind==='hide').length};
+ await fixture.api().ensureOwnedTab(11,'deepseek');await fixture.api().ensureOwnedTab(20,'chatgpt');
+ assert.equal(await fixture.api().isRenderingIdle('doubao'),false);
+ await assert.rejects(fixture.api().acquireRendering(12,'doubao','other-turn'),/background_window_rendering_busy/);
+ assert.equal(fixture.calls.updates.length,before.updates);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,before.hides);
+ assert.equal(fixture.tabs.get(12).active,true);assert.equal(fixture.tabs.get(11).active,false);assert.equal(fixture.tabs.get(20).active,false);
+ assert.equal(fixture.tabs.get(99).windowId,1);assert.equal(fixture.tabs.get(99).active,true);
+ assert.equal(await fixture.api().releaseRendering('wrong-lease'),false);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);
+ assert.equal(await fixture.api().releaseRendering(lease),true);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.verified,true);assert.equal(fixture.local.bridgeBackgroundWindowHealth.rendering,false);
+});
+
+test('a rendering lease cannot activate an ordinary user page',async()=>{
+ const fixture=renderingHarness();await fixture.api().ensure();
+ await assert.rejects(fixture.api().acquireRendering(99,'doubao','render-turn'),/background_window_tab_unproven/);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(99).windowId,1);
+ assert.equal(fixture.calls.updates.some(call=>call.tabId===99),false);
+});
+
+for(const failure of ['activation','health']){
+ test(`a ${failure} failure after rendering lease persistence restores the host and permits the next turn`,async()=>{
+  const fixture=renderingHarness();const state=await fixture.api().ensure();let failed=false;
+  if(failure==='activation')fixture.options.onUpdate=(tab,properties)=>{if(tab.id===12&&properties.active&&!failed){failed=true;throw Error('temporary_activation_error');}};
+  else fixture.options.beforeStorageSet=values=>{if(values.bridgeBackgroundWindowHealth?.rendering===true&&!failed){failed=true;throw Error('temporary_health_error');}};
+  await assert.rejects(fixture.api().acquireRendering(12,'doubao','failed-turn'),/temporary_(activation|health)_error/);
+  assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+  const lease=await fixture.api().acquireRendering(12,'doubao','next-turn');await fixture.api().releaseRendering(lease);
+  assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);
+ });
+}
+
+test('failed activation cleanup retries native hiding without permanently reserving the Doubao page',async()=>{
+ const fixture=renderingHarness();await fixture.api().ensure();let failed=false,denyHide=false;
+ fixture.options.onUpdate=(tab,properties)=>{if(tab.id===12&&properties.active&&!failed){failed=true;denyHide=true;throw Error('temporary_activation_error');}};
+ fixture.options.reply=(kind,reply)=>{if(kind==='hide'&&denyHide)reply.verified=false;};
+ await assert.rejects(fixture.api().acquireRendering(12,'doubao','failed-turn'),/temporary_activation_error/);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.jobId,'failed-turn');
+ denyHide=false;await fixture.fireRenderingRetry();
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);
+ const lease=await fixture.api().acquireRendering(12,'doubao','next-turn');await fixture.api().releaseRendering(lease);
+});
+
+test('a transient native hide failure on release is retried before the next rendering turn',async()=>{
+ const fixture=renderingHarness();const state=await fixture.api().ensure();
+ const lease=await fixture.api().acquireRendering(12,'doubao','render-turn');
+ fixture.options.reply=(kind,reply)=>{if(kind==='hide')reply.verified=false;};
+ await assert.rejects(fixture.api().releaseRendering(lease),/background_window_not_hidden/);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);assert.equal(fixture.local.bridgeBackgroundWindowHealth.verified,false);
+ delete fixture.options.reply;await fixture.fireRenderingRetry();
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+ assert.equal(await fixture.api().isRenderingIdle('doubao'),true);
+});
+
+test('a recovered active Doubao turn stays leased, cannot be overwritten, and releases only after its promise ends',async()=>{
+ const fixture=renderingHarness();const state=await fixture.api().ensure();
+ const lease=await fixture.api().acquireRendering(12,'doubao','old-turn');fixture.tabs.get(12).activeTurn='old-turn';
+ fixture.load();const before=fixture.calls.updates.length;
+ await assert.rejects(fixture.api().acquireRendering(12,'doubao','new-turn'),/background_window_rendering_busy/);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);assert.equal(await fixture.api().isRenderingIdle('doubao'),false);
+ await fixture.api().ensureOwnedTab(11,'deepseek');await fixture.fireRenderingRetry();
+ assert.equal(fixture.calls.updates.length,before);assert.equal(fixture.local.bridgeBackgroundRenderingLease.jobId,'old-turn');
+ delete fixture.tabs.get(12).activeTurn;await fixture.fireRenderingRetry();
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+});
+
+test('manual reveal during rendering release leaves the user selected page untouched',async()=>{
+ const fixture=renderingHarness();await fixture.api().ensure();
+ const lease=await fixture.api().acquireRendering(12,'doubao','render-turn');fixture.options.manualReveal=true;
+ const before=fixture.calls.updates.length,hides=fixture.calls.requests.filter(call=>call.kind==='hide').length;
+ assert.equal(await fixture.api().releaseRendering(lease),true);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(12).active,true);
+ assert.equal(fixture.calls.updates.length,before);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,hides);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.error,'background_window_manual_reveal');
+});
 
 function diagnosticOnly(fixture,from,code){
  const added=fixture.calls.requests.slice(from);

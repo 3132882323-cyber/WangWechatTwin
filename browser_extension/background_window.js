@@ -3,11 +3,11 @@
 // confirm hiding; minimized is used solely while the empty host is created.
 (function(root){
  const base='http://127.0.0.1:18769/browser-bridge/window';
- const stateKey='bridgeBackgroundWindow',pendingKey='bridgeBackgroundPendingTabs',recoveryKey='bridgeBackgroundRecoveryApplied';
+ const stateKey='bridgeBackgroundWindow',pendingKey='bridgeBackgroundPendingTabs',recoveryKey='bridgeBackgroundRecoveryApplied',renderKey='bridgeBackgroundRenderingLease';
  const titlePattern=/^WeChatTwin Background [0-9a-f]{32}$/;
  const recoveryPattern=/^[0-9a-f]{32}$/;
  const home={deepseek:'https://chat.deepseek.com/',doubao:'https://www.doubao.com/chat/',chatgpt:'https://chatgpt.com/?temporary-chat=true'};
- let serial=Promise.resolve(),ensureFlight=null,cached=null,activationTimer=null;
+ let serial=Promise.resolve(),ensureFlight=null,cached=null,activationTimer=null,renderLease=null,renderTimer=null;
  const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
  const enqueue=task=>{const next=serial.then(task,task);serial=next.catch(()=>{});return next;};
  const hostUrl=()=> 'http://127.0.0.1:18769/browser-window/host';
@@ -40,7 +40,7 @@
    try{await root.migrateChatgptPool();}catch(error){modelErrors.chatgpt=/^chatgpt_[a-z_]+$/.test(error?.message||'')?error.message:'chatgpt_migration_failed';}
   }
   const [local,session]=await Promise.all([
-   chrome.storage.local.get([stateKey,pendingKey,recoveryKey,'token','bridgePool','deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','doubaoOwnedTab','doubaoOwnedUrl','doubaoConversations']),
+   chrome.storage.local.get([stateKey,pendingKey,recoveryKey,renderKey,'token','bridgePool','deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','doubaoOwnedTab','doubaoOwnedUrl','doubaoConversations']),
    chrome.storage.session.get(['bridgePool',pendingKey])
   ]);
   const pool=local.bridgePool!==undefined?local.bridgePool:(session.bridgePool||[]),pending=local[pendingKey]!==undefined?local[pendingKey]:(session[pendingKey]||[]);
@@ -273,6 +273,25 @@
  async function prepare(){
   let ownership=await readOwnership();const token=ownership.local.token;
   if(!token)throw Error('background_window_token_required');
+  if(!renderLease&&ownership.local[renderKey])await restoreRendering(ownership);
+  if(renderLease){
+   const context=renderLease.context;
+   await validateContents(context.windowId,context.hostTabId,ownership);
+   const registered=await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId});
+   if(registered?.ok!==true||registered.window_id!==context.windowId||registered.host_tab_id!==context.hostTabId||registered.title!==context.title)throw Error('background_window_registration_rejected');
+   if(registered.manual_reveal===true)throw Error('background_window_manual_reveal');
+   // A verified hidden window remains the same window when only its active tab
+   // changes. Other providers may work, but must not reselect the controller.
+   if(renderLease.releasing){
+    await finishRendering(renderLease,token);return prepare();
+   }
+   if(renderLease.recovered){
+    const active=await renderingActive(renderLease);
+    if(!active){await finishRendering(renderLease,token,false);return prepare();}
+    watchRendering(renderLease.id);
+   }
+   cached=context;return {context,ownership};
+  }
   const context=await findHost(ownership);
   const reply=await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId});
   if(reply?.ok!==true||reply.window_id!==context.windowId||reply.host_tab_id!==context.hostTabId||!titlePattern.test(reply.title||''))throw Error('background_window_registration_rejected');
@@ -343,20 +362,105 @@
    // A native hide failure keeps the created page recorded; never create a
    // replacement or expose it in the ordinary current/focused Chrome window.
    await validateContents(context.windowId,context.hostTabId,await readOwnership());
-   await hide(context,ownership.local.token);
+   if(!renderLease)await hide(context,ownership.local.token);
    // Provider code needs a committed URL before it can navigate or inspect the
    // page. Wait on the same ID; a slow/closed page never causes a replacement.
    return await waitCreated(context,tab.id,provider);
   }));
  }
+ async function renderingActive(lease){
+  const results=await chrome.scripting.executeScript({target:{tabId:lease.tabId,frameIds:[0]},func:jobId=>window.wechatDoubaoActiveTurn===jobId,args:[lease.jobId]});
+  return results.find(result=>result.frameId===0)?.result===true;
+ }
+ async function restoreRendering(ownership){
+  const saved=ownership.local[renderKey],context=ownership.local[stateKey];
+  if(!saved||typeof saved.id!=='string'||!/^[-0-9a-f]{36}$/.test(saved.id)||saved.provider!=='doubao'||!id(saved.tabId)||typeof saved.jobId!=='string'||!context||saved.windowId!==context.windowId||saved.hostTabId!==context.hostTabId||!titlePattern.test(context.title||''))throw Error('background_window_rendering_invalid');
+  const item=[...ownership.tabs,...ownership.contained].find(item=>item.tab.id===saved.tabId&&item.claim.provider===saved.provider&&item.tab.windowId===context.windowId);
+  if(!item){
+   if(ownership.absent.some(claim=>claim.tabId===saved.tabId)){await chrome.storage.local.remove(renderKey);return;}
+   throw Error('background_window_rendering_unproven');
+  }
+  renderLease={...saved,context,recovered:true};
+ }
+ function watchRendering(leaseId){
+  if(renderTimer)return;
+  renderTimer=setTimeout(()=>{
+   renderTimer=null;
+   if(renderLease?.id!==leaseId)return;
+   enqueue(()=>guarded(async()=>{
+    if(renderLease?.id!==leaseId)return;
+    const ownership=await readOwnership();
+    await validateContents(renderLease.context.windowId,renderLease.context.hostTabId,ownership);
+    if(!renderLease.releasing&&await renderingActive(renderLease)){watchRendering(leaseId);return;}
+    await finishRendering(renderLease,ownership.local.token);
+   })).catch(()=>{if(renderLease?.id===leaseId)watchRendering(leaseId);});
+  },1000);
+ }
+ function acquireRendering(tabId,provider,jobId){
+  return enqueue(()=>guarded(async()=>{
+   if(renderLease)throw Error('background_window_rendering_busy');
+   if(provider!=='doubao'||typeof jobId!=='string'||!/^[a-zA-Z0-9_-]{1,128}$/.test(jobId))throw Error('background_window_rendering_rejected');
+   const {context,ownership}=await prepare();
+   if(renderLease)throw Error('background_window_rendering_busy');
+   const item=ownership.tabs.find(item=>item.tab.id===tabId&&item.claim.provider===provider&&item.tab.windowId===context.windowId);
+   if(!item||!providerOrigin(provider,item.tab.url))throw Error('background_window_tab_unproven');
+   const lease={id:crypto.randomUUID(),provider,tabId,jobId,windowId:context.windowId,hostTabId:context.hostTabId,context};
+   // Persist before activation. A worker restart inspects only the owned
+   // content promise marker and never uses a timeout to cancel that promise.
+   await chrome.storage.local.set({[renderKey]:{id:lease.id,provider,tabId,jobId,windowId:context.windowId,hostTabId:context.hostTabId}});
+   renderLease=lease;clearTimeout(activationTimer);activationTimer=null;
+   try{
+    await chrome.tabs.update(tabId,{active:true});
+    await health({ready:true,hidden:true,visible:false,verified:true,window_id:context.windowId,host_tab_id:context.hostTabId,rendering:true,rendering_provider:provider});
+    return lease.id;
+   }catch(error){
+    // No content script has been started by the caller yet. Restore the host
+    // even when activation succeeded but the health write failed.
+    lease.releasing=true;
+    try{await finishRendering(lease,ownership.local.token);}catch{if(renderLease?.id===lease.id)watchRendering(lease.id);}
+    throw error;
+   }
+  }));
+ }
+ async function finishRendering(lease,token,checkManual=true){
+  if(renderLease?.id!==lease.id)return false;
+  const context=lease.context;
+  const registered=checkManual?await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId}):null;
+  if(registered&&(registered.ok!==true||registered.window_id!==context.windowId||registered.host_tab_id!==context.hostTabId||registered.title!==context.title))throw Error('background_window_registration_rejected');
+  if(registered?.manual_reveal===true){
+   renderLease=null;clearTimeout(renderTimer);renderTimer=null;await chrome.storage.local.remove(renderKey);
+   await health({ready:false,hidden:false,visible:true,verified:false,rendering:false,error:'background_window_manual_reveal'});return true;
+  }
+  const ownership=await readOwnership();
+  await validateContents(context.windowId,context.hostTabId,ownership);
+  await hide(context,token);
+  if(renderLease?.id!==lease.id)return false;
+  renderLease=null;clearTimeout(renderTimer);renderTimer=null;await chrome.storage.local.remove(renderKey);
+  await health({ready:true,hidden:true,visible:false,verified:true,window_id:context.windowId,host_tab_id:context.hostTabId,rendering:false});return true;
+ }
+ function releaseRendering(leaseId){
+  return enqueue(()=>guarded(async()=>{
+   if(!leaseId||renderLease?.id!==leaseId)return false;
+   const lease=renderLease;lease.releasing=true;
+   try{const ownership=await readOwnership();return await finishRendering(lease,ownership.local.token);}
+   catch(error){if(renderLease?.id===lease.id)watchRendering(lease.id);throw error;}
+  }));
+ }
+ function isRenderingIdle(provider){
+  return enqueue(()=>guarded(async()=>{
+   if(provider!=='doubao')throw Error('background_window_rendering_rejected');
+   await prepare();return !renderLease;
+  }));
+ }
  function startup(){return ensure().catch(()=>console.warn('Bridge background window requires attention'));}
- const api={ensure,ensureOwnedTab,createModelTab,startup};root.WechatBackgroundWindow=api;
+ const api={ensure,ensureOwnedTab,createModelTab,startup,acquireRendering,releaseRendering,isRenderingIdle};root.WechatBackgroundWindow=api;
  // Events only retry the window contract; they never create model pages.
  if(chrome.runtime.onStartup)chrome.runtime.onStartup.addListener(startup);
  if(chrome.runtime.onInstalled)chrome.runtime.onInstalled.addListener(startup);
  if(chrome.tabs.onUpdated)chrome.tabs.onUpdated.addListener((tabId,change)=>{if(cached?.hostTabId===tabId&&change.status==='complete')startup();});
  if(chrome.tabs.onAttached)chrome.tabs.onAttached.addListener((tabId,info)=>{if(cached&&info.newWindowId===cached.windowId)startup();});
  if(chrome.tabs.onActivated)chrome.tabs.onActivated.addListener(info=>{
+  if(renderLease&&info.windowId===renderLease.context.windowId&&info.tabId===renderLease.tabId)return;
   if(!cached||info.windowId!==cached.windowId||info.tabId===cached.hostTabId)return;
   clearTimeout(activationTimer);
   // Chrome's tab search can activate a tab in another window. Debounce those

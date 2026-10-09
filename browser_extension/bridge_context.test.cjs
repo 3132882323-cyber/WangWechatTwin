@@ -47,8 +47,12 @@ function turnNode(order,text,body){
 function load(name,context){
  if(name==='doubao_background.js'){
   context.AbortController??=AbortController;context.clearTimeout??=clearTimeout;
+  context.console??={warn(){}};
   context.WechatBackgroundWindow??={
    async ensure(){},
+   async isRenderingIdle(){return true;},
+   async acquireRendering(){return 'test-rendering-lease';},
+   async releaseRendering(){return true;},
    async createModelTab({url}){return context.chrome.tabs.create({url,active:false});},
    async ensureOwnedTab(id){
     const tab=await context.chrome.tabs.get(id);
@@ -69,6 +73,22 @@ function load(name,context){
 }
 
 async function settleMicrotasks(){for(let i=0;i<20;i++)await Promise.resolve();}
+
+test('a recovered Doubao rendering turn sends a blocked heartbeat before claiming another job',async()=>{
+ const calls={next:0,scripts:0,heartbeats:[],idle:0};
+ const chrome={storage:{local:{async get(){return {token:'test-token'};},async set(){}}},alarms:{onAlarm:{addListener(){}}}};
+ const fetch=async(url,options)=>{
+  if(url.endsWith('/next')){calls.next++;return {ok:true,json:async()=>({job:null})};}
+  if(url.endsWith('/heartbeat')){calls.heartbeats.push(JSON.parse(options.body));return {ok:true};}
+  throw Error('missing local bootstrap');
+ };
+ const context={chrome,fetch,WebSocket:class{},URL,setTimeout,clearTimeout,
+  WechatBackgroundWindow:{async ensure(){},async isRenderingIdle(provider){assert.equal(provider,'doubao');calls.idle++;return false;}}
+ };
+ load('doubao_background.js',context);await context.doubaoPump();
+ assert.equal(calls.next,0);assert.equal(calls.idle,1);assert.deepEqual(calls.heartbeats,[{blocked:true}]);
+ assert.equal(vm.runInNewContext('doubaoBusy',context),false);
+});
 
 for(const bodyStalls of [false,true]){
  test(`Doubao bridge deadline aborts a stalled ${bodyStalls?'response body':'fetch'} even when it ignores cancellation`,async()=>{
@@ -116,7 +136,7 @@ for(const hungStage of ['ready','setup','reply']){
  test(`Doubao ${hungStage} script timeout keeps the same page fenced, sends a heartbeat, and discards its late result`,async()=>{
   const time=clock(),url='https://www.doubao.com/chat/666',key='d'.repeat(64);
   const saved={doubaoOwnedTab:32,doubaoOwnedUrl:url,doubaoConversations:{[key]:{url,name:'保留虚构备注',lastTurnId:'kept-turn'},other:{url:'https://www.doubao.com/chat/777',lastTurnId:'other-turn'}}};
-  const before=structuredClone(saved.doubaoConversations),calls={next:0,results:[],heartbeats:[],setup:0,reply:0,creates:0,updates:0};
+  const before=structuredClone(saved.doubaoConversations),calls={next:0,results:[],heartbeats:[],setup:0,reply:0,creates:0,updates:0,acquires:[],releases:[]};
   let settleScript,rejectScript,reached;
   const pendingScript=new Promise((resolve,reject)=>{settleScript=resolve;rejectScript=reject;});
   const scriptReached=new Promise(resolve=>{reached=resolve;});
@@ -141,10 +161,13 @@ for(const hungStage of ['ready','setup','reply']){
   };
   const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout};
   load('doubao_background.js',context);
+  context.WechatBackgroundWindow.acquireRendering=async(...args)=>{calls.acquires.push(args);return 'owned-lease';};
+  context.WechatBackgroundWindow.releaseRendering=async lease=>{calls.releases.push(lease);return true;};
   const pumping=context.doubaoPump();await scriptReached;time.advance(hungStage==='reply'?120000:8000);await pumping;
   assert.equal(saved.doubaoLastFailure.code,hungStage==='reply'?'doubao_reply_script_timeout':'doubao_script_timeout');
   assert.equal(saved.doubaoLastFailure.stage,hungStage);assert.equal(saved.doubaoLastFailure.pending_script,true);
   assert.equal(vm.runInNewContext('doubaoBusy',context),true);
+  assert.deepEqual(calls.acquires,[[32,'doubao','timed-turn']]);assert.deepEqual(calls.releases,[]);
   await context.doubaoPump();await settleMicrotasks();
   assert.equal(calls.next,1);assert.ok(calls.heartbeats.length>=1);
   assert.ok(calls.heartbeats.every(body=>body.blocked===true&&Object.keys(body).length===1));
@@ -156,6 +179,7 @@ for(const hungStage of ['ready','setup','reply']){
   await settleMicrotasks();
   assert.equal(vm.runInNewContext('doubaoBusy',context),false);
   assert.equal(vm.runInNewContext('doubaoBlocked',context),false);
+  assert.deepEqual(calls.releases,['owned-lease']);
   assert.deepEqual(saved.doubaoConversations,before);assert.equal(calls.results.length,1);
   if(hungStage!=='reply')assert.equal(calls.reply,0);
   await context.doubaoPump();assert.equal(calls.next,2);
@@ -465,15 +489,15 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
   alarms:{onAlarm:{addListener(){}}}
  };
  const fetch=async(url,options)=>{
-  if(url.endsWith('/next')){assert.deepEqual(backgroundCalls,['ensure','ensure']);return {ok:true,json:async()=>({job:{id:'turn-fresh',conversation_key:'new',prompt:'虚构提示',images:[],contact_name:'虚构备注'}})};}
+  if(url.endsWith('/next')){assert.deepEqual(backgroundCalls,['ensure','idle']);return {ok:true,json:async()=>({job:{id:'turn-fresh',conversation_key:'new',prompt:'虚构提示',images:[],contact_name:'虚构备注'}})};}
   if(url.endsWith('/result')){resultBody=JSON.parse(options.body);return {ok:true};}
   throw Error('unexpected fetch');
  };
  const context={chrome,fetch,WebSocket:class{},URL,Date:time.Date,setTimeout:time.setTimeout,clearTimeout:time.clearTimeout,console,
-  WechatBackgroundWindow:{async ensure(){backgroundCalls.push('ensure');},async ensureOwnedTab(id,provider){assert.equal(id,148);assert.equal(provider,'doubao');backgroundCalls.push('owned');return tab;},async createModelTab(){throw Error('must not create');}}};
+  WechatBackgroundWindow:{async ensure(){backgroundCalls.push('ensure');},async isRenderingIdle(){backgroundCalls.push('idle');return true;},async acquireRendering(id,provider,jobId){assert.equal(id,148);assert.equal(provider,'doubao');assert.equal(jobId,'turn-fresh');backgroundCalls.push('acquire');return 'fresh-lease';},async releaseRendering(lease){assert.equal(lease,'fresh-lease');backgroundCalls.push('release');},async ensureOwnedTab(id,provider){assert.equal(id,148);assert.equal(provider,'doubao');backgroundCalls.push('owned');return tab;},async createModelTab(){throw Error('must not create');}}};
  load('doubao_background.js',context);
  await context.doubaoPump();
- assert.deepEqual(backgroundCalls,['ensure','ensure','owned']);
+ assert.deepEqual(backgroundCalls,['ensure','idle','owned','acquire','release']);
  assert.deepEqual(updates,[home]);
  assert.equal(resultBody.id,'turn-fresh');
  assert.equal(resultBody.result,'{"reply":"新答案"}');
@@ -596,6 +620,8 @@ test('Doubao migrates once to an exact verified seed page without creating a tab
  };
  const context={chrome,fetch,WebSocket:class{},URL,setTimeout,console,WechatBackgroundWindow:{
   async ensure(){windowOwners.push(saved.doubaoOwnedTab);hiddenBeforeQueue=saved.doubaoOwnedTab===195;},
+  async isRenderingIdle(){await this.ensure();return true;},
+  async acquireRendering(){return 'seed-lease';},async releaseRendering(){return true;},
   async ensureOwnedTab(id,provider){assert.equal(id,195);assert.equal(provider,'doubao');return {id,url:seedUrl};},
   async createModelTab(){throw Error('must not create');}
  }};

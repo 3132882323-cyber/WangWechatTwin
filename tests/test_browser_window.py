@@ -24,15 +24,22 @@ class FakeWindows:
     def exists(self, hwnd):
         return hwnd in self.windows
 
-    def snapshot(self, hwnd, title):
+    def bound_snapshot(self, hwnd):
         if hwnd not in self.windows:
             raise windows.WindowControlError("owned_window_missing")
         current = self.windows[hwnd]
+        if current.get("ancestor", hwnd) != hwnd:
+            raise windows.WindowControlError("owned_window_missing")
         if current["class"] != "Chrome_WidgetWin_1":
             raise windows.WindowControlError("owned_window_class_mismatch")
+        return self.window_process(hwnd)
+
+    def snapshot(self, hwnd, title):
+        window = self.bound_snapshot(hwnd)
+        current = self.windows[hwnd]
         if not windows._caption_matches(current["title"], title):
             raise windows.WindowControlError("owned_window_title_mismatch")
-        return self.window_process(hwnd)
+        return window
 
     def window_process(self, hwnd):
         current = self.windows[hwnd]
@@ -162,6 +169,30 @@ def test_restore_rechecks_and_shows_only_original_window(registered):
     assert registered.native.commands == [(101, False), (101, True)]
 
 
+def test_restore_allows_active_model_title_only_for_the_previously_bound_window(registered):
+    assert windows.hide(registered.db)["hidden"] is True
+    registered.native.windows[102] = dict(registered.native.windows[101])
+    registered.native.windows[101]["title"] = "Model response - Google Chrome"
+
+    result = windows.show(registered.db)
+
+    assert result["ok"] is True and result["verified"] is True
+    assert result["visible"] is True and result["manual_reveal"] is True
+    assert registered.native.windows[102]["visible"] is False
+    assert registered.native.commands == [(101, False), (101, True)]
+
+
+def test_hiding_still_requires_the_private_host_title_after_binding(registered):
+    assert windows.hide(registered.db)["hidden"] is True
+    registered.native.windows[101]["title"] = "Model response - Google Chrome"
+
+    result = windows.hide(registered.db)
+
+    assert result["error"] == "owned_window_title_mismatch"
+    assert result["verified"] is False
+    assert registered.native.commands == [(101, False)]
+
+
 def test_manual_reveal_blocks_automatic_hide_until_explicit_resume(registered, monkeypatch):
     assert windows.hide(registered.db)["hidden"] is True
     assert windows.show(registered.db)["manual_reveal"] is True
@@ -202,13 +233,19 @@ def test_restore_does_not_claim_success_if_window_stays_minimized(registered):
     assert result["verified"] is False and result["manual_reveal"] is False
 
 
-@pytest.mark.parametrize("changed", ["create_time", "exe", "username", "thread_id", "title"])
+@pytest.mark.parametrize("changed", ["create_time", "exe", "username", "pid", "thread_id", "class", "ancestor"])
 def test_restore_rejects_recycled_process_or_window_identity(registered, changed):
     assert windows.hide(registered.db)["hidden"] is True
+    registered.native.windows[101]["title"] = "Model response - Google Chrome"
     if changed == "thread_id":
         registered.native.windows[101][changed] += 1
-    elif changed == "title":
-        registered.native.windows[101][changed] = "Personal browser tab - Google Chrome"
+    elif changed == "pid":
+        registered.native.windows[101][changed] = 43
+        registered.identities[43] = {**registered.identities[42], "pid": 43}
+    elif changed == "class":
+        registered.native.windows[101][changed] = "Notepad"
+    elif changed == "ancestor":
+        registered.native.windows[101][changed] = 102
     elif changed == "create_time":
         registered.identities[42][changed] += 10
     else:
@@ -216,6 +253,18 @@ def test_restore_rejects_recycled_process_or_window_identity(registered, changed
     result = windows.show(registered.db)
     assert result["ok"] is False and result["verified"] is False
     assert registered.native.commands == [(101, False)]
+
+
+def test_restore_rechecks_process_identity_after_native_show(registered):
+    assert windows.hide(registered.db)["hidden"] is True
+    registered.native.windows[101]["title"] = "Model response - Google Chrome"
+    registered.native.after_change = lambda: registered.identities[42].update(create_time=2000.25)
+
+    result = windows.show(registered.db)
+
+    assert result["error"] == "owned_window_identity_changed"
+    assert result["verified"] is False and result["manual_reveal"] is False
+    assert registered.native.commands == [(101, False), (101, True)]
 
 
 def test_bound_handle_never_falls_back_to_another_matching_window(registered):

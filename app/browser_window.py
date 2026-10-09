@@ -142,18 +142,23 @@ class _Windows:
     def exists(self, hwnd: int) -> bool:
         return bool(self.api.IsWindow(hwnd))
 
-    def snapshot(self, hwnd: int, title: str) -> dict[str, int]:
+    def bound_snapshot(self, hwnd: int) -> dict[str, int]:
+        """Recheck a saved top-level Chrome handle without relying on its tab title."""
         if not self.exists(hwnd) or self.api.GetAncestor(hwnd, 2) != hwnd:
             raise WindowControlError("owned_window_missing")
         window_class = ctypes.create_unicode_buffer(128)
         self.api.GetClassNameW(hwnd, window_class, len(window_class))
         if window_class.value != _CHROME_CLASS:
             raise WindowControlError("owned_window_class_mismatch")
+        return self.window_process(hwnd)
+
+    def snapshot(self, hwnd: int, title: str) -> dict[str, int]:
+        window = self.bound_snapshot(hwnd)
         caption = ctypes.create_unicode_buffer(256)
         self.api.GetWindowTextW(hwnd, caption, len(caption))
         if not _caption_matches(caption.value, title):
             raise WindowControlError("owned_window_title_mismatch")
-        return self.window_process(hwnd)
+        return window
 
     def window_process(self, hwnd: int) -> dict[str, int]:
         if not self.exists(hwnd):
@@ -222,8 +227,15 @@ def _bound_identity(state: dict[str, Any]) -> dict[str, Any] | None:
     return {key: value[key] for key in ("hwnd", "pid", "thread_id", "create_time", "exe", "username")}
 
 
-def _same_window(native: _Windows, state: dict[str, Any], bound: dict[str, Any]) -> None:
-    current = _capture(native, bound["hwnd"], state["title"])
+def _same_window(native: _Windows, state: dict[str, Any], bound: dict[str, Any],
+                 *, require_title: bool = True) -> None:
+    if require_title:
+        current = _capture(native, bound["hwnd"], state["title"])
+    else:
+        # A render lease changes the active tab's caption. Showing still checks
+        # the saved HWND, top-level class, thread and full Chrome process identity.
+        window = native.bound_snapshot(bound["hwnd"])
+        current = {**window, **_chrome_identity(window["pid"])}
     if current != bound:
         raise WindowControlError("owned_window_identity_changed")
 
@@ -314,12 +326,12 @@ def _set_visibility(db, visible: bool) -> dict[str, Any]:
                 # cannot leave a hidden window with no recorded restoration key.
                 state.update(visible=None, hidden=False, verified=False)
                 db.set_state(STATE_KEY, state)
-            _same_window(native, state, bound)
+            _same_window(native, state, bound, require_title=not visible)
             native.set_visible(bound["hwnd"], visible)
-            _same_window(native, state, bound)
+            _same_window(native, state, bound, require_title=not visible)
             actual = native.visible(bound["hwnd"])
             still_minimized = visible and native.iconic(bound["hwnd"])
-            _same_window(native, state, bound)
+            _same_window(native, state, bound, require_title=not visible)
             if actual is not visible or still_minimized:
                 raise WindowControlError("window_visibility_not_confirmed")
             state.update(visible=actual, hidden=not actual, verified=True,
@@ -344,7 +356,7 @@ def hide(db) -> dict[str, Any]:
 
 
 def show(db) -> dict[str, Any]:
-    """Restore the previously bound window, retaining the same identity checks."""
+    """Restore only the previously bound window, even while an owned model tab is active."""
     return _set_visibility(db, True)
 
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "微信分身专用网页连接",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "permissions": [
     "alarms",
     "storage",

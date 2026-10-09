@@ -27,7 +27,7 @@ function doubaoErrorCode(error){
 async function doubaoPump(){
  if(doubaoBusy){await doubaoBlockedHeartbeat();return;}const {token}=await chrome.storage.local.get('token');if(!token||doubaoBusy)return;
  const base='http://127.0.0.1:18769/browser-bridge';const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Provider':'doubao'};
- let job=null,stage='bootstrap',ownedTabId=null,blockedScript=null;const pumpStarted=Date.now();doubaoBusy=true;
+ let job=null,stage='bootstrap',ownedTabId=null,blockedScript=null,renderLease=null;const pumpStarted=Date.now();doubaoBusy=true;
  const execute=async(options,reply=false)=>{
   const pending=chrome.scripting.executeScript(options),code=reply?'doubao_reply_script_timeout':'doubao_script_timeout';
   try{return await doubaoDeadline(pending,reply?120000:8000,code);}
@@ -63,7 +63,8 @@ async function doubaoPump(){
    if(!tab)throw Error('doubao_seed_tab_unavailable');
    await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:tab.url,doubaoSeedApplied:seed.url});
   }
-  stage='background_window';await WechatBackgroundWindow.ensure();
+  stage='background_window';
+  if(!await WechatBackgroundWindow.isRenderingIdle('doubao')){doubaoBlocked=true;await doubaoBlockedHeartbeat();return;}
   stage='queue';const next=await doubaoFetch(base+'/next',{headers},response=>response.ok?response.json():null);if(!next)return;job=next.job;if(!job)return;
   const started=Date.now(),key=job.conversation_key;
   stage='owned_tab';
@@ -81,6 +82,7 @@ async function doubaoPump(){
   }
   ownedTabId=tab.id;await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:tab.url||home});
   tab=await WechatBackgroundWindow.ensureOwnedTab(tab.id,'doubao');
+  renderLease=await WechatBackgroundWindow.acquireRendering(tab.id,'doubao',job.id);
   const known=conversations[key];let reused=chatUrl.test(known?.url||'')||localUrl.test(known?.url||''),expectedUrl=reused?known.url:home;
   stage='navigate';
   if(tab.url!==expectedUrl){
@@ -146,8 +148,9 @@ async function doubaoPump(){
  }
  finally{
   // executeScript cannot be cancelled. Discard its late value and keep the page fenced until it settles.
-  if(blockedScript){const release=()=>{doubaoBusy=false;doubaoBlocked=false;};blockedScript.then(release,release);}
-  else doubaoBusy=false;
+  const release=async()=>{try{if(renderLease)await WechatBackgroundWindow.releaseRendering(renderLease);}catch{console.warn('Doubao rendering window requires attention');}finally{doubaoBusy=false;doubaoBlocked=false;}};
+  if(blockedScript)blockedScript.then(release,release);
+  else await release();
  }
 }
 async function connectDoubao(){

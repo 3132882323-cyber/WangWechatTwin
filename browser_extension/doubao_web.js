@@ -25,6 +25,7 @@ window.wechatDoubaoWait= function(check,timeoutMs,errorCode){
 
 window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,turnId,contactName=''){
  let pendingPersist=Promise.resolve();
+ window.wechatDoubaoActiveTurn=turnId;
  try{
  const root=document.documentElement,previousOwner=root.dataset.wechatDoubaoOwner;
  const home='https://www.doubao.com/chat/',chatUrl=/^https:\/\/www\.doubao\.com\/chat\/\d+$/,localUrl=/^https:\/\/www\.doubao\.com\/chat\/local_\d+$/;
@@ -148,6 +149,7 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
  if(!assertUrl('reply')||root.dataset.wechatDoubaoOwner!==key)throw Error('doubao_ownership_lost');
  return {reply:JSON.stringify(decision),url:activeUrl};
  }catch(error){await pendingPersist.catch(()=>{});document.documentElement.dataset.wechatDoubaoFailure=String(error.message).match(/doubao_[a-z_]+/)?.[0]||error.name;throw error;}
+ finally{if(window.wechatDoubaoActiveTurn===turnId)delete window.wechatDoubaoActiveTurn;}
 };
 
 window.wechatDoubaoRename=async function(name){

@@ -16,6 +16,7 @@ window.wechatDeepseekDraft=async function(prompt,key,reuse=false,expectedUrl,tur
   if(location.href!==expectedUrl||!(expectedUrl===home||chatUrl.test(expectedUrl)))throw Error('deepseek_wrong_conversation');
   delete root.dataset.wechatDeepseekFailed;
   delete root.dataset.wechatDeepseekFailedOwner;
+  delete root.dataset.wechatDeepseekFailure;
   if((reuse&&!chatUrl.test(activeUrl))||(!reuse&&activeUrl!==home))throw Error('deepseek_not_fresh_home');
   if(!reuse&&(document.querySelector('.ds-assistant-message-main-content')||users().length))throw Error('deepseek_existing_conversation');
   if(root.dataset.wechatDeepseekOwner&&root.dataset.wechatDeepseekOwner!==key)throw Error('deepseek_wrong_contact');
@@ -71,6 +72,6 @@ window.wechatDeepseekDraft=async function(prompt,key,reuse=false,expectedUrl,tur
    await new Promise(resolve=>setTimeout(resolve,400));
   }
   throw Error('deepseek_reply_timeout');
- }catch(error){root.dataset.wechatDeepseekFailed='true';root.dataset.wechatDeepseekFailedOwner=key;throw error;}
+ }catch(error){root.dataset.wechatDeepseekFailed='true';root.dataset.wechatDeepseekFailedOwner=key;root.dataset.wechatDeepseekFailure=/^deepseek_[a-z_]+$/.test(error?.message||'')?error.message:'deepseek_unexpected_error';throw error;}
 };
 void 0;
