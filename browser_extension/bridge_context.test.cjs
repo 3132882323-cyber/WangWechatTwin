@@ -652,7 +652,8 @@ test('DeepSeek refuses an invalid persisted tab instead of creating another page
  load('deepseek_background.js',context);
  await context.deepseekPump();
  assert.equal(creates,0);
- assert.equal(resultBody.error,'reply');
+ assert.equal(resultBody.error,'deepseek_owned_tab_unavailable');
+ assert.equal(resultBody.stage,'owned_tab');
 });
 
 test('DeepSeek migrates once to the exact verified latest conversation tab',async()=>{
@@ -747,7 +748,7 @@ for(const [provider,ownedUrl,otherUrl] of [
   assert.equal(fixture.saved[provider+'OwnedTab'],32);
   assert.equal(fixture.saved[provider+'RecoveryApplied'],fixture.recoveryId);
   assert.equal(fixture.calls.queries,1);
-  assert.equal(fixture.calls.results.at(-1).error,provider==='doubao'?'doubao_owned_tab_unavailable':'reply');
+  assert.equal(fixture.calls.results.at(-1).error,provider+'_owned_tab_unavailable');
   delete fixture.saved[provider+'OwnedTab'];
   await fixture.makeContext()[provider+'Pump']();
   assert.equal(fixture.calls.queries,1);
@@ -778,7 +779,7 @@ for(const [provider,ownedUrl,otherUrl] of [
   const context=fixture.makeContext();await context[provider+'Pump']();
   fixture.bootstrap.owned_url=ownedUrl;fixture.bootstrap.recovery_id='short';
   fixture.setTabs([{id:32,url:ownedUrl}]);await context[provider+'Pump']();
-  if(provider==='doubao')delete fixture.saved.doubaoLastFailure;
+  delete fixture.saved[provider+'LastFailure'];
   assert.deepEqual(fixture.saved,before);
   assert.equal(fixture.calls.queries,0);
   assert.equal(fixture.calls.creates+fixture.calls.updates+fixture.calls.scripts,0);
