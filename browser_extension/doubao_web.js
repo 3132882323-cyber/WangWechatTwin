@@ -46,6 +46,16 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
  };
  const visibleUsers=()=>Array.from(document.querySelectorAll('[data-testid="send_message"]'));
  const imageMessage=node=>!!node.querySelector('img')&&!node.textContent.includes('[wechat-turn:');
+ const freshPrefixReady=mine=>{
+  if(root.dataset.wechatDoubaoOwner!==key)throw Error('doubao_ownership_lost');
+  const before=visibleUsers().filter(node=>!mine||(node!==mine&&(node.compareDocumentPosition(mine)&Node.DOCUMENT_POSITION_FOLLOWING)));
+  const priorReplies=Array.from(document.querySelectorAll('[data-testid="receive_message"]')).filter(node=>!mine||(node.compareDocumentPosition(mine)&Node.DOCUMENT_POSITION_FOLLOWING));
+  // A fresh turn started with no messages and verified the exact upload previews.
+  // Its image bubble may render before the server assigns any message IDs.
+  if(priorReplies.length||before.length>images.length||before.some(node=>!imageMessage(node))||
+     (before.length&&!visualReady))throw Error('doubao_unowned_conversation');
+  return before.every(node=>!!messageId(node));
+ };
  // Diagnostics contain only structural attributes, IDs and character counts.
  // Never copy text, input contents, labels, HTML, URLs or uploaded image data.
  const safeAttrs=node=>{
@@ -81,9 +91,11 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
  captureDiagnostic=()=>{
   const users=visibleUsers(),user=users.find(node=>node.textContent.includes(marker));
   const answers=Array.from(document.querySelectorAll('[data-testid="receive_message"]'));
+  const before=user?users.filter(node=>node!==user&&follows(node,user)):users;
   const after=user?answers.filter(node=>follows(user,node)):[];
   const current=location.href,urlKind=isHomeUrl(current)?'home':localUrl.test(current)?'local':chatUrl.test(current)?'chat':'other';
   return {urlKind,sameOwnedUrl:current===activeUrl,userFound:!!user,user:idPaths(user,user),
+   upload:{expectedCount:images.length,verified:visualReady},prefix:{count:before.length,imageOnlyCount:before.filter(imageMessage).length,missingIdCount:before.filter(node=>!messageId(node)).length},
    selectors:{send:users.length,receive:answers.length,receiveVariant:count(document,'[data-testid*="receive_message"]'),assistantRole:count(document,'[data-message-role="assistant"],[data-role="assistant"]'),union:count(document,'[data-testid="union_message"]'),messageBlock:count(document,'[data-testid="message-block-container"]'),messageId:count(document,'[data-message-id]'),streaming:count(document,'[data-streaming]')},
    afterCount:after.length,after:after.slice(-3).map(node=>{
     const body=node.querySelector?.('[data-testid="message_text_content"]'),ancestors=[];
@@ -101,10 +113,9 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
      ((!reused&&localUrl.test(activeUrl))||(reused&&localUrl.test(activeUrl))||(!reused&&visualReady&&chatUrl.test(activeUrl)))){
    const users=visibleUsers(),mine=users.find(node=>node.textContent.includes(marker));
    if(!mine)return false;
-   const before=users.filter(node=>node!==mine&&(node.compareDocumentPosition(mine)&Node.DOCUMENT_POSITION_FOLLOWING));
    const after=users.filter(node=>node!==mine&&(mine.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING));
-   if(after.length||(!reused&&(before.length>images.length||before.some(node=>!imageMessage(node)||!messageId(node))||
-      Array.from(document.querySelectorAll('[data-testid="receive_message"]')).some(node=>node.compareDocumentPosition(mine)&Node.DOCUMENT_POSITION_FOLLOWING))))throw Error('doubao_unowned_conversation');
+   if(after.length)throw Error('doubao_unowned_conversation');
+   if(!reused&&!freshPrefixReady(mine))return false;
    activeUrl=current;finalUrlLocked=true;return true;
   }
   throw Error('doubao_conversation_changed');
@@ -142,8 +153,7 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
   visualReady=true;
  }
  if(!reused){
-  const before=visibleUsers(),priorReplies=document.querySelectorAll('[data-testid="receive_message"]');
-  if(priorReplies.length||before.length>images.length||before.some(node=>!imageMessage(node)||!messageId(node)))throw Error('doubao_unowned_conversation');
+  if(!freshPrefixReady(null))await window.wechatDoubaoWait(()=>{assertUrl();return freshPrefixReady(null);},3000,'doubao_image_upload_not_verified');
  }
  const submitted=marker+'\n此标记只用于核对本轮网页消息，回复中不要复述。\n\n'+prompt;
  diagnosticPhase='send_ready';
@@ -164,11 +174,7 @@ window.wechatDoubaoReply=async function(prompt,key,reused,images,expectedUrl,tur
   const users=visibleUsers(),user=users.find(node=>node.textContent.includes(marker));
   if(!user)return null;
   if(users.some(node=>node!==user&&(user.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING)))throw Error('doubao_newer_user_turn');
-  if(!reused){
-   const before=users.filter(node=>node!==user&&(node.compareDocumentPosition(user)&Node.DOCUMENT_POSITION_FOLLOWING));
-   if(before.length>images.length||before.some(node=>!imageMessage(node)||!messageId(node))||
-      Array.from(document.querySelectorAll('[data-testid="receive_message"]')).some(node=>node.compareDocumentPosition(user)&Node.DOCUMENT_POSITION_FOLLOWING))throw Error('doubao_unowned_conversation');
-  }
+  if(!reused&&!freshPrefixReady(user))return null;
   return chatUrl.test(activeUrl)||localUrl.test(activeUrl)?user:null;
  },Math.max(1,replyDeadline-Date.now()),'doubao_reply_timeout');
  diagnosticPhase='persist_user';

@@ -115,7 +115,7 @@ class WebReplyLLM:
         finally:
             with self.connect() as db:
                 # Personal context need not remain in the transport queue.
-                db.execute("UPDATE jobs SET prompt='',images='[]',status=CASE WHEN status='done' THEN status ELSE 'expired' END WHERE id=?", (job_id,))
+                db.execute("UPDATE jobs SET prompt='',images='[]',status=CASE WHEN status IN ('done','failed') THEN status ELSE 'expired' END WHERE id=?", (job_id,))
 
     def complete(self, job_id, result, browser_meta=None):
         with self.connect() as connection:

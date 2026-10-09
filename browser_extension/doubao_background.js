@@ -18,7 +18,7 @@ async function doubaoBlockedHeartbeat(){
  }catch{}finally{doubaoHeartbeatBusy=false;}
 }
 function doubaoErrorCode(error){
- const allowed=new Set(['doubao_bridge_timeout','doubao_script_timeout','doubao_reply_script_timeout','doubao_recovery_unproven','doubao_recovery_tab_unavailable','doubao_seed_tab_unavailable','doubao_owned_tab_unavailable','doubao_owned_tab_unproven','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified','doubao_login_or_load','doubao_empty_or_wrong_conversation','doubao_result_url_changed','doubao_result_rejected','doubao_conversation_changed','doubao_unowned_conversation','doubao_wrong_conversation','doubao_wrong_contact','doubao_turn_already_present','doubao_user_attachments','doubao_upload_not_available','doubao_ownership_lost','doubao_image_upload_not_verified','doubao_prompt_or_send_not_ready','doubao_newer_user_turn','doubao_reply_timeout','doubao_rename_timeout']);
+ const allowed=new Set(['doubao_bridge_timeout','doubao_script_timeout','doubao_reply_script_timeout','doubao_reply_missing_result','doubao_recovery_unproven','doubao_recovery_tab_unavailable','doubao_seed_tab_unavailable','doubao_owned_tab_unavailable','doubao_owned_tab_unproven','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified','doubao_login_or_load','doubao_empty_or_wrong_conversation','doubao_result_url_changed','doubao_result_rejected','doubao_conversation_changed','doubao_unowned_conversation','doubao_wrong_conversation','doubao_wrong_contact','doubao_turn_already_present','doubao_user_attachments','doubao_upload_not_available','doubao_ownership_lost','doubao_image_upload_not_verified','doubao_prompt_or_send_not_ready','doubao_newer_user_turn','doubao_reply_timeout','doubao_rename_timeout']);
  const message=String(error?.message||'');
  if(/^background_window_[a-z_]+$/.test(message))return 'doubao_background_window_unavailable';
  const code=message.match(/\bdoubao_[a-z_]+\b/)?.[0];
@@ -133,8 +133,21 @@ async function doubaoPump(){
   stage='setup';await chrome.storage.local.set({doubaoOwnedTab:tab.id,doubaoOwnedUrl:expectedUrl});
   await execute({target:{tabId:tab.id},files:['doubao_web.js']});
   stage='reply';
-  const result=await execute({target:{tabId:tab.id},func:async(prompt,key,reused,images,expectedUrl,turnId,contactName)=>await window.wechatDoubaoReply(prompt,key,reused,images,expectedUrl,turnId,contactName),args:[job.prompt,key,reused,job.images||[],expectedUrl,job.id,job.contact_name||'']},true);
-  const outcome=result[0]?.result;if(!outcome?.reply||!chatUrl.test(outcome.url)||(reused&&outcome.url!==expectedUrl))throw Error('doubao_empty_or_wrong_conversation');
+  const result=await execute({target:{tabId:tab.id},func:async(prompt,key,reused,images,expectedUrl,turnId,contactName)=>{
+   // Chromium may omit the result when an injected async function rejects.
+   // Carry only its fixed error token across the injection boundary.
+   try{return await window.wechatDoubaoReply(prompt,key,reused,images,expectedUrl,turnId,contactName);}
+   catch(error){return {error:String(error?.message||'').match(/\bdoubao_[a-z_]+\b/)?.[0]||'doubao_unexpected_error'};}
+  },args:[job.prompt,key,reused,job.images||[],expectedUrl,job.id,job.contact_name||'']},true);
+  const outcome=result[0]?.result;
+  if(outcome?.error)throw Error(doubaoErrorCode({message:outcome.error}));
+  if(!outcome)throw Error('doubao_reply_missing_result');
+  let verifiedMigration=false;
+  if(reused&&localUrl.test(expectedUrl)&&chatUrl.test(outcome.url||'')){
+   const current=(await chrome.storage.local.get('doubaoConversations')).doubaoConversations?.[key];
+   verifiedMigration=current?.url===outcome.url&&current?.lastTurnId===job.id;
+  }
+  if(!outcome.reply||!chatUrl.test(outcome.url)||(reused&&outcome.url!==expectedUrl&&!verifiedMigration))throw Error('doubao_empty_or_wrong_conversation');
   stage='complete';const finished=await chrome.tabs.get(tab.id);if(finished.url!==outcome.url)throw Error('doubao_result_url_changed');
   conversations[key]={url:finished.url,name:job.contact_name||'',lastTurnId:job.id};await chrome.storage.local.set({doubaoConversations:conversations,doubaoOwnedUrl:finished.url});
   const accepted=await doubaoFetch(base+'/result',{method:'POST',headers,body:JSON.stringify({id:job.id,result:outcome.reply,browser_meta:{tab_id:tab.id,reused,managed_tabs:1,bridge_total_ms:Date.now()-started}})});

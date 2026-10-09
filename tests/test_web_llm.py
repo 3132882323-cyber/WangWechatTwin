@@ -74,3 +74,29 @@ def test_pause_allows_only_explicit_virtual_queue_verification(tmp_path,monkeypa
     result=llm.decide('test',json.dumps({'__is_local_test':True,'incoming':{'content':'虚构'}}),RiskLevel.low)
     assert result.reply=='测试完成'
     with pytest.raises(LLMError,match='已暂停'):llm.decide('production',json.dumps({'incoming':{'content':'正常消息'}}),RiskLevel.low)
+
+
+def test_failed_visual_job_retains_failure_status_and_clears_media(tmp_path,monkeypatch):
+    import json
+    from PIL import Image
+    from app.web_llm import WebReplyLLM
+
+    cfg=AppConfig(project_root=tmp_path,openai={'provider':'doubao_web','web_reply_timeout_seconds':2})
+    image_dir=cfg.resolve(cfg.paths.history_reader)/'sticker_assets'
+    image_dir.mkdir(parents=True)
+    image_path=image_dir/'frame.png'
+    Image.new('RGB',(2,2),'white').save(image_path)
+    llm=WebReplyLLM(cfg)
+
+    def fail_claimed_job(_):
+        with llm.connect() as db:
+            row=db.execute("SELECT id,images FROM jobs WHERE status='pending'").fetchone()
+            assert row is not None and len(json.loads(row[1]))==1
+            db.execute("UPDATE jobs SET status='failed' WHERE id=?",(row[0],))
+
+    monkeypatch.setattr('app.web_llm.time.sleep',fail_claimed_job)
+    payload=json.dumps({'__media_paths':[str(image_path)],'incoming':{'message_type':'sticker','content':'[表情包]'}})
+    with pytest.raises(LLMError,match='网页回复失败'):
+        llm.decide('visual',payload,RiskLevel.low)
+    with llm.connect() as db:
+        assert db.execute('SELECT status,prompt,images FROM jobs').fetchone()==('failed','','[]')

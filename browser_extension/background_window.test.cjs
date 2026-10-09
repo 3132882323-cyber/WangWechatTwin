@@ -108,10 +108,14 @@ function renderingHarness(){
   setTimeout(done,ms){const timer=++next;timers.set(timer,{done,ms});return timer;},
   clearTimeout(timer){timers.delete(timer);}
  });
- fixture.fireRenderingRetry=async()=>{
+ fixture.startRenderingRetry=()=>{
   const timer=[...timers].find(([,value])=>value.ms===1000);
   assert.ok(timer,'a rendering recovery retry is scheduled');
-  timers.delete(timer[0]);timer[1].done();
+  timers.delete(timer[0]);return timer[1].done();
+ };
+ fixture.renderingRetryCount=()=>[...timers.values()].filter(value=>value.ms===1000).length;
+ fixture.fireRenderingRetry=async()=>{
+  await fixture.startRenderingRetry();
   await fixture.api().releaseRendering('not-the-owner');
  };
  return fixture;
@@ -185,6 +189,93 @@ test('a recovered active Doubao turn stays leased, cannot be overwritten, and re
  assert.equal(fixture.calls.updates.length,before);assert.equal(fixture.local.bridgeBackgroundRenderingLease.jobId,'old-turn');
  delete fixture.tabs.get(12).activeTurn;await fixture.fireRenderingRetry();
  assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+});
+
+test('a stalled recovered Doubao probe is single-flight while DeepSeek and GPT remain available',{timeout:2000},async()=>{
+ const fixture=renderingHarness();const state=await fixture.api().ensure();
+ const lease=await fixture.api().acquireRendering(12,'doubao','old-turn');fixture.tabs.get(12).activeTurn='old-turn';fixture.load();
+ const execute=fixture.context.chrome.scripting.executeScript;let resolveProbe,probeStarted,probes=0;
+ const started=new Promise(resolve=>{probeStarted=resolve;});
+ fixture.context.chrome.scripting.executeScript=properties=>properties.target.tabId!==12?execute(properties):new Promise(resolve=>{probes++;resolveProbe=resolve;probeStarted();});
+ const before={updates:fixture.calls.updates.length,hides:fixture.calls.requests.filter(call=>call.kind==='hide').length};
+ await fixture.api().ensure();const watch=fixture.startRenderingRetry();await started;
+ for(let attempt=0;attempt<3;attempt++){
+  assert.equal((await fixture.api().ensureOwnedTab(11,'deepseek')).id,11);
+  assert.equal((await fixture.api().ensureOwnedTab(20,'chatgpt')).id,20);
+  assert.equal(await fixture.api().isRenderingIdle('doubao'),false);
+ }
+ await assert.rejects(fixture.api().acquireRendering(12,'doubao','new-turn'),/background_window_rendering_busy/);
+ assert.equal(probes,1);assert.equal(fixture.renderingRetryCount(),0);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);assert.equal(fixture.tabs.get(12).active,true);
+ assert.equal(fixture.calls.updates.length,before.updates);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,before.hides);
+ resolveProbe([{frameId:0,result:true}]);await watch;
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);assert.equal(fixture.renderingRetryCount(),1);
+ fixture.context.chrome.scripting.executeScript=execute;delete fixture.tabs.get(12).activeTurn;
+ await fixture.fireRenderingRetry();
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+});
+
+test('a rejected or unverified recovery probe keeps the Doubao lease and retries without blocking other providers',{timeout:2000},async()=>{
+ for(const result of [Error('page unavailable'),[],[{frameId:1,result:false}],[{frameId:0,error:'probe failed'}],[{frameId:0,result:'false'}]]){
+  const fixture=renderingHarness();await fixture.api().ensure();
+  const lease=await fixture.api().acquireRendering(12,'doubao','old-turn');fixture.tabs.get(12).activeTurn='old-turn';fixture.load();
+  const execute=fixture.context.chrome.scripting.executeScript;
+  fixture.context.chrome.scripting.executeScript=async properties=>{if(properties.target.tabId!==12)return execute(properties);if(result instanceof Error)throw result;return result;};
+  await fixture.api().ensure();const before=fixture.calls.updates.length;await fixture.fireRenderingRetry();
+  assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);assert.equal(fixture.tabs.get(12).active,true);assert.equal(fixture.calls.updates.length,before);
+  assert.equal(fixture.renderingRetryCount(),1);assert.equal((await fixture.api().ensureOwnedTab(11,'deepseek')).id,11);assert.equal((await fixture.api().ensureOwnedTab(20,'chatgpt')).id,20);
+  fixture.context.chrome.scripting.executeScript=execute;delete fixture.tabs.get(12).activeTurn;
+  await fixture.fireRenderingRetry();assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);
+ }
+});
+
+test('a late recovery probe cannot release a newer rendering lease',{timeout:2000},async()=>{
+ const fixture=renderingHarness();await fixture.api().ensure();
+ const previous=await fixture.api().acquireRendering(12,'doubao','old-turn');fixture.load();
+ const execute=fixture.context.chrome.scripting.executeScript;let resolveProbe,probeStarted;
+ const started=new Promise(resolve=>{probeStarted=resolve;});
+ fixture.context.chrome.scripting.executeScript=properties=>properties.target.tabId!==12?execute(properties):new Promise(resolve=>{resolveProbe=resolve;probeStarted();});
+ await fixture.api().ensure();const watch=fixture.startRenderingRetry();await started;
+ await fixture.api().releaseRendering(previous);const current=await fixture.api().acquireRendering(12,'doubao','new-turn');
+ const before={updates:fixture.calls.updates.length,hides:fixture.calls.requests.filter(call=>call.kind==='hide').length};
+ resolveProbe([{frameId:0,result:false}]);await watch;
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,current);assert.equal(fixture.tabs.get(12).active,true);
+ assert.equal(fixture.calls.updates.length,before.updates);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,before.hides);
+ assert.equal(fixture.renderingRetryCount(),0);await fixture.api().releaseRendering(current);
+});
+
+test('an explicit release retries native hiding even while an earlier recovery probe is stalled',{timeout:2000},async()=>{
+ const fixture=renderingHarness();const state=await fixture.api().ensure();
+ const lease=await fixture.api().acquireRendering(12,'doubao','old-turn');fixture.load();
+ const execute=fixture.context.chrome.scripting.executeScript;let resolveProbe,probeStarted,probes=0;
+ const started=new Promise(resolve=>{probeStarted=resolve;});
+ fixture.context.chrome.scripting.executeScript=properties=>properties.target.tabId!==12?execute(properties):new Promise(resolve=>{probes++;resolveProbe=resolve;probeStarted();});
+ await fixture.api().ensure();const watch=fixture.startRenderingRetry();await started;
+ fixture.options.reply=(kind,reply)=>{if(kind==='hide')reply.verified=false;};
+ await assert.rejects(fixture.api().releaseRendering(lease),/background_window_not_hidden/);
+ assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);assert.equal(fixture.renderingRetryCount(),1);
+ delete fixture.options.reply;await fixture.fireRenderingRetry();
+ assert.equal(probes,1);assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+ const before=fixture.calls.updates.length;resolveProbe([{frameId:0,result:false}]);await watch;
+ assert.equal(fixture.calls.updates.length,before);assert.equal(fixture.renderingRetryCount(),0);
+});
+
+test('recovery rechecks ownership and manual reveal after its asynchronous probe',{timeout:2000},async()=>{
+ for(const changed of ['manual reveal','unclaimed tab']){
+  const fixture=renderingHarness();const state=await fixture.api().ensure();
+  const lease=await fixture.api().acquireRendering(12,'doubao','old-turn');fixture.load();
+  const execute=fixture.context.chrome.scripting.executeScript;let resolveProbe,probeStarted;
+  const started=new Promise(resolve=>{probeStarted=resolve;});
+  fixture.context.chrome.scripting.executeScript=properties=>properties.target.tabId!==12?execute(properties):new Promise(resolve=>{resolveProbe=resolve;probeStarted();});
+  await fixture.api().ensure();const watch=fixture.startRenderingRetry();await started;
+  if(changed==='manual reveal')fixture.options.manualReveal=true;
+  else fixture.tabs.set(88,{id:88,windowId:state.windowId,url:'https://example.org/',active:false});
+  const before={updates:fixture.calls.updates.length,hides:fixture.calls.requests.filter(call=>call.kind==='hide').length};
+  resolveProbe([{frameId:0,result:false}]);await watch;
+  assert.equal(fixture.tabs.get(12).active,true);assert.equal(fixture.calls.updates.length,before.updates);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,before.hides);
+  if(changed==='manual reveal')assert.equal(fixture.local.bridgeBackgroundRenderingLease,undefined);
+  else{assert.equal(fixture.local.bridgeBackgroundRenderingLease.id,lease);assert.equal(fixture.renderingRetryCount(),1);}
+ }
 });
 
 test('manual reveal during rendering release leaves the user selected page untouched',async()=>{

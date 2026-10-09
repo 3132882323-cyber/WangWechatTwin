@@ -7,7 +7,7 @@
  const titlePattern=/^WeChatTwin Background [0-9a-f]{32}$/;
  const recoveryPattern=/^[0-9a-f]{32}$/;
  const home={deepseek:'https://chat.deepseek.com/',doubao:'https://www.doubao.com/chat/',chatgpt:'https://chatgpt.com/?temporary-chat=true'};
- let serial=Promise.resolve(),ensureFlight=null,cached=null,activationTimer=null,renderLease=null,renderTimer=null;
+ let serial=Promise.resolve(),ensureFlight=null,cached=null,activationTimer=null,renderLease=null,renderTimer=null,renderWatch=null;
  const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
  const enqueue=task=>{const next=serial.then(task,task);serial=next.catch(()=>{});return next;};
  const hostUrl=()=> 'http://127.0.0.1:18769/browser-window/host';
@@ -285,11 +285,7 @@
    if(renderLease.releasing){
     await finishRendering(renderLease,token);return prepare();
    }
-   if(renderLease.recovered){
-    const active=await renderingActive(renderLease);
-    if(!active){await finishRendering(renderLease,token,false);return prepare();}
-    watchRendering(renderLease.id);
-   }
+   if(renderLease.recovered)watchRendering(renderLease.id);
    cached=context;return {context,ownership};
   }
   const context=await findHost(ownership);
@@ -370,7 +366,9 @@
  }
  async function renderingActive(lease){
   const results=await chrome.scripting.executeScript({target:{tabId:lease.tabId,frameIds:[0]},func:jobId=>window.wechatDoubaoActiveTurn===jobId,args:[lease.jobId]});
-  return results.find(result=>result.frameId===0)?.result===true;
+  const active=results.find(result=>result.frameId===0)?.result;
+  if(typeof active!=='boolean')throw Error('background_window_rendering_unverified');
+  return active;
  }
  async function restoreRendering(ownership){
   const saved=ownership.local[renderKey],context=ownership.local[stateKey];
@@ -383,17 +381,34 @@
   renderLease={...saved,context,recovered:true};
  }
  function watchRendering(leaseId){
-  if(renderTimer)return;
+  if(renderLease?.id!==leaseId||renderTimer||(renderWatch?.id===leaseId&&!renderLease.releasing))return;
   renderTimer=setTimeout(()=>{
    renderTimer=null;
    if(renderLease?.id!==leaseId)return;
-   enqueue(()=>guarded(async()=>{
-    if(renderLease?.id!==leaseId)return;
-    const ownership=await readOwnership();
-    await validateContents(renderLease.context.windowId,renderLease.context.hostTabId,ownership);
-    if(!renderLease.releasing&&await renderingActive(renderLease)){watchRendering(leaseId);return;}
-    await finishRendering(renderLease,ownership.local.token);
-   })).catch(()=>{if(renderLease?.id===leaseId)watchRendering(leaseId);});
+   const flight={id:leaseId};renderWatch=flight;
+   return (async()=>{
+    const lease=await enqueue(()=>guarded(async()=>{
+     if(renderLease?.id!==leaseId)return null;
+     const ownership=await readOwnership();
+     await validateContents(renderLease.context.windowId,renderLease.context.hostTabId,ownership);
+     return renderLease;
+    }));
+    if(!lease)return;
+    // A recovered content probe may never settle. Keep it single-flight and
+    // outside the shared queue so DeepSeek and GPT can still prepare their tabs.
+    // Only a confirmed idle result may release the lease; no timeout cancels it.
+    if(!lease.releasing&&await renderingActive(lease))return;
+    await enqueue(()=>guarded(async()=>{
+     if(renderLease?.id!==leaseId)return;
+     const ownership=await readOwnership();
+     // finishRendering rechecks manual reveal and current ownership after the
+     // asynchronous probe, before selecting the controller or hiding anything.
+     await finishRendering(renderLease,ownership.local.token);
+    }));
+   })().catch(()=>{}).finally(()=>{
+    if(renderWatch===flight)renderWatch=null;
+    if(renderLease?.id===leaseId)watchRendering(leaseId);
+   });
   },1000);
  }
  function acquireRendering(tabId,provider,jobId){
