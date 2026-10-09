@@ -16,7 +16,7 @@ async function deepseekPump(){
  const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Provider':'deepseek'};
  const base='http://127.0.0.1:18769/browser-bridge';let job=null,stage='bootstrap',ownedTabId=null,readyState=null;const pumpStarted=Date.now();deepseekBusy=true;
  try{
-  stage='background_window';await WechatBackgroundWindow.ensure();stage='bootstrap';
+  stage='background_window';await WechatBackgroundWindow.ensure('deepseek');stage='bootstrap';
   const previous=await chrome.storage.local.get(['deepseekOwnedTab','deepseekOwnedUrl','deepseekConversations','deepseekSeedApplied','deepseekRecoveryApplied']);
   const conversations=previous.deepseekConversations||{};
   const home='https://chat.deepseek.com/';
@@ -32,7 +32,7 @@ async function deepseekPump(){
    tab=matches[0];
    await chrome.storage.local.set({deepseekOwnedTab:tab.id,deepseekOwnedUrl:ownedUrl,deepseekRecoveryApplied:recoveryId});
   }
-  stage='background_window';await WechatBackgroundWindow.ensure();stage='queue';
+  stage='background_window';await WechatBackgroundWindow.ensure('deepseek');stage='queue';
   const bridgeStarted=Date.now();
   const next=await fetch(base+'/next',{headers});if(!next.ok)return;job=(await next.json()).job;if(!job)return;
   stage='validate_job';if(job.images?.length)throw Error('deepseek_visual_not_verified');

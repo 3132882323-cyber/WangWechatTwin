@@ -24,6 +24,80 @@ def test_health_detects_dead_reply_lane_and_stale_runtime(tmp_path):
     assert client.get('/health').json()['ok'] is True
 
 
+def test_health_reports_required_model_bridge_heartbeats(tmp_path):
+    import time
+    from app.config import AppConfig
+
+    config = AppConfig(project_root=tmp_path, openai={'provider': 'hybrid_web'})
+    db = Database(tmp_path / 'health.sqlite3')
+    client = TestClient(create_app(config, db))
+    db.set_state('runtime_heartbeat', {'seen_at': time.time()})
+    db.set_state('reply_scheduler_health', {'dead_lanes': []})
+    health = client.get('/health').json()
+    assert health['runtime_ok'] is True
+    assert health['model_bridges_ok'] is False
+    assert health['ok'] is False
+    assert {provider: bridge['status'] for provider, bridge in health['model_bridges'].items()} == {
+        'chatgpt': 'missing', 'deepseek': 'missing', 'doubao': 'missing'}
+
+    token = (config.resolve(config.paths.browser_bridge) / 'pairing_token.txt').read_text().strip()
+    for provider in ('chatgpt', 'deepseek', 'doubao'):
+        response = client.post('/browser-bridge/heartbeat', json={'blocked': False}, headers={
+            'authorization': 'Bearer ' + token, 'x-wechat-bridge-provider': provider})
+        assert response.status_code == 200
+    health = client.get('/health').json()
+    assert health['ok'] is True
+    assert health['model_bridges_ok'] is True
+    assert all(bridge['status'] == 'ready' for bridge in health['model_bridges'].values())
+
+    state = db.get_state('doubao_bridge')
+    db.set_state('doubao_bridge', {**state, 'heartbeat_seen_at': time.time() - 180,
+                                   'seen_at': time.time()})
+    health = client.get('/health').json()
+    assert health['runtime_ok'] is True
+    assert health['model_bridges_ok'] is False
+    assert health['ok'] is False
+    assert health['model_bridges']['doubao']['status'] == 'stale'
+    assert health['model_bridges']['deepseek']['status'] == 'ready'
+
+    client.post('/browser-bridge/heartbeat', json={'blocked': True}, headers={
+        'authorization': 'Bearer ' + token, 'x-wechat-bridge-provider': 'doubao'})
+    assert client.get('/health').json()['model_bridges']['doubao']['status'] == 'blocked'
+    client.post('/browser-bridge/heartbeat', json={'blocked': False}, headers={
+        'authorization': 'Bearer ' + token, 'x-wechat-bridge-provider': 'doubao'})
+    assert client.get('/health').json()['ok'] is True
+
+
+def test_bridge_poll_does_not_replace_explicit_heartbeat(tmp_path):
+    import time
+    from app.config import AppConfig
+
+    for provider, mode in (('chatgpt', 'web'), ('deepseek', 'deepseek_web'), ('doubao', 'doubao_web')):
+        root = tmp_path / provider
+        config = AppConfig(project_root=root, openai={'provider': mode})
+        db = Database(root / 'health.sqlite3')
+        client = TestClient(create_app(config, db))
+        token = (config.resolve(config.paths.browser_bridge) / 'pairing_token.txt').read_text().strip()
+        headers = {'authorization': 'Bearer ' + token, 'x-wechat-bridge-provider': provider,
+                   'x-wechat-bridge-version': '4'}
+        key = 'browser_bridge' if provider == 'chatgpt' else provider + '_bridge'
+
+        db.set_state(key, {'seen_at': time.time() - 180})
+        assert client.get('/health').json()['model_bridges'][provider]['status'] == 'stale'
+        assert client.get('/browser-bridge/next', headers=headers).status_code == 200
+        assert client.get('/health').json()['model_bridges'][provider]['status'] == 'unconfirmed'
+        client.post('/browser-bridge/heartbeat', json={'blocked': False}, headers=headers)
+        pulse = db.get_state(key)['heartbeat_seen_at']
+        assert client.get('/browser-bridge/next', headers=headers).status_code == 200
+        state = db.get_state(key)
+        assert state['heartbeat_seen_at'] == pulse
+        assert client.get('/health').json()['ok'] is True
+
+        db.set_state(key, {**state, 'heartbeat_seen_at': time.time() - 180})
+        assert client.get('/browser-bridge/next', headers=headers).status_code == 200
+        assert client.get('/health').json()['model_bridges'][provider]['status'] == 'stale'
+
+
 def test_blocked_browser_heartbeat_never_claims_a_reply(tmp_path):
     from app.config import AppConfig
     from app.web_llm import WebReplyLLM

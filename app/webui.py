@@ -197,6 +197,17 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 result['recovery_requested'] = {'nonce': recovery['nonce']}
             return result
 
+        @app.post('/browser-bridge/window/retire-for-recovery')
+        async def retire_browser_window_for_recovery(request: Request):
+            bridge_auth(request)
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(400, '恢复参数无效')
+            from app.browser_window import retire_for_recovery
+            return await asyncio.to_thread(retire_for_recovery, db,
+                                           body.get('window_id'), body.get('host_tab_id'),
+                                           body.get('nonce'))
+
         @app.post('/browser-bridge/window/recovered')
         async def browser_models_recovered(request: Request):
             bridge_auth(request)
@@ -236,8 +247,11 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 raise HTTPException(400, '未知网页提供方')
             body = await request.json()
             blocked = body.get('blocked') is True
-            db.set_state('browser_bridge' if provider == 'chatgpt' else provider + '_bridge',
-                         {'seen_at': time.time(), 'ready': not blocked, 'blocked': blocked})
+            key = 'browser_bridge' if provider == 'chatgpt' else provider + '_bridge'
+            state = db.get_state(key) or {}
+            now = time.time()
+            db.set_state(key, {**state, 'seen_at': now, 'heartbeat_seen_at': now,
+                               'ready': not blocked, 'blocked': blocked})
             return {'ok': True}
 
         @app.get('/browser-bridge/next')
@@ -246,8 +260,13 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             provider=request.headers.get('x-wechat-bridge-provider','chatgpt')
             if provider not in {'chatgpt','deepseek','doubao'}:raise HTTPException(400,'未知网页提供方')
             if provider=='chatgpt' and request.headers.get('x-wechat-bridge-version') == '4':
-                db.set_state('browser_bridge', {'version':4,'seen_at':time.time(),'max_owned_tabs':3,'build':request.headers.get('x-wechat-bridge-build','original')})
-            elif provider in {'deepseek','doubao'}:db.set_state(provider+'_bridge',{'seen_at':time.time(),'ready':True})
+                state = db.get_state('browser_bridge') or {}
+                db.set_state('browser_bridge', {**state, 'version':4,'seen_at':time.time(),
+                                               'max_owned_tabs':3,'build':request.headers.get('x-wechat-bridge-build','original')})
+            elif provider in {'deepseek','doubao'}:
+                key = provider + '_bridge'
+                state = db.get_state(key) or {}
+                db.set_state(key, {**state, 'seen_at': time.time()})
             paused = config.resolve(config.paths.pause_file).exists()
             with queue.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
@@ -302,8 +321,39 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
     async def health() -> JSONResponse:
         workers = db.get_state("reply_scheduler_health") or {}
         heartbeat = db.get_state("runtime_heartbeat") or {}
-        stale = bool(heartbeat) and time.time() - heartbeat.get("seen_at", 0) > 120
-        return JSONResponse({"ok": not bool(workers.get("dead_lanes")) and not stale,
+        now = time.time()
+        stale = bool(heartbeat) and now - heartbeat.get("seen_at", 0) > 120
+        runtime_ok = not bool(workers.get("dead_lanes")) and not stale
+        required = {
+            'web': ('chatgpt',),
+            'deepseek_web': ('deepseek',),
+            'doubao_web': ('doubao',),
+            'hybrid_web': ('chatgpt', 'deepseek', 'doubao'),
+        }.get(config.openai.provider, ())
+        model_bridges = {}
+        def age_of(value):
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= now + 120:
+                return now - value
+            return None
+        for provider in required:
+            key = 'browser_bridge' if provider == 'chatgpt' else provider + '_bridge'
+            state = db.get_state(key) or {}
+            pulse = state.get('heartbeat_seen_at')
+            age = age_of(pulse)
+            activity_age = age_of(state.get('seen_at'))
+            status = ('missing' if age is None and activity_age is None else
+                      'stale' if age is not None and age > 120 or age is None and activity_age > 120 else
+                      'unconfirmed' if age is None else
+                      'blocked' if state.get('blocked') or state.get('ready') is False else
+                      'ready' if state.get('ready') is True else 'unconfirmed')
+            model_bridges[provider] = {
+                'status': status,
+                'heartbeat_seen_at': pulse,
+                'seen_at': state.get('seen_at'),
+            }
+        model_bridges_ok = all(bridge['status'] == 'ready' for bridge in model_bridges.values())
+        return JSONResponse({"ok": runtime_ok and model_bridges_ok, "runtime_ok": runtime_ok,
+                             "model_bridges_ok": model_bridges_ok, "model_bridges": model_bridges,
                              "paused": config.resolve(config.paths.pause_file).exists(),
                              "workers": workers, "heartbeat_stale": stale})
 

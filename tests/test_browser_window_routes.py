@@ -41,6 +41,24 @@ def test_window_manual_controls_require_owner_csrf(tmp_path, monkeypatch):
     assert '后台网页已显示' in db.get_state('browser_window_feedback')['message']
 
 
+def test_recovery_retirement_requires_pairing_and_forwards_only_requested_identity(tmp_path, monkeypatch):
+    db, app, client, headers = setup(tmp_path)
+    body = {'window_id': 11, 'host_tab_id': 22, 'nonce': 'a' * 32}
+    calls = []
+    def retire(database, window_id, host_tab_id, nonce):
+        calls.append((database, window_id, host_tab_id, nonce))
+        return {'ok': True, 'retired': True, 'visible': True, 'verified': True,
+                'manual_reveal': False, **body}
+    monkeypatch.setattr('app.browser_window.retire_for_recovery', retire)
+    assert client.post('/browser-bridge/window/retire-for-recovery', json=body).status_code == 403
+    assert calls == []
+    response = client.post('/browser-bridge/window/retire-for-recovery', json=body, headers=headers)
+    assert response.status_code == 200 and response.json()['nonce'] == body['nonce']
+    assert calls == [(db, 11, 22, body['nonce'])]
+    assert client.post('/browser-bridge/window/retire-for-recovery', json=[], headers=headers).status_code == 400
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize('authorization', ['missing', 'incorrect', 'pairing_only'])
 def test_model_recovery_request_requires_owner_csrf_before_mutation(tmp_path, monkeypatch, authorization):
     db, app, client, headers = setup(tmp_path)

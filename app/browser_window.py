@@ -302,11 +302,86 @@ def register(db, window_id: int, host_tab_id: int) -> dict[str, Any]:
         return _result(state)
 
 
+def _pending_recovery_matches(recovery: Any, nonce: Any) -> bool:
+    return (
+        isinstance(recovery, dict)
+        and recovery.get("completed") is False
+        and isinstance(nonce, str)
+        and re.fullmatch(r"[0-9a-f]{32}", nonce) is not None
+        and recovery.get("nonce") == nonce
+    )
+
+
+def retire_for_recovery(db, window_id: int, host_tab_id: int, nonce: str) -> dict[str, Any]:
+    """Release one registered window only after a requested recovery restores it.
+
+    A personal tab may have entered the old window. Preserve its native binding
+    until the full saved identity is checked and SW_RESTORE is confirmed; the
+    authenticated extension can then move its host and register a new window.
+    """
+    if not _identifier(window_id) or not _identifier(host_tab_id):
+        return _result(None, error="invalid_window_registration")
+    with _WINDOW_LOCK:
+        state = db.get_state(STATE_KEY)
+        if not _valid_state(state):
+            return _result(None, error="window_not_registered")
+        if state["window_id"] != window_id or state["host_tab_id"] != host_tab_id:
+            return _result(state, error="recovery_registration_mismatch")
+        if not _pending_recovery_matches(db.get_state("browser_model_recovery"), nonce):
+            return _result(state, error="recovery_nonce_mismatch")
+        if state.get("manual_reveal") is True:
+            return _result(state, error="background_window_manual_reveal")
+        try:
+            bound = _bound_identity(state)
+            already_retired = bound is None
+            if already_retired:
+                proof = state.get("recovery_retirement")
+                if (not isinstance(proof, dict) or proof.get("nonce") != nonce
+                        or proof.get("window_id") != window_id or proof.get("host_tab_id") != host_tab_id):
+                    return _result(state, error="window_not_bound")
+                bound = _bound_identity(proof)
+                if bound is None:
+                    return _result(state, error="window_not_bound")
+            native = _native_api()
+            _same_window(native, state, bound, require_title=False)
+            if not already_retired:
+                native.set_visible(bound["hwnd"], True)
+            _same_window(native, state, bound, require_title=False)
+            actual = native.visible(bound["hwnd"])
+            still_minimized = native.iconic(bound["hwnd"])
+            _same_window(native, state, bound, require_title=False)
+            if not actual or still_minimized:
+                raise WindowControlError("window_visibility_not_confirmed")
+            # A new recovery request must not be consumed by an old call
+            # that was still restoring its window.
+            if not _pending_recovery_matches(db.get_state("browser_model_recovery"), nonce):
+                return _result(state, error="recovery_nonce_mismatch")
+            if not already_retired:
+                state = {**state, "native": None, "visible": None, "hidden": False,
+                         "verified": False, "checked_at": time.time(), "last_error": None,
+                         "recovery_retirement": {"nonce": nonce, "window_id": window_id,
+                                                 "host_tab_id": host_tab_id, "native": bound}}
+                db.set_state(STATE_KEY, state)
+            # A retry rechecks the saved retirement identity and visibility,
+            # without touching native state or accepting an unbound window.
+            return {**_result(state, visible=True, verified=True), "retired": True,
+                    "nonce": nonce, "code": "window_retired_for_recovery"}
+        except WindowControlError as exc:
+            return _result(state, error=str(exc))
+        except (OSError, psutil.Error):
+            return _result(state, error="native_access_failed")
+
+
 def _set_visibility(db, visible: bool) -> dict[str, Any]:
     with _WINDOW_LOCK:
         state = db.get_state(STATE_KEY)
         if not _valid_state(state):
             return _result(None, error="window_not_registered")
+        if not visible and "recovery_retirement" in state:
+            # A timed-out request may arrive after retirement. Never reacquire
+            # the old title and hide a window that can now contain personal tabs.
+            # Only registration of different IDs replaces this retirement proof.
+            return _result(state, error="background_window_retired_for_recovery")
         if not visible and state.get("manual_reveal") is True:
             return _result(state, error="background_window_manual_reveal")
         try:

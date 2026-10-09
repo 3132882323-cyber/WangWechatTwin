@@ -52,13 +52,13 @@ async function recoverChatgptPageInner(){
 }
 Promise.resolve(WechatBackgroundWindow.startup()).then(()=>migrateChatgptPool()).then(()=>recoverChatgptPage()).catch(()=>console.warn('ChatGPT explicit page migration/recovery pending'));
 async function acquire(key){
- await WechatBackgroundWindow.ensure();
+ await WechatBackgroundWindow.ensure('chatgpt');
  await migrateChatgptPool();
  await recoverChatgptPage();
  const bridgePool=await WechatPool.readPool(chrome.storage);
  const slots=[];
  for(const s of bridgePool){let t;try{t=await chrome.tabs.get(s.tabId);}catch{throw Error('chatgpt_owned_tab_unavailable');}if(t.url!==s.url||!WechatPool.validUrl(t.url))throw Error('chatgpt_owned_tab_unavailable');slots.push(s);}
- await WechatBackgroundWindow.ensure();
+ await WechatBackgroundWindow.ensure('chatgpt');
  const idle=slots.find(slot=>slot.bootstrapIdle);const choice=idle?{slot:idle,reset:false,reused:false}:WechatPool.choose(slots,key,Date.now());let s=choice.slot;
  if(!s){const t=await WechatBackgroundWindow.createModelTab({url:rootUrl});s={tabId:t.id,slotId:[0,1,2].find(i=>!slots.some(x=>x.slotId===i)),turns:0};slots.push(s);}
  else if(choice.reset){
@@ -92,7 +92,7 @@ async function pump(){
  busy=true;let job=null,pool=null,stage='queue';
  const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4','X-Wechat-Bridge-Build':'fast-sticker-v2'};
  try{
-  await WechatBackgroundWindow.ensure();
+   await WechatBackgroundWindow.ensure('chatgpt');
   const r=await fetch(base+'/next',{headers});if(!r.ok)throw Error('bridge');
   job=(await r.json()).job;if(!job)return;
   const bridgeStarted=Date.now();const queueWait=Math.max(0,Math.round(bridgeStarted-job.created*1000));

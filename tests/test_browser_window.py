@@ -386,3 +386,270 @@ def test_native_adapter_uses_hide_not_minimize_and_separately_reads_visibility()
     adapter.set_visible(101, True)
     assert calls[-1] == (101, 9)
     assert adapter.iconic(101) is False
+
+
+@pytest.fixture
+def recovery_window(registered):
+    assert windows.hide(registered.db)["hidden"] is True
+    registered.recovery = {"nonce": "a" * 32, "requested_at": 123, "completed": False}
+    registered.db.set_state("browser_model_recovery", registered.recovery)
+    registered.db.set_state("unrelated_bridge_state", {"preserve": True})
+    return registered
+
+
+@pytest.mark.parametrize(
+    "window_id,tab_id,error",
+    [(-1, 9, "invalid_window_registration"), (True, 9, "invalid_window_registration"),
+     (7, "9", "invalid_window_registration"), (7, None, "invalid_window_registration"),
+     (8, 9, "recovery_registration_mismatch"), (7, 10, "recovery_registration_mismatch")],
+)
+def test_recovery_retirement_requires_exact_registered_ids(recovery_window, monkeypatch, window_id, tab_id, error):
+    db = recovery_window.db
+    saved = db.get_state(windows.STATE_KEY)
+    monkeypatch.setattr(windows, "_native_api", lambda: pytest.fail("invalid recovery accessed native windows"))
+    result = windows.retire_for_recovery(db, window_id, tab_id, recovery_window.recovery["nonce"])
+    assert result["error"] == error
+    assert db.get_state(windows.STATE_KEY) == saved
+    assert db.get_state("browser_model_recovery") == recovery_window.recovery
+
+
+@pytest.mark.parametrize("case", ["missing", "foreign", "completed", "malformed", "non_string"])
+def test_recovery_retirement_requires_current_pending_nonce(recovery_window, monkeypatch, case):
+    db = recovery_window.db
+    saved = db.get_state(windows.STATE_KEY)
+    nonce = recovery_window.recovery["nonce"]
+    if case == "missing":
+        db.set_state("browser_model_recovery", {})
+    elif case == "foreign":
+        nonce = "b" * 32
+    elif case == "completed":
+        db.set_state("browser_model_recovery", {**recovery_window.recovery, "completed": True})
+    elif case == "malformed":
+        nonce = "bad-nonce"
+        db.set_state("browser_model_recovery", {**recovery_window.recovery, "nonce": nonce})
+    else:
+        nonce = ["a" * 32]
+    recovery_before = db.get_state("browser_model_recovery")
+    monkeypatch.setattr(windows, "_native_api", lambda: pytest.fail("invalid nonce accessed native windows"))
+    assert windows.retire_for_recovery(db, 7, 9, nonce)["error"] == "recovery_nonce_mismatch"
+    assert db.get_state(windows.STATE_KEY) == saved
+    assert db.get_state("browser_model_recovery") == recovery_before
+
+
+def test_recovery_retirement_respects_manual_reveal(recovery_window, monkeypatch):
+    db = recovery_window.db
+    state = db.get_state(windows.STATE_KEY)
+    state["manual_reveal"] = True
+    db.set_state(windows.STATE_KEY, state)
+    monkeypatch.setattr(windows, "_native_api", lambda: pytest.fail("manual reveal accessed native windows"))
+    result = windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])
+    assert result["error"] == "background_window_manual_reveal"
+    assert db.get_state(windows.STATE_KEY) == state
+
+
+def test_recovery_restores_mixed_window_before_releasing_only_its_binding(recovery_window):
+    db, native = recovery_window.db, recovery_window.native
+    state = db.get_state(windows.STATE_KEY)
+    state["preserved_field"] = "keep"
+    db.set_state(windows.STATE_KEY, state)
+    native.windows[101].update(title="Personal tab - Google Chrome", iconic=True)
+    native.windows[102] = dict(native.windows[101])
+
+    def require_saved_binding():
+        assert db.get_state(windows.STATE_KEY)["native"] == state["native"]
+
+    native.before_change = require_saved_binding
+    result = windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])
+
+    assert result == {
+        "ok": True, "retired": True, "visible": True, "verified": True, "hidden": False,
+        "manual_reveal": False, "window_id": 7, "host_tab_id": 9, "title": state["title"],
+        "nonce": recovery_window.recovery["nonce"], "code": "window_retired_for_recovery",
+    }
+    assert native.commands == [(101, False), (101, True)]
+    assert native.visible(101) is True and native.iconic(101) is False
+    assert native.visible(102) is False
+    saved = db.get_state(windows.STATE_KEY)
+    assert saved["native"] is None and saved["verified"] is False
+    assert saved["preserved_field"] == "keep" and saved["manual_reveal"] is False
+    assert saved["recovery_retirement"]["native"] == state["native"]
+    assert db.get_state("browser_model_recovery") == recovery_window.recovery
+    assert db.get_state("unrelated_bridge_state") == {"preserve": True}
+
+
+@pytest.mark.parametrize("changed", ["create_time", "exe", "username", "pid", "thread_id", "class", "ancestor"])
+def test_recovery_retirement_rejects_changed_native_identity(recovery_window, changed):
+    native = recovery_window.native
+    saved = recovery_window.db.get_state(windows.STATE_KEY)
+    if changed == "thread_id":
+        native.windows[101][changed] += 1
+    elif changed == "pid":
+        native.windows[101][changed] = 43
+        recovery_window.identities[43] = {**recovery_window.identities[42], "pid": 43}
+    elif changed == "class":
+        native.windows[101][changed] = "Notepad"
+    elif changed == "ancestor":
+        native.windows[101][changed] = 102
+    elif changed == "create_time":
+        recovery_window.identities[42][changed] += 10
+    else:
+        recovery_window.identities[42][changed] = "different"
+    result = windows.retire_for_recovery(recovery_window.db, 7, 9, recovery_window.recovery["nonce"])
+    assert result["ok"] is False and result["verified"] is False
+    assert native.commands == [(101, False)]
+    assert recovery_window.db.get_state(windows.STATE_KEY) == saved
+
+
+@pytest.mark.parametrize("case,error", [
+    ("hidden", "window_visibility_not_confirmed"), ("minimized", "window_visibility_not_confirmed"),
+    ("identity_changed", "owned_window_identity_changed"), ("disappeared", "owned_window_missing"),
+])
+def test_recovery_retirement_preserves_binding_if_restore_is_unverified(recovery_window, case, error):
+    db, native = recovery_window.db, recovery_window.native
+    saved = db.get_state(windows.STATE_KEY)
+    if case in {"hidden", "minimized"}:
+        native.ignore_change = True
+        if case == "minimized":
+            native.windows[101].update(visible=True, iconic=True)
+    elif case == "identity_changed":
+        native.after_change = lambda: recovery_window.identities[42].update(create_time=2000.25)
+    else:
+        native.after_change = lambda: native.windows.pop(101)
+    result = windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])
+    assert result["error"] == error and result["verified"] is False
+    assert db.get_state(windows.STATE_KEY) == saved
+    assert db.get_state("browser_model_recovery") == recovery_window.recovery
+
+
+def test_recovery_retirement_rechecks_nonce_after_restore(recovery_window):
+    db = recovery_window.db
+    saved = db.get_state(windows.STATE_KEY)
+    replacement = {**recovery_window.recovery, "nonce": "b" * 32}
+    recovery_window.native.after_change = lambda: db.set_state("browser_model_recovery", replacement)
+    result = windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])
+    assert result["error"] == "recovery_nonce_mismatch"
+    assert db.get_state(windows.STATE_KEY) == saved
+    assert db.get_state("browser_model_recovery") == replacement
+
+
+def test_recovery_retirement_retry_verifies_saved_proof_without_another_restore(recovery_window):
+    db = recovery_window.db
+    first = windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])
+    saved = db.get_state(windows.STATE_KEY)
+    second = windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])
+    assert first == second and second["retired"] is True
+    assert recovery_window.native.commands == [(101, False), (101, True)]
+    assert db.get_state(windows.STATE_KEY) == saved
+    assert db.get_state("browser_model_recovery") == recovery_window.recovery
+
+
+@pytest.mark.parametrize("change,error", [
+    ("hidden", "window_visibility_not_confirmed"), ("minimized", "window_visibility_not_confirmed"),
+    ("identity", "owned_window_identity_changed"), ("foreign_proof", "window_not_bound"),
+])
+def test_recovery_retirement_retry_does_not_trust_stale_visibility_proof(recovery_window, change, error):
+    db = recovery_window.db
+    assert windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])["retired"] is True
+    if change == "hidden":
+        recovery_window.native.windows[101]["visible"] = False
+    elif change == "minimized":
+        recovery_window.native.windows[101]["iconic"] = True
+    elif change == "identity":
+        recovery_window.identities[42]["create_time"] += 100
+    else:
+        state = db.get_state(windows.STATE_KEY)
+        state["recovery_retirement"]["nonce"] = "b" * 32
+        db.set_state(windows.STATE_KEY, state)
+    saved = db.get_state(windows.STATE_KEY)
+    result = windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])
+    assert result["error"] == error and result["verified"] is False
+    assert recovery_window.native.commands == [(101, False), (101, True)]
+    assert db.get_state(windows.STATE_KEY) == saved
+
+
+def test_recovery_retirement_never_claims_visibility_for_unbound_registration(registered, monkeypatch):
+    registered.db.set_state("browser_model_recovery", {"nonce": "a" * 32, "completed": False})
+    state = registered.db.get_state(windows.STATE_KEY)
+    monkeypatch.setattr(windows, "_native_api", lambda: pytest.fail("unbound recovery accessed native windows"))
+    result = windows.retire_for_recovery(registered.db, 7, 9, "a" * 32)
+    assert result["error"] == "window_not_bound" and result["verified"] is False
+    assert registered.db.get_state(windows.STATE_KEY) == state
+
+
+def test_new_window_registration_is_accepted_after_verified_retirement(recovery_window, monkeypatch):
+    db = recovery_window.db
+    assert windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])["retired"] is True
+    with monkeypatch.context() as context:
+        context.setattr(windows, "_native_api", lambda: pytest.fail("new registration must not change the retired window"))
+        result = windows.register(db, 8, 9)
+    assert result["ok"] is True and result["window_id"] == 8 and result["host_tab_id"] == 9
+    assert db.get_state(windows.STATE_KEY)["native"] is None
+    assert "recovery_retirement" not in db.get_state(windows.STATE_KEY)
+    assert db.get_state("browser_model_recovery") == recovery_window.recovery
+    assert recovery_window.native.visible(101) is True
+    assert windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])["error"] == "recovery_registration_mismatch"
+
+
+def test_late_hide_cannot_rebind_and_hide_a_retired_mixed_window(recovery_window, monkeypatch):
+    db, native = recovery_window.db, recovery_window.native
+    assert windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])["retired"] is True
+    saved = db.get_state(windows.STATE_KEY)
+    # The private host title is still present until the extension moves it. A
+    # delayed hide used to rediscover this exact window and hide personal tabs.
+    assert native.snapshot(101, saved["title"])["hwnd"] == 101
+    monkeypatch.setattr(windows, "_native_api", lambda: pytest.fail("retired hide must not inspect native windows"))
+    result = windows.hide(db)
+    assert result["error"] == "background_window_retired_for_recovery"
+    assert result["ok"] is False and result["hidden"] is False
+    assert db.get_state(windows.STATE_KEY) == saved
+    assert native.commands == [(101, False), (101, True)]
+    assert native.visible(101) is True
+
+
+@pytest.mark.parametrize("case", ["completed", "new_nonce_old_request", "new_nonce_new_request", "missing"])
+def test_old_registration_stays_retired_across_recovery_state_changes(recovery_window, monkeypatch, case):
+    db, native = recovery_window.db, recovery_window.native
+    nonce = recovery_window.recovery["nonce"]
+    assert windows.retire_for_recovery(db, 7, 9, nonce)["retired"] is True
+    saved = db.get_state(windows.STATE_KEY)
+    if case == "completed":
+        db.set_state("browser_model_recovery", {**recovery_window.recovery, "completed": True})
+    elif case.startswith("new_nonce"):
+        db.set_state("browser_model_recovery", {**recovery_window.recovery, "nonce": "b" * 32})
+        if case == "new_nonce_new_request":
+            nonce = "b" * 32
+    else:
+        db.set_state("browser_model_recovery", {})
+    recovery_before = db.get_state("browser_model_recovery")
+    monkeypatch.setattr(windows, "_native_api", lambda: pytest.fail("old registration must remain retired"))
+    assert windows.register(db, 7, 9)["ok"] is True
+    assert windows.resume(db)["ok"] is True
+    assert windows.retire_for_recovery(db, 7, 9, nonce)["ok"] is False
+    assert windows.hide(db)["error"] == "background_window_retired_for_recovery"
+    assert db.get_state(windows.STATE_KEY) == saved
+    assert db.get_state("browser_model_recovery") == recovery_before
+    assert native.commands == [(101, False), (101, True)]
+    assert native.visible(101) is True
+
+
+@pytest.mark.parametrize("proof", [None, {}, False])
+def test_presence_of_corrupt_retirement_proof_still_blocks_hide(registered, monkeypatch, proof):
+    state = registered.db.get_state(windows.STATE_KEY)
+    state["recovery_retirement"] = proof
+    registered.db.set_state(windows.STATE_KEY, state)
+    monkeypatch.setattr(windows, "_native_api", lambda: pytest.fail("corrupt retirement proof must fail closed"))
+    assert windows.hide(registered.db)["error"] == "background_window_retired_for_recovery"
+    assert registered.db.get_state(windows.STATE_KEY) == state
+    assert registered.native.commands == []
+
+
+def test_new_registration_can_hide_only_new_window_after_retirement(recovery_window):
+    db, native = recovery_window.db, recovery_window.native
+    assert windows.retire_for_recovery(db, 7, 9, recovery_window.recovery["nonce"])["retired"] is True
+    registered = windows.register(db, 8, 9)
+    native.windows[102] = {**native.windows[101], "title": registered["title"] + " - Google Chrome"}
+    assert windows.hide(db)["hidden"] is True
+    assert db.get_state(windows.STATE_KEY)["native"]["hwnd"] == 102
+    assert "recovery_retirement" not in db.get_state(windows.STATE_KEY)
+    assert native.commands == [(101, False), (101, True), (102, False)]
+    assert native.visible(101) is True and native.visible(102) is False
