@@ -22,6 +22,10 @@ class ReplyScheduler:
         self._exited = set()
         self._started = False
         self._next_health_at = 0
+        self._web_queue = None
+        if config.openai.provider in {'web', 'deepseek_web', 'doubao_web', 'hybrid_web'}:
+            from app.web_llm import WebReplyLLM
+            self._web_queue = WebReplyLLM(config)
         with db.connect() as connection:
             connection.execute('''CREATE TABLE IF NOT EXISTS reply_jobs(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, contact TEXT, payload TEXT,
@@ -268,11 +272,32 @@ class ReplyScheduler:
             connection.execute('COMMIT')
         return row
 
+    def _auto_resume(self):
+        """Heal a pause that repeated browser failures created, after a cooldown.
+
+        Only an unchanged pause owned by browser_health can be resumed.
+        """
+        now = time.time()
+        if now - getattr(self, '_last_resume_check', 0.0) < 30:
+            return
+        self._last_resume_check = now
+        try:
+            from app.browser_health import auto_resume
+            # browser_health records the successful transition once. The
+            # scheduler's lane() classifier requires an incoming message.
+            auto_resume(self.config, self.db)
+        except Exception as error:
+            self._remember_error(getattr(self, 'lane', 'deepseek') if not callable(getattr(self, 'lane', None)) else 'deepseek', error)
+
     def run(self, lane='deepseek'):
         while not self.stop.is_set():
             row = None
             try:
                 self._publish_health()
+                self._auto_resume()
+                if lane == 'deepseek' and self._web_queue is not None:
+                    # Keep browser transport clean even while no replies arrive.
+                    self._web_queue._reap_stale_claims()
                 if (self.db.get_state('resource_pressure') or {}).get('active'):
                     self.stop.wait(2)
                     continue

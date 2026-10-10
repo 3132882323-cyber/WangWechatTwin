@@ -189,3 +189,28 @@ def test_doubao_route_registered_without_weakening_auth(tmp_path):
     token=(tmp_path/'bridge'/'pairing_token.txt').read_text().strip()
     response=client.get('/browser-bridge/next',headers={'X-Wechat-Bridge-Provider':'doubao','Authorization':'Bearer '+token})
     assert response.status_code==200
+
+
+def test_bridge_failure_retains_fixed_code_and_rejects_late_pollution(tmp_path):
+    import time, json
+    from app.config import AppConfig
+    from app.web_llm import WebReplyLLM
+    config = AppConfig(project_root=tmp_path, openai={'provider':'hybrid_web'})
+    db = Database(tmp_path/'health.sqlite3')
+    client = TestClient(create_app(config,db))
+    queue = WebReplyLLM(config)
+    token = (config.resolve(config.paths.browser_bridge)/'pairing_token.txt').read_text().strip()
+    headers = {'authorization':'Bearer '+token,'x-wechat-bridge-provider':'deepseek'}
+    with queue.connect() as conn:
+        conn.execute("insert into jobs(id,status,created,expires,provider,is_test,prompt,images) values('test','claimed',?,?,'deepseek',1,'private','[1]')",(time.time(),time.time()+50))
+    production_failure={'code':'deepseek_reply_timeout','seen_at':time.time(),'is_test':False}
+    db.set_state('deepseek_last_failure',production_failure)
+    assert client.post('/browser-bridge/result',json={'id':'test','error':'deepseek_known_conversation_missing'},headers=headers).status_code == 200
+    assert db.get_state('deepseek_last_failure')==production_failure
+    with queue.connect() as conn:
+        status,prompt,images,meta=conn.execute("select status,prompt,images,browser_meta from jobs where id='test'").fetchone()
+    assert (status,prompt,images)==('failed','','[]')
+    assert json.loads(meta)=={'failure_code':'deepseek_known_conversation_missing'}
+    before=db.get_state('deepseek_last_test_failure')
+    assert client.post('/browser-bridge/result',json={'id':'test','error':'private exception text'},headers=headers).status_code==409
+    assert db.get_state('deepseek_last_test_failure')==before

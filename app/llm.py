@@ -13,7 +13,13 @@ from app.reply_selection import (
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, fallback_safe: bool = False):
+        super().__init__(message)
+        self.fallback_safe = fallback_safe
+
+
+# Backup lanes are eligible only before any webpage has claimed the job.
+FALLBACK_LANES = {'deepseek': 'chatgpt', 'doubao': 'chatgpt'}
 
 
 class ReplyLLM:
@@ -71,7 +77,18 @@ class ReplyLLM:
 
     def _decide_once(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
         if self.hybrid:
-            return self.hybrid[self.route(user_payload,risk)].decide(system_prompt,user_payload,risk)
+            lane = self.route(user_payload,risk)
+            try:
+                return self.hybrid[lane].decide(system_prompt,user_payload,risk)
+            except LLMError as exc:
+                # Only a definitively cancelled, unclaimed job may change lanes.
+                # Unknown submission outcomes remain on review.
+                if not exc.fallback_safe:
+                    raise
+                backup = FALLBACK_LANES.get(lane)
+                if backup and backup in self.hybrid:
+                    return self.hybrid[backup].decide(system_prompt,user_payload,risk)
+                raise
         if self.account is not None:
             return self.account.decide(system_prompt, user_payload, risk)
         model = (

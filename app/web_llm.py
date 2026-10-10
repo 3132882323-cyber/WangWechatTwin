@@ -11,6 +11,20 @@ import uuid
 
 from app.models import ReplyDecision
 
+# Chrome may sleep the connector and it only polls every 30s, so a claim window
+# of 35s silently dropped most replies. 75s covers two poll rounds.
+CLAIM_GRACE_SECONDS = 75.0
+# A channel that just failed gets a short wait so one broken page cannot
+# stall every contact behind it.
+FAILED_CHANNEL_GRACE_SECONDS = 15.0
+FAILED_CHANNEL_MEMORY_SECONDS = 600.0
+# How often a stuck claim is released back to the queue.
+REAP_INTERVAL_SECONDS = 30.0
+# Finished rows are transport leftovers; keep them briefly for inspection.
+FINISHED_ROW_RETENTION_SECONDS = 3 * 86400.0
+# Budget must cover the claim window plus real page generation time.
+PROVIDER_TIMEOUT_BUDGET = {'deepseek_web': 150.0, 'doubao_web': 200.0}
+
 
 class WebReplyLLM:
     def __init__(self, config):
@@ -18,6 +32,7 @@ class WebReplyLLM:
         root = config.resolve(config.paths.browser_bridge)
         root.mkdir(parents=True, exist_ok=True)
         self.path = root / "jobs.sqlite3"
+        self._last_reap = 0.0
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, prompt TEXT, status TEXT, result TEXT, created REAL, expires REAL)")
             if 'is_test' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
@@ -34,14 +49,17 @@ class WebReplyLLM:
                 db.execute("ALTER TABLE jobs ADD COLUMN selection_mode TEXT NOT NULL DEFAULT 'direct'")
             if 'provider' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT 'chatgpt'")
+            db.execute('CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status,provider,expires)')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created)')
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
 
     def decide(self, system_prompt, user_payload, risk):
         from app.llm import LLMError
+        self._reap_stale_claims()
         job_id = uuid.uuid4().hex
-        provider_budget={'deepseek_web':90,'doubao_web':120}.get(self.config.openai.provider,self.config.openai.web_reply_timeout_seconds)
+        provider_budget=PROVIDER_TIMEOUT_BUDGET.get(self.config.openai.provider,self.config.openai.web_reply_timeout_seconds)
         expires = time.time() + min(self.config.openai.web_reply_timeout_seconds,provider_budget)
         schema = json.dumps(ReplyDecision.model_json_schema(), ensure_ascii=False)
         if self.config.openai.provider in {'deepseek_web','doubao_web'}:
@@ -100,16 +118,35 @@ class WebReplyLLM:
                 if self.config.resolve(self.config.paths.pause_file).exists() and not is_test:
                     raise LLMError("已暂停网页回复")
                 with self.connect() as db:
-                    status, result = db.execute("SELECT status,result FROM jobs WHERE id=?", (job_id,)).fetchone()
-                if status=='pending' and time.time()-waiting_started>35:
-                    raise LLMError('网页未领取任务，已快速转审核，避免长期堵塞')
+                    status, result, browser_meta = db.execute(
+                        "SELECT status,result,browser_meta FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if status=='pending' and time.time()-waiting_started>self._claim_grace_seconds(provider,waiting_started,expires):
+                    # A connector can claim between the read above and here.
+                    # Only an atomic cancellation proves that another lane may
+                    # safely handle this message without submitting it twice.
+                    with self.connect() as db:
+                        cancelled = db.execute(
+                            "UPDATE jobs SET status='expired',prompt='',images='[]' "
+                            "WHERE id=? AND status='pending'", (job_id,)).rowcount
+                    if cancelled == 1:
+                        raise LLMError('网页未领取任务，已快速转审核，避免长期堵塞', fallback_safe=True)
+                    continue
                 if status == "done":
                     try:
                         return ReplyDecision.model_validate_json(result)
                     except ValueError as exc:
                         raise LLMError("网页结果格式无效，留待审核") from exc
                 if status == "failed":
-                    raise LLMError("网页回复失败，留待审核；不会切回 Codex")
+                    code = ''
+                    try:
+                        metadata = json.loads(browser_meta or '{}')
+                        candidate = metadata.get('failure_code') if isinstance(metadata, dict) else None
+                        if isinstance(candidate, str) and re.fullmatch(r'[a-z_]{1,80}', candidate):
+                            code = candidate
+                    except (TypeError, ValueError):
+                        pass
+                    suffix = f'（错误码：{code}）' if code else ''
+                    raise LLMError("网页回复失败，留待审核；不会切回 Codex" + suffix)
                 time.sleep(.25)
             raise LLMError("网页连接未就绪或超时，留待审核；不会切回 Codex")
         finally:
@@ -117,9 +154,70 @@ class WebReplyLLM:
                 # Personal context need not remain in the transport queue.
                 db.execute("UPDATE jobs SET prompt='',images='[]',status=CASE WHEN status IN ('done','failed') THEN status ELSE 'expired' END WHERE id=?", (job_id,))
 
+    def _reap_stale_claims(self):
+        """Expire abandoned jobs and clear private payloads from old terminal rows.
+
+        A crashed or reloaded page can leave a claimed slot occupied; a crashed
+        backend can leave a pending job with personal context in the payload.
+        Neither is eligible for a later send after its deadline.
+        """
+        now = time.time()
+        if now - getattr(self, '_last_reap', 0.0) < REAP_INTERVAL_SECONDS:
+            return 0
+        try:
+            with self.connect() as db:
+                released = db.execute(
+                    "UPDATE jobs SET status='expired',prompt='',images='[]' "
+                    "WHERE status IN ('pending','claimed') AND expires<=?", (now,)).rowcount or 0
+                pruned = db.execute(
+                    "UPDATE jobs SET prompt='',images='[]' "
+                    "WHERE status IN ('done','expired','failed') "
+                    "AND created<=? AND (prompt!='' OR images!='[]')",
+                    (now - FINISHED_ROW_RETENTION_SECONDS,)).rowcount or 0
+            self._last_reap = now
+            return released + pruned
+        except sqlite3.Error:
+            return 0
+
+    def _bridge_health(self, provider):
+        """False when this channel failed in the last few minutes.
+
+        A page that just failed will keep failing, so waiting the full window
+        would only stall the lane behind it.
+        """
+        try:
+            from app.db import Database
+            state_db = Database(self.config.resolve(self.config.paths.database))
+            failure = state_db.get_state(provider + '_last_failure') or {}
+            if failure.get('is_test') is True:
+                return True
+            seen = float(failure.get('seen_at') or 0)
+            success = state_db.get_state(provider + '_last_success') or {}
+            recovered = (success.get('is_test') is False
+                         and float(success.get('seen_at') or 0) > seen)
+            return not (seen and time.time() - seen < FAILED_CHANNEL_MEMORY_SECONDS and not recovered)
+        except Exception:
+            # Unknown is not a reason to shorten the wait.
+            return True
+
+    def _claim_grace_seconds(self, provider, waiting_started, expires):
+        """How long a job may sit unclaimed before it becomes a draft review.
+
+        The connector only polls every 30s and Chrome may sleep it, so 35s lost
+        most messages. Wait long enough to cover two poll rounds on a healthy
+        channel; fail fast on one that just broke, yet never past the deadline.
+        """
+        remaining = expires - waiting_started - 5.0
+        if remaining <= 0:
+            # Too little time left to wait for a claim: let the deadline decide.
+            return CLAIM_GRACE_SECONDS
+        if not self._bridge_health(provider):
+            return min(FAILED_CHANNEL_GRACE_SECONDS, remaining)
+        return min(CLAIM_GRACE_SECONDS, remaining)
+
     def complete(self, job_id, result, browser_meta=None):
         with self.connect() as connection:
-            row=connection.execute('SELECT selection_mode FROM jobs WHERE id=?',(job_id,)).fetchone()
+            row=connection.execute('SELECT selection_mode,is_test,provider FROM jobs WHERE id=?',(job_id,)).fetchone()
         if row and row[0]=='direct':
             raw=json.loads(result)
             raw.pop('candidates',None);raw.pop('selected_candidate',None)
@@ -132,3 +230,12 @@ class WebReplyLLM:
                                  (parsed.model_dump_json(), json.dumps(meta),job_id, time.time())).rowcount
         if updated != 1:
             raise ValueError("网页任务已过期或已完成，不能重复提交")
+        if row and row[1] == 0 and row[2] in {'chatgpt', 'deepseek', 'doubao'}:
+            # Health is based on an actual production completion, not heartbeat
+            # traffic or virtual verification jobs. Telemetry must not undo it.
+            try:
+                from app.db import Database
+                Database(self.config.resolve(self.config.paths.database)).set_state(
+                    row[2] + '_last_success', {'seen_at': time.time(), 'is_test': False})
+            except (OSError, sqlite3.Error):
+                pass

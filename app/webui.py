@@ -286,12 +286,12 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             if body.get('error'):
                 code=str(body.get('error',''))
                 if not __import__('re').fullmatch(r'[a-z_]{1,80}',code):code='unclassified'
-                if test_row:
-                    db.set_state(test_row[1]+'_last_failure',{'code':code,'seen_at':time.time(),'is_test':bool(test_row[0])})
                 with queue.connect() as conn:
-                    changed=conn.execute("UPDATE jobs SET status='failed',prompt='' WHERE id=? AND status='claimed'", (body['id'],)).rowcount
+                    changed=conn.execute("UPDATE jobs SET status='failed',prompt='',images='[]',browser_meta=? WHERE id=? AND status='claimed' AND expires>?", (json.dumps({'failure_code':code}),body['id'],time.time())).rowcount
                 if changed != 1:
                     raise HTTPException(409,'任务已过期或已处理')
+                if test_row:
+                    db.set_state(test_row[1]+('_last_test_failure' if test_row[0] else '_last_failure'),{'code':code,'seen_at':time.time(),'is_test':bool(test_row[0])})
                 if test_row and (test_row[0] or test_row[1] in {'deepseek','doubao'}):
                     db.add_event('browser_test_error','独立浏览器验证失败；未暂停生产回复')
                 else:
