@@ -39,11 +39,28 @@ class IdlePipeline:
         raise AssertionError('This fixture has no messages or sends')
 
 
-def test_idle_scheduler_resumes_owned_failure_pause_and_resets_failure_count(tmp_path):
+def test_idle_scheduler_resumes_owned_failure_pause_and_resets_failure_count(tmp_path, monkeypatch):
     config, db = failure_pause(tmp_path)
+    recovery = threading.Condition()
+    completed = False
+    original_resume = browser_health.auto_resume
+
+    def observe_resume(*args, **kwargs):
+        nonlocal completed
+        result = original_resume(*args, **kwargs)
+        if result:
+            with recovery:
+                completed = True
+                recovery.notify_all()
+        return result
+
+    monkeypatch.setattr(browser_health, 'auto_resume', observe_resume)
     pipeline = IdlePipeline()
     scheduler = ReplyScheduler(config, db, pipeline, SimpleNamespace())
     try:
+        # Another lane can poll after unlink but before ownership and the event are persisted.
+        with recovery:
+            assert recovery.wait_for(lambda: completed, timeout=5), 'automatic recovery never completed'
         assert pipeline.polled.wait(5), 'idle workers never resumed after the cooldown'
         assert not config.resolve(config.paths.pause_file).exists()
         assert db.get_state('auto_pause') == {}

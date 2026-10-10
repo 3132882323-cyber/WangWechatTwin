@@ -47,6 +47,7 @@ async function deepseekPump(){
   }
   stage='owned_tab';const known=conversations[key];
   let url=chatUrl.test(known?.url||'')?known.url:home;
+  if(url!==home&&Object.entries(conversations).some(([otherKey,value])=>otherKey!==key&&value?.url===url))throw Error('deepseek_wrong_contact');
   if(!tab&&Number.isInteger(previous.deepseekOwnedTab)){
    try{tab=await chrome.tabs.get(previous.deepseekOwnedTab);}catch{}
    if(!tab||!tab.url||new URL(tab.url).origin!=='https://chat.deepseek.com')throw Error('deepseek_owned_tab_unavailable');
@@ -79,17 +80,21 @@ async function deepseekPump(){
   const slots=[{id:tab.id,key,used:Date.now()}];
   await chrome.storage.session.set({deepseekSlots:slots});
   let reuse=url!==home,restoredFromLocal=false;
-  stage='ready';const deadline=Date.now()+30000;let ready=false,stableSince=0,lastSignature='',lastValue=null,readyScriptFailed=false;
+  stage='ready';const deadline=Date.now()+(reuse?8000:30000);let ready=false,stableSince=0,lastSignature='',lastValue=null,readyScriptFailed=false;
   while(Date.now()<deadline){
-   try{const state=await chrome.scripting.executeScript({target:{tabId:tab.id},func:(lastTurnId)=>{const answers=document.querySelectorAll('.ds-assistant-message-main-content');const blocks=Array.from(document.querySelector('.ds-virtual-list-visible-items')?.children||[]);const users=blocks.filter(node=>!node.querySelector('.ds-assistant-message-main-content')&&(node.textContent||'').trim());return {url:location.href,ready:document.readyState,editor:!!document.querySelector('textarea[placeholder="给 DeepSeek 发送消息 "]'),answers:answers.length,users:users.length,lastAnswerLength:answers.length?(answers[answers.length-1].textContent||'').length:0,hasKnownTurn:!lastTurnId||users.some(node=>node.textContent.includes('[wechat-turn:'+lastTurnId+']'))};},args:[reuse?known?.lastTurnId||'':'']});
+   try{const state=await chrome.scripting.executeScript({target:{tabId:tab.id},func:(lastTurnId)=>{const answers=document.querySelectorAll('.ds-assistant-message-main-content');const blocks=Array.from(document.querySelector('.ds-virtual-list-visible-items')?.children||[]);const users=blocks.filter(node=>!node.querySelector('.ds-assistant-message-main-content')&&(node.textContent||'').trim());const editor=document.querySelector('textarea[placeholder="给 DeepSeek 发送消息 "]');return {url:location.href,ready:document.readyState,editor:!!editor,draft:!!editor?.value.trim(),owner:document.documentElement.dataset.wechatDeepseekOwner||'',answers:answers.length,users:users.length,unownedUsers:users.some(node=>!/(?:^|\s)\[wechat-turn:[^\]]+\]/.test(node.textContent||'')),lastAnswerLength:answers.length?(answers[answers.length-1].textContent||'').length:0,hasKnownTurn:!lastTurnId||users.some(node=>node.textContent.includes('[wechat-turn:'+lastTurnId+']'))};},args:[reuse?known?.lastTurnId||'':'']});
     const value=state[0]?.result;
     if(value){lastValue=value;readyState={url_matches_expected:value.url===url,document_ready:['loading','interactive','complete'].includes(value.ready)?value.ready:'unknown',editor:!!value.editor,has_known_turn:!!value.hasKnownTurn,visible_users:Number.isInteger(value.users)?value.users:0,visible_answers:Number.isInteger(value.answers)?value.answers:0};}
     if(reuse&&value?.url===home&&value.ready!=='loading'&&value.editor)throw Error('deepseek_known_conversation_missing');
-    const eligible=value?.url===url&&value.ready!=='loading'&&value.editor&&value.hasKnownTurn&&(reuse||(!value.answers&&!value.users));
+    if(reuse&&value?.url===url&&value.owner&&value.owner!==key)throw Error('deepseek_wrong_contact');
+    // The last turn can leave DeepSeek's virtual DOM. In that case the live
+    // page must still carry the owner set by our previous verified send.
+    const virtualTurn=reuse&&!!known?.lastTurnId&&!value?.hasKnownTurn&&value?.owner===key&&!value?.draft&&!value?.unownedUsers&&(value.users>0||value.answers>0);
+    const eligible=value?.url===url&&value.ready!=='loading'&&value.editor&&(value.hasKnownTurn||virtualTurn)&&(reuse||(!value.answers&&!value.users));
     const signature=eligible?JSON.stringify([value.url,value.users,value.answers,value.lastAnswerLength]):'';
     if(signature&&signature===lastSignature&&Date.now()-stableSince>=900){ready=true;break;}
     if(signature!==lastSignature){lastSignature=signature;stableSince=Date.now();}
-   }catch(error){if(error?.message==='deepseek_known_conversation_missing')throw error;readyScriptFailed=true;}
+   }catch(error){if(['deepseek_known_conversation_missing','deepseek_wrong_contact'].includes(error?.message))throw error;readyScriptFailed=true;lastSignature='';stableSince=0;}
    await new Promise(resolve=>setTimeout(resolve,400));
   }
   if(!ready){

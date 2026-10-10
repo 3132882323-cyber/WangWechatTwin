@@ -90,7 +90,7 @@ async function pump(){
  const {bridgeLease}=await chrome.storage.session.get('bridgeLease');if(bridgeLease?.until>Date.now())return;
  await chrome.storage.local.set({bridgeWorkerVersion:4});
  busy=true;let job=null,pool=null,stage='queue';
- const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4','X-Wechat-Bridge-Build':'fast-sticker-v2'};
+ const headers={Authorization:'Bearer '+token,'Content-Type':'application/json','X-Wechat-Bridge-Version':'4','X-Wechat-Bridge-Build':'sticker-vision-v1'};
  try{
    await WechatBackgroundWindow.ensure('chatgpt');
   const r=await fetch(base+'/next',{headers});if(!r.ok)throw Error('bridge');

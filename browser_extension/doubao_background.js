@@ -84,6 +84,8 @@ async function doubaoPump(){
   tab=await WechatBackgroundWindow.ensureOwnedTab(tab.id,'doubao');
   renderLease=await WechatBackgroundWindow.acquireRendering(tab.id,'doubao',job.id);
   const known=conversations[key];let reused=chatUrl.test(known?.url||'')||localUrl.test(known?.url||''),expectedUrl=reused?known.url:home;
+  if(reused&&Object.entries(conversations).some(([otherKey,value])=>otherKey!==key&&value?.url===expectedUrl))throw Error('doubao_wrong_contact');
+  if(reused&&known?.pending)throw Error('doubao_pending_unverified');
   stage='navigate';
   if(tab.url!==expectedUrl){
    const editing=await execute({target:{tabId:tab.id},func:()=>!!(document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]')?.textContent.trim()||document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'))});
@@ -103,11 +105,12 @@ async function doubaoPump(){
    }});
    if(!changed[0]?.result){await chrome.tabs.update(tab.id,{url:home});freshFallback=true;}
   }
-  stage='ready';let ready=false,stableSince=0,lastSignature='';const freshStarted=Date.now(),deadline=freshStarted+30000;
+  stage='ready';let ready=false,stableSince=0,lastSignature='';const freshStarted=Date.now(),deadline=freshStarted+(reused?8000:30000);
   while(Date.now()<deadline){
-   try{const state=await execute({target:{tabId:tab.id},func:(lastTurnId)=>{const replies=document.querySelectorAll('[data-testid="receive_message"]');const editor=document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');return {url:location.href,editor:!!editor,draft:!!editor?.textContent.trim(),attachments:!!document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'),answers:replies.length,users:document.querySelectorAll('[data-testid="send_message"]').length,lastAnswerLength:replies.length?(replies[replies.length-1].textContent||'').length:0,hasKnownTurn:!lastTurnId||Array.from(document.querySelectorAll('[data-testid="send_message"]')).some(node=>node.textContent.includes('[wechat-turn:'+lastTurnId+']'))};},args:[reused?known?.lastTurnId||'':'']});
+   try{const state=await execute({target:{tabId:tab.id},func:(lastTurnId)=>{const replies=document.querySelectorAll('[data-testid="receive_message"]');const editor=document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');const users=Array.from(document.querySelectorAll('[data-testid="send_message"]'));return {url:location.href,editor:!!editor,draft:!!editor?.textContent.trim(),attachments:!!document.querySelector('[data-testid="chat_input"] [data-testid="attachment-image-card"]'),owner:document.documentElement.dataset.wechatDoubaoOwner||'',answers:replies.length,users:users.length,unownedUsers:users.some(node=>!/(?:^|\s)\[wechat-turn:[^\]]+\]/.test(node.textContent||'')),lastAnswerLength:replies.length?(replies[replies.length-1].textContent||'').length:0,hasKnownTurn:!lastTurnId||users.some(node=>node.textContent.includes('[wechat-turn:'+lastTurnId+']'))};},args:[reused?known?.lastTurnId||'':'']});
     const value=state[0]?.result;
     if(reused&&isHomeUrl(value?.url)&&value.editor)throw Error('doubao_known_conversation_missing');
+    if(reused&&value?.url===expectedUrl&&value.owner&&value.owner!==key)throw Error('doubao_wrong_contact');
    if(reused&&localUrl.test(expectedUrl)&&chatUrl.test(value?.url||'')&&known?.lastTurnId&&value.hasKnownTurn){
     expectedUrl=value.url;conversations[key]={...known,url:expectedUrl,pending:false};
     await chrome.storage.local.set({doubaoConversations:conversations,doubaoOwnedUrl:expectedUrl});
@@ -118,12 +121,14 @@ async function doubaoPump(){
      if(value.draft||value.attachments)throw Error('doubao_user_editing');
      await chrome.tabs.update(tab.id,{url:home});freshFallback=true;lastSignature='';stableSince=0;continue;
     }
-   if(reused&&known?.pending&&(value?.users||value?.answers))throw Error('doubao_pending_unverified');
-   const eligible=value?.url===expectedUrl&&value.editor&&value.hasKnownTurn&&(reused||emptyFresh);
+    // A virtualized old turn can be absent from the DOM, but the live page
+    // must retain the owner established by our previous verified send.
+    const virtualTurn=reused&&!!known?.lastTurnId&&!value?.hasKnownTurn&&value?.owner===key&&!value?.draft&&!value?.attachments&&!value?.unownedUsers&&(value.users>0||value.answers>0);
+    const eligible=value?.url===expectedUrl&&value.editor&&(value.hasKnownTurn||virtualTurn)&&(reused||emptyFresh);
     const signature=eligible?JSON.stringify([value.url,value.users,value.answers,value.lastAnswerLength]):'';
     if(signature&&signature===lastSignature&&Date.now()-stableSince>=900){ready=true;break;}
     if(signature!==lastSignature){lastSignature=signature;stableSince=Date.now();}
-  }catch(error){if(['doubao_script_timeout','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified'].includes(error?.message))throw error;}await new Promise(r=>setTimeout(r,300));
+  }catch(error){if(['doubao_script_timeout','doubao_user_editing','doubao_known_conversation_missing','doubao_pending_unverified','doubao_wrong_contact'].includes(error?.message))throw error;lastSignature='';stableSince=0;}await new Promise(r=>setTimeout(r,300));
   }
   if(!ready)throw Error('doubao_login_or_load');
   if(!reused&&localUrl.test(expectedUrl)){

@@ -165,6 +165,8 @@ def _load(args: argparse.Namespace) -> tuple[AppConfig, Database]:
 
 
 def _adapter(config: AppConfig, *, initialize: bool = True):
+    if sys.platform == "darwin" and config.adapter != "mock":
+        raise WxAutoUnavailable("Mac 版当前支持草稿与网页桥接；尚未实现本机微信收发适配器，不能加载 Windows 接口")
     if config.adapter == "history_http_sender":
         from app.adapters.http_sender import HistoryHTTPSender
         return HistoryHTTPSender(config)
@@ -192,7 +194,16 @@ def command_doctor(args: argparse.Namespace) -> int:
             ).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
-    model_ready = account_ready if uses_account else bool(key)
+    web_providers = {'web': ('chatgpt',), 'deepseek_web': ('deepseek',),
+                     'doubao_web': ('doubao',), 'hybrid_web': ('chatgpt', 'deepseek', 'doubao')}
+    required_bridges = web_providers.get(config.openai.provider, ())
+    bridge_readiness = {}
+    for provider in required_bridges:
+        state = db.get_state('browser_bridge' if provider == 'chatgpt' else provider + '_bridge') or {}
+        heartbeat = state.get('heartbeat_seen_at')
+        bridge_readiness[provider] = (isinstance(heartbeat, (int, float))
+            and 0 <= time.time() - heartbeat < 120 and not state.get('blocked', False))
+    model_ready = all(bridge_readiness.values()) if required_bridges else account_ready if uses_account else bool(key)
     python_supported = (3, 10) <= sys.version_info[:2] < (3, 13)
     report = {
         "ok": model_ready and python_supported,
@@ -204,7 +215,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         "database": str(config.resolve(config.paths.database)),
         "database_writable": True,
         "openai_key_present": bool(key),
-        "inference_provider": "account" if uses_account else "api",
+        "inference_provider": config.openai.provider if required_bridges else "account" if uses_account else "api",
+        "browser_bridges": bridge_readiness,
         "model_credentials_available": model_ready,
         "model_inference_verified": False,
         "openai_base_url": base or "official",
@@ -212,7 +224,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "warnings": [],
     }
     if not model_ready:
-        report["warnings"].append("AI 尚未连接，请先登录 Codex 或配置模型密钥")
+        report["warnings"].append("网页桥接心跳尚未就绪，请连接扩展并登录所选网页模型；心跳不代表生成验收通过" if required_bridges else "AI 尚未连接，请先登录 Codex 或配置模型密钥")
     if not python_supported:
         report["warnings"].append("建议使用 Python 3.11 或 3.12")
     try:
@@ -337,6 +349,58 @@ def command_run(args: argparse.Namespace) -> int:
         lock.release()
 
 
+def command_draft(args: argparse.Namespace) -> int:
+    """Import bounded text input as drafts; never construct a real sender."""
+    try:
+        with Path(args.input).open('rb') as source:
+            raw = source.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError('输入文件超过 1 MiB')
+        items = json.loads(raw.decode('utf-8-sig'))
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list) or not 1 <= len(items) <= 100:
+            raise ValueError('输入应为一条消息或 1～100 条消息数组')
+        for item in items:
+            if not isinstance(item, dict) or set(item) - {'contact','sender','content','chat_type','message_type'}:
+                raise ValueError('消息字段无效；此入口仅接受文字，不读取任意附件路径')
+            if any(not isinstance(item.get(field), str) or not item[field].strip()
+                   or len(item[field]) > maximum for field, maximum in [('contact',256),('content',32768)]):
+                raise ValueError('contact/content 必须为非空且长度有效的文字')
+            if 'sender' in item and (not isinstance(item['sender'],str) or not item['sender'].strip() or len(item['sender']) > 256):
+                raise ValueError('sender 字段无效')
+            if item.get('chat_type','friend') not in {'friend','group'} or item.get('message_type','text') != 'text':
+                raise ValueError('此入口仅接受私聊或群聊文字')
+    except (OSError, ValueError, UnicodeError):
+        print('草稿输入无效：请使用不超过 1 MiB 的 UTF-8 消息 JSON', file=sys.stderr)
+        return 2
+    config = load_config(args.config).model_copy(deep=True)
+    config.mode = 'shadow'
+    config.adapter = 'mock'
+    config.wechat.allow_unknown_contacts = True
+    config.wechat.unknown_contact_mode = 'shadow'
+    config.wechat.send_holding_on_review = False
+    config.wechat.use_greeting_cache = False
+    config.proactive.enabled = False
+    config.stickers.enabled = False
+    for contact in config.contacts:
+        contact.mode = 'shadow'
+    db = Database(config.resolve(config.paths.database))
+    pipeline = ReplyPipeline(config, db)
+    class DraftOnlyAdapter(MockAdapter):
+        def send_text(self, contact, text):
+            raise RuntimeError('草稿入口禁止发送')
+    adapter = DraftOnlyAdapter(items)
+    outcomes = []
+    while adapter.queue:
+        for message in adapter.poll():
+            result = pipeline.process(message, adapter)
+            outcomes.append({'status':result.status, 'draft_id':result.draft_id,
+                             'wechat_sent':False})
+    print(json.dumps({'draft_only':True,'results':outcomes},ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="微信聊天分身")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
@@ -348,6 +412,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="启动消息处理")
     run.add_argument("--mode", choices=["shadow", "low_risk_auto", "full_auto", "off"])
     run.set_defaults(func=command_run)
+
+    draft = sub.add_parser("draft", help="导入文字 JSON，仅生成审核草稿，不发送微信")
+    draft.add_argument("--input", required=True, help="UTF-8 消息 JSON 文件")
+    draft.set_defaults(func=command_draft)
 
     pause = sub.add_parser("pause", help="暂停")
     pause.set_defaults(func=command_pause)

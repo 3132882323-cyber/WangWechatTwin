@@ -77,6 +77,8 @@ class FakeWindows:
 
 @pytest.fixture
 def registered(tmp_path, monkeypatch):
+    # These cases exercise the Win32 adapter contract on every CI host.
+    monkeypatch.setattr(windows.sys, "platform", "win32")
     db = Database(tmp_path / "window.sqlite3")
     registration = windows.register(db, 7, 9)
     native = FakeWindows(registration["title"])

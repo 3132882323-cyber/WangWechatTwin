@@ -1,6 +1,6 @@
 // A separate, same-profile Chrome window for proven bridge-owned model tabs.
-// Chrome has no hidden window state. Only the authenticated native backend can
-// confirm hiding; minimized is used solely while the empty host is created.
+// Chrome has no hidden window state. Windows uses authenticated native hiding;
+// macOS explicitly uses a minimized dedicated window, verified by this extension.
 (function(root){
  const base='http://127.0.0.1:18769/browser-bridge/window';
  const stateKey='bridgeBackgroundWindow',pendingKey='bridgeBackgroundPendingTabs',recoveryKey='bridgeBackgroundRecoveryApplied',renderKey='bridgeBackgroundRenderingLease',relocationKey='bridgeBackgroundRecoveryRelocation';
@@ -122,6 +122,7 @@
   const reply=await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId});
   if(reply?.ok!==true||reply.window_id!==context.windowId||reply.host_tab_id!==context.hostTabId||!titlePattern.test(reply.title||''))throw Error('background_window_registration_rejected');
   if(reply.manual_reveal===true)throw Error('background_window_manual_reveal');
+  if(windowMode(reply)==='extension_minimized')throw Error('background_window_mixed_tabs');
   const nonce=reply.recovery_requested?.nonce;
   if(nonce===undefined)throw Error('background_window_mixed_tabs');
   if(typeof nonce!=='string'||!recoveryPattern.test(nonce)||(expectedNonce&&nonce!==expectedNonce))throw Error('background_window_recovery_rejected');
@@ -259,6 +260,42 @@
   const error=String(reply?.error||'');
   return /^(?:background_window_[a-z_]+|owned_window_missing|owned_window_title_mismatch)$/.test(error)?error:'background_window_not_hidden';
  }
+ function windowMode(reply){
+  const capability=reply?.capabilities;
+  // Older Windows backends have no capability field and retain their strict
+  // native receipt contract. A macOS fallback requires explicit negotiation.
+  if(capability===undefined)return 'native_hidden';
+  if(capability?.mode==='native_hidden'&&capability.platform==='windows'&&capability.native_hide===true)return 'native_hidden';
+  if(capability?.mode==='extension_minimized'&&capability.platform==='macos'&&capability.native_hide===false&&capability.extension_minimize===true&&capability.fully_hidden===false)return 'extension_minimized';
+  throw Error('background_window_platform_unsupported');
+ }
+ function backgroundState(context){
+  return context.windowMode==='extension_minimized'
+   ?{hidden:false,minimized:true,visible:false,verified:true,window_mode:'extension_minimized',verification_source:'chrome_extension'}
+   :{hidden:true,visible:false,verified:true};
+ }
+ async function extensionVisibility(context,token,state){
+  const expectedUrl=context.restoreHost?context.restoreHostUrl:hostUrl();
+  await validateContents(context.windowId,context.hostTabId,await readOwnership(),expectedUrl);
+  const before=await chrome.windows.get(context.windowId);
+  if(before.state!==state)await chrome.windows.update(context.windowId,{state,...(state==='normal'?{focused:true}:{})});
+  // Recheck both the exact owned container and the observed result. Neither an
+  // update promise nor a backend acknowledgement alone proves minimization.
+  await validateContents(context.windowId,context.hostTabId,await readOwnership(),expectedUrl);
+  const observed=await chrome.windows.get(context.windowId);
+  if(observed.state!==state)throw Error('background_window_visibility_unverified');
+  const reply=await request('/visibility',token,{window_id:context.windowId,host_tab_id:context.hostTabId,title:context.title,state});
+  if(reply?.ok!==true||reply.window_id!==context.windowId||reply.host_tab_id!==context.hostTabId||reply.title!==context.title||reply.window_mode!=='extension_minimized'||reply.hidden!==false||reply.verified!==true||reply.verification_source!=='chrome_extension'||reply.minimized!==(state==='minimized')||reply.visible!==(state==='normal')||reply.manual_reveal!==(state==='normal'))throw Error('background_window_visibility_rejected');
+ }
+ async function manualReveal(context,reply,token){
+  context.windowMode=windowMode(reply);
+  if(reply.manual_reveal!==true)return false;
+  if(context.windowMode==='extension_minimized'){
+   context.title=reply.title;
+   await extensionVisibility(context,token,'normal');
+  }
+  return true;
+ }
  async function hide(context,token){
   // Activating a tab does not focus the window. The stable controller title is
   // the only title the backend may use to identify and hide a native HWND.
@@ -269,6 +306,10 @@
   // Retry only those two caption timing failures, with the identical identity.
   for(let attempt=0;attempt<4;attempt++){
    const reply=await request('/hide',token,body);
+   if(context.windowMode==='extension_minimized'){
+    if(reply?.ok!==true||reply.action!=='minimize'||reply.window_mode!=='extension_minimized'||reply.hidden!==false||reply.manual_reveal!==false||reply.window_id!==context.windowId||reply.host_tab_id!==context.hostTabId||reply.title!==context.title)throw Error('background_window_minimization_rejected');
+    await extensionVisibility(context,token,'minimized');return;
+   }
    if(reply?.ok===true&&reply.hidden===true&&reply.visible===false&&reply.verified===true&&reply.window_id===context.windowId&&reply.host_tab_id===context.hostTabId&&reply.title===context.title)return;
    const transient=reply?.ok===false&&['owned_window_missing','owned_window_title_mismatch'].includes(reply.error);
    if(!transient||attempt===3)throw Error(nativeError(reply));
@@ -343,7 +384,8 @@
    await validateContents(context.windowId,context.hostTabId,ownership);
    const registered=await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId});
    if(registered?.ok!==true||registered.window_id!==context.windowId||registered.host_tab_id!==context.hostTabId||registered.title!==context.title)throw Error('background_window_registration_rejected');
-   if(registered.manual_reveal===true)throw Error('background_window_manual_reveal');
+   if(await manualReveal(context,registered,token))throw Error('background_window_manual_reveal');
+   if(context.windowMode==='extension_minimized')await extensionVisibility(context,token,'minimized');
    // A verified hidden window remains the same window when only its active tab
    // changes. Other providers may work, but must not reselect the controller.
    if(renderLease.releasing){
@@ -356,14 +398,15 @@
   const reply=await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId});
   if(reply?.ok!==true||reply.window_id!==context.windowId||reply.host_tab_id!==context.hostTabId||!titlePattern.test(reply.title||''))throw Error('background_window_registration_rejected');
   // A controlled reveal pauses work before changing the user's active tab.
-  if(reply.manual_reveal===true)throw Error('background_window_manual_reveal');
+  if(await manualReveal(context,reply,token))throw Error('background_window_manual_reveal');
   if(reply.recovery_requested!==undefined&&(!reply.recovery_requested||typeof reply.recovery_requested.nonce!=='string'||!recoveryPattern.test(reply.recovery_requested.nonce)))throw Error('background_window_recovery_rejected');
   // Registration/manual mode is checked before restoring even a blank host.
   if(context.restoreHost)await restoreHost(context);
   context.title=reply.title;
   await chrome.storage.local.set({[stateKey]:context});cached=context;
   await validateContents(context.windowId,context.hostTabId,ownership);
-  // Verify the empty/already-owned window is truly hidden before moving pages.
+  // Verify the empty/already-owned window's negotiated background state before
+  // moving pages. macOS remains a minimized Chrome window, never native-hidden.
   await hide(context,token);
   const recovery=await restoreClosed(context,token,reply.recovery_requested,ownership);ownership=recovery.ownership;
   for(const {tab} of ownership.tabs){
@@ -388,7 +431,7 @@
     await chrome.storage.local.set({[recoveryKey]:recovery.nonce});recoveryPending=false;
    }catch(error){recoveryError=error?.message||'background_window_recovery_failed';}
   }
-  await health({ready:true,hidden:true,visible:false,verified:true,window_id:context.windowId,host_tab_id:context.hostTabId,managed_tabs:finalOwnership.tabs.length,missing_tab_ids:finalOwnership.missing,model_errors:modelErrors,recovery_pending:recoveryPending,...(recoveryError?{recovery_error:recoveryError}:{})});
+  await health({ready:true,...backgroundState(context),window_id:context.windowId,host_tab_id:context.hostTabId,managed_tabs:finalOwnership.tabs.length,missing_tab_ids:finalOwnership.missing,model_errors:modelErrors,recovery_pending:recoveryPending,...(recoveryError?{recovery_error:recoveryError}:{})});
   return {context,ownership:finalOwnership};
  }
  async function guarded(task){
@@ -404,7 +447,12 @@
    if(!saved.token)return false;
    let code=typeof failureCode==='string'&&/^(?:background_window_|owned_window_)[a-z_]+$/.test(failureCode)?failureCode:(failureCode?provider+'_background_window_unavailable':'');
    let candidates=[];
-   if(!code&&context&&id(context.windowId)&&id(context.hostTabId)&&windowHealth?.ready===true&&windowHealth.hidden===true&&windowHealth.verified===true&&windowHealth.visible===false&&windowHealth.window_id===context.windowId&&windowHealth.host_tab_id===context.hostTabId&&!windowHealth.model_errors?.[provider]){
+   let backgroundVerified=windowHealth?.verified===true&&windowHealth.visible===false&&windowHealth.hidden===true;
+   if(context?.windowMode==='extension_minimized'){
+    backgroundVerified=windowHealth?.verified===true&&windowHealth.visible===false&&windowHealth.hidden===false&&windowHealth.minimized===true&&windowHealth.window_mode==='extension_minimized'&&windowHealth.verification_source==='chrome_extension';
+    if(backgroundVerified)backgroundVerified=(await chrome.windows.get(context.windowId)).state==='minimized';
+   }
+   if(!code&&context&&id(context.windowId)&&id(context.hostTabId)&&windowHealth?.ready===true&&backgroundVerified&&windowHealth.window_id===context.windowId&&windowHealth.host_tab_id===context.hostTabId&&!windowHealth.model_errors?.[provider]){
     if(provider==='chatgpt'){
      const pool=saved.bridgePool;
      if(Array.isArray(pool)&&pool.length<=3&&pool.every(slot=>slot&&id(slot.tabId)&&providerUrl(provider,slot.url)))candidates=pool.map(slot=>({tabId:slot.tabId,url:slot.url,exact:true}));
@@ -522,7 +570,8 @@
    renderLease=lease;clearTimeout(activationTimer);activationTimer=null;
    try{
     await chrome.tabs.update(tabId,{active:true});
-    await health({ready:true,hidden:true,visible:false,verified:true,window_id:context.windowId,host_tab_id:context.hostTabId,rendering:true,rendering_provider:provider});
+    if(context.windowMode==='extension_minimized')await extensionVisibility(context,ownership.local.token,'minimized');
+    await health({ready:true,...backgroundState(context),window_id:context.windowId,host_tab_id:context.hostTabId,rendering:true,rendering_provider:provider});
     return lease.id;
    }catch(error){
     // No content script has been started by the caller yet. Restore the host
@@ -538,7 +587,7 @@
   const context=lease.context;
   const registered=checkManual?await request('/register',token,{window_id:context.windowId,host_tab_id:context.hostTabId}):null;
   if(registered&&(registered.ok!==true||registered.window_id!==context.windowId||registered.host_tab_id!==context.hostTabId||registered.title!==context.title))throw Error('background_window_registration_rejected');
-  if(registered?.manual_reveal===true){
+  if(registered&&await manualReveal(context,registered,token)){
    renderLease=null;clearTimeout(renderTimer);renderTimer=null;await chrome.storage.local.remove(renderKey);
    await health({ready:false,hidden:false,visible:true,verified:false,rendering:false,error:'background_window_manual_reveal'});return true;
   }
@@ -547,7 +596,7 @@
   await hide(context,token);
   if(renderLease?.id!==lease.id)return false;
   renderLease=null;clearTimeout(renderTimer);renderTimer=null;await chrome.storage.local.remove(renderKey);
-  await health({ready:true,hidden:true,visible:false,verified:true,window_id:context.windowId,host_tab_id:context.hostTabId,rendering:false});return true;
+  await health({ready:true,...backgroundState(context),window_id:context.windowId,host_tab_id:context.hostTabId,rendering:false});return true;
  }
  function releaseRendering(leaseId){
   return enqueue(()=>guarded(async()=>{

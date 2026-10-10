@@ -507,8 +507,8 @@ test('Doubao fresh UI falling into an existing chat retries the same owned tab a
 for(const reused of [false,true]){
  test(`Doubao ${reused?'rejects a saved chat redirected to':'prepares a new contact at'} home without a trailing slash`,async()=>{
   const time=clock(),home='https://www.doubao.com/chat',oldUrl='https://www.doubao.com/chat/111';
-  const old={url:oldUrl,name:'保留的虚构备注',lastTurnId:'old-turn'};
-  const tab={id:228,url:oldUrl},saved={doubaoOwnedTab:228,doubaoOwnedUrl:oldUrl,doubaoConversations:{old,...(reused?{new:{...old}}:{})}};
+   const old={url:'https://www.doubao.com/chat/222',name:'保留的虚构备注',lastTurnId:'old-turn'};
+   const tab={id:228,url:oldUrl},saved={doubaoOwnedTab:228,doubaoOwnedUrl:oldUrl,doubaoConversations:{old,...(reused?{new:{...old,url:oldUrl}}:{})}};
   const updates=[];let scripts=0,creates=0,resultBody;
   const chrome={
    storage:{local:{async get(item){return item==='token'?{token:'test-token'}:saved;},async set(values){Object.assign(saved,values);}}},

@@ -1,8 +1,10 @@
-"""Hide only the Chrome window registered by the authenticated browser bridge.
+"""Control only the Chrome window registered by the authenticated bridge.
 
 The extension keeps its private host tab active while calling ``hide``.  The
 native handle and process identity remain local; an HTTP caller never supplies
-a HWND.  Importing this module does not inspect or change desktop windows.
+a HWND. On macOS the extension minimizes its dedicated window and reports the
+observed Chrome state; this is never presented as native hiding. Importing this
+module does not inspect or change desktop windows.
 """
 from __future__ import annotations
 
@@ -18,7 +20,13 @@ import time
 from ctypes import wintypes
 from typing import Any
 
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:
+    # The macOS extension-only bridge has no process-inspection dependency.
+    psutil = None
+
+_NATIVE_ERRORS = (OSError, psutil.Error) if psutil is not None else (OSError,)
 
 
 STATE_KEY = "browser_bridge_window"
@@ -33,6 +41,18 @@ SW_RESTORE = 9
 
 class WindowControlError(RuntimeError):
     """A stable, non-sensitive error code safe to return to the bridge."""
+
+
+def capabilities() -> dict[str, Any]:
+    """Describe implementation support, without claiming a successful run."""
+    if sys.platform == "win32":
+        return {"platform": "windows", "mode": "native_hidden", "native_hide": True,
+                "extension_minimize": False, "fully_hidden": True}
+    if sys.platform == "darwin":
+        return {"platform": "macos", "mode": "extension_minimized", "native_hide": False,
+                "extension_minimize": True, "fully_hidden": False}
+    return {"platform": sys.platform, "mode": "unsupported", "native_hide": False,
+            "extension_minimize": False, "fully_hidden": False}
 
 
 def _identifier(value: Any) -> bool:
@@ -89,6 +109,8 @@ def _installed_chrome_paths() -> set[str]:
 
 
 def _chrome_identity(pid: int) -> dict[str, Any]:
+    if psutil is None:
+        raise WindowControlError("native_dependency_unavailable")
     process = psutil.Process(pid)
     with process.oneshot():
         executable = _path_key(os.path.realpath(process.exe()))
@@ -109,6 +131,8 @@ def _chrome_identity(pid: int) -> dict[str, Any]:
 
 
 def _process_start_time(pid: int) -> float | None:
+    if psutil is None:
+        raise WindowControlError("native_dependency_unavailable")
     try:
         return psutil.Process(pid).create_time()
     except psutil.NoSuchProcess:
@@ -263,6 +287,10 @@ def _result(state: dict[str, Any] | None, *, visible: bool | None = None, verifi
         result.update({key: state[key] for key in ("window_id", "host_tab_id", "title")})
     if error:
         result["error"] = error
+    if sys.platform == "darwin":
+        result.update(hidden=False, window_mode="extension_minimized",
+                      minimized=visible is False and verified,
+                      verification_source="chrome_extension" if verified else None)
     return result
 
 
@@ -274,6 +302,10 @@ def register(db, window_id: int, host_tab_id: int) -> dict[str, Any]:
         saved = db.get_state(STATE_KEY)
         same_registration = (_valid_state(saved) and saved["window_id"] == window_id
                              and saved["host_tab_id"] == host_tab_id)
+        if sys.platform == "darwin" and _valid_state(saved) and saved.get("native") is not None:
+            # A copied Windows database is not a macOS window-ownership proof.
+            # Keep the old restoration identity instead of silently discarding it.
+            return _result(saved, error="native_state_platform_mismatch")
         if _valid_state(saved) and saved.get("native") is not None:
             try:
                 bound = _bound_identity(saved)
@@ -291,13 +323,15 @@ def register(db, window_id: int, host_tab_id: int) -> dict[str, Any]:
                     db.set_state(STATE_KEY, saved)
             except WindowControlError as exc:
                 return _result(saved, error=str(exc))
-            except (OSError, psutil.Error):
+            except _NATIVE_ERRORS:
                 return _result(saved, error="native_access_failed")
         if same_registration:
             return _result(saved)
         state = {"window_id": window_id, "host_tab_id": host_tab_id,
                  "title": TITLE_PREFIX + secrets.token_hex(16), "native": None,
                  "visible": None, "hidden": False, "verified": False, "manual_reveal": False}
+        if sys.platform == "darwin":
+            state.update(window_mode="extension_minimized", minimized=False)
         db.set_state(STATE_KEY, state)
         return _result(state)
 
@@ -331,6 +365,11 @@ def retire_for_recovery(db, window_id: int, host_tab_id: int, nonce: str) -> dic
             return _result(state, error="recovery_nonce_mismatch")
         if state.get("manual_reveal") is True:
             return _result(state, error="background_window_manual_reveal")
+        if sys.platform == "darwin":
+            # A mixed window requires the Windows restoration proof used below.
+            # On macOS leave it alone; removing the unrelated tab lets the owned
+            # window resume without risking another browser window's contents.
+            return _result(state, error="background_window_mixed_tabs")
         try:
             bound = _bound_identity(state)
             already_retired = bound is None
@@ -368,7 +407,7 @@ def retire_for_recovery(db, window_id: int, host_tab_id: int, nonce: str) -> dic
                     "nonce": nonce, "code": "window_retired_for_recovery"}
         except WindowControlError as exc:
             return _result(state, error=str(exc))
-        except (OSError, psutil.Error):
+        except _NATIVE_ERRORS:
             return _result(state, error="native_access_failed")
 
 
@@ -384,6 +423,17 @@ def _set_visibility(db, visible: bool) -> dict[str, Any]:
             return _result(state, error="background_window_retired_for_recovery")
         if not visible and state.get("manual_reveal") is True:
             return _result(state, error="background_window_manual_reveal")
+        if sys.platform == "darwin":
+            if state.get("native") is not None:
+                return _result(state, error="native_state_platform_mismatch")
+            state.update(window_mode="extension_minimized", visible=None, hidden=False,
+                         minimized=False, verified=False, checked_at=time.time(), last_error=None)
+            if visible:
+                state["manual_reveal"] = True
+            db.set_state(STATE_KEY, state)
+            # The extension checks exact IDs, contents and Chrome's result before
+            # reporting. The backend cannot verify desktop visibility on macOS.
+            return {**_result(state), "action": "restore" if visible else "minimize"}
         try:
             native = _native_api()
             bound = _bound_identity(state)
@@ -417,7 +467,7 @@ def _set_visibility(db, visible: bool) -> dict[str, Any]:
             return _result(state, visible=actual, verified=True)
         except WindowControlError as exc:
             error = str(exc)
-        except (OSError, psutil.Error):
+        except _NATIVE_ERRORS:
             error = "native_access_failed"
         state.update(visible=None, hidden=False, verified=False,
                      checked_at=time.time(), last_error=error)
@@ -426,12 +476,12 @@ def _set_visibility(db, visible: bool) -> dict[str, Any]:
 
 
 def hide(db) -> dict[str, Any]:
-    """Use SW_HIDE and confirm IsWindowVisible is false for the registered window."""
+    """Hide on Windows, or request extension-owned minimization on macOS."""
     return _set_visibility(db, False)
 
 
 def show(db) -> dict[str, Any]:
-    """Restore only the previously bound window, even while an owned model tab is active."""
+    """Restore the owned window, or queue that extension action on macOS."""
     return _set_visibility(db, True)
 
 
@@ -442,5 +492,43 @@ def resume(db) -> dict[str, Any]:
         if not _valid_state(state):
             return _result(None, error="window_not_registered")
         state["manual_reveal"] = False
+        if sys.platform == "darwin":
+            state.update(visible=None, hidden=False, minimized=False, verified=False)
         db.set_state(STATE_KEY, state)
         return _result(state)
+
+
+def report_extension_visibility(db, window_id: int, host_tab_id: int,
+                                title: str, state: str) -> dict[str, Any]:
+    """Record an authenticated extension observation, never a native hide proof.
+
+    The route authenticates the bridge token. The extension validates its owned
+    host and every tab immediately around chrome.windows.update/get. Reports
+    from another registration or a superseded manual mode cannot change state.
+    """
+    with _WINDOW_LOCK:
+        saved = db.get_state(STATE_KEY)
+        if not _valid_state(saved):
+            return _result(None, error="window_not_registered")
+        if (not _identifier(window_id) or not _identifier(host_tab_id)
+                or saved["window_id"] != window_id or saved["host_tab_id"] != host_tab_id
+                or not isinstance(title, str) or saved["title"] != title):
+            return _result(saved, error="extension_window_registration_mismatch")
+        if sys.platform != "darwin":
+            return _result(saved, error="extension_window_visibility_unsupported")
+        if saved.get("native") is not None:
+            return _result(saved, error="native_state_platform_mismatch")
+        if "recovery_retirement" in saved:
+            return _result(saved, error="background_window_retired_for_recovery")
+        if state not in ("minimized", "normal"):
+            return _result(saved, error="extension_window_state_invalid")
+        expected = "normal" if saved.get("manual_reveal") is True else "minimized"
+        if state != expected:
+            return _result(saved, error="background_window_manual_reveal" if expected == "normal"
+                           else "extension_window_visibility_stale")
+        visible = state == "normal"
+        saved.update(window_mode="extension_minimized", visible=visible, minimized=not visible,
+                     hidden=False, verified=True, verification_source="chrome_extension",
+                     checked_at=time.time(), last_error=None)
+        db.set_state(STATE_KEY, saved)
+        return _result(saved, visible=visible, verified=True)

@@ -28,6 +28,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
     window_state=db.get_state('browser_bridge_window') or {}
     window_feedback=db.get_state('browser_window_feedback') or {}
     window_status=('临时显示，新网页任务已暂停' if window_state.get('manual_reveal') else
+                   '已最小化（Mac，未完全隐藏）' if window_state.get('window_mode') == 'extension_minimized' and window_state.get('minimized') and window_state.get('verified') else
                    '已真正隐藏' if window_state.get('hidden') and window_state.get('verified') and window_state.get('visible') is False else '等待后台窗口连接')
     drafts = db.list_drafts(status="pending", limit=60)
     events = db.recent_events(limit=60)
@@ -190,8 +191,9 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         async def register_browser_window(request: Request):
             bridge_auth(request)
             body = await request.json()
-            from app.browser_window import register
+            from app.browser_window import register, capabilities
             result = await asyncio.to_thread(register, db, body.get('window_id'), body.get('host_tab_id'))
+            result['capabilities'] = capabilities()
             recovery = db.get_state('browser_model_recovery') or {}
             if result.get('ok') and recovery.get('nonce') and not recovery.get('completed'):
                 result['recovery_requested'] = {'nonce': recovery['nonce']}
@@ -228,6 +230,16 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             if any(body.get(key) != state.get(key) for key in ('window_id','host_tab_id','title')):
                 raise HTTPException(409, '后台窗口身份不匹配')
             return await asyncio.to_thread(hide, db)
+
+        @app.post('/browser-bridge/window/visibility')
+        async def browser_window_visibility(request: Request):
+            bridge_auth(request)
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(400, '窗口状态参数无效')
+            from app.browser_window import report_extension_visibility
+            return await asyncio.to_thread(report_extension_visibility, db, body.get('window_id'),
+                                           body.get('host_tab_id'), body.get('title'), body.get('state'))
 
         @app.post('/browser-bridge/window/diagnostic')
         async def browser_window_diagnostic(request: Request):
@@ -292,8 +304,10 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                     raise HTTPException(409,'任务已过期或已处理')
                 if test_row:
                     db.set_state(test_row[1]+('_last_test_failure' if test_row[0] else '_last_failure'),{'code':code,'seen_at':time.time(),'is_test':bool(test_row[0])})
-                if test_row and (test_row[0] or test_row[1] in {'deepseek','doubao'}):
+                if test_row and test_row[0]:
                     db.add_event('browser_test_error','独立浏览器验证失败；未暂停生产回复')
+                elif test_row and test_row[1] in {'deepseek','doubao'}:
+                    db.add_event('browser_model_error', test_row[1]+' 网页任务失败：'+code+'；仅该任务转审核', level='error')
                 else:
                     from app.browser_health import failed
                     failed(config,db,body.get('error'))
@@ -383,7 +397,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         from app.browser_window import show
         result = await asyncio.to_thread(show, db)
         db.set_state('browser_window_feedback', {'ok':result.get('ok',False),
-                     'message':'后台网页已显示，新网页任务暂时停止；操作完成后请恢复后台。' if result.get('ok') else '后台窗口尚未就绪，请等待网页连接后再试。'})
+                     'message':('已请求显示 Mac 专用窗口，等待扩展确认；新网页任务暂停。' if result.get('action') == 'restore' else '后台网页已显示，新网页任务暂时停止；操作完成后请恢复后台。') if result.get('ok') else '后台窗口尚未就绪，请等待网页连接后再试。'})
         return RedirectResponse('/',status_code=303)
 
     @app.get('/browser-window/host', response_class=HTMLResponse)
@@ -409,7 +423,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         from app.browser_window import resume
         result = await asyncio.to_thread(resume, db)
         db.set_state('browser_window_feedback', {'ok':result.get('ok',False),
-                     'message':'已结束手动操作，等待连接器重新隐藏窗口并恢复生成。' if result.get('ok') else '后台窗口尚未登记，请等待连接。'})
+                     'message':('已结束手动操作，等待连接器最小化 Mac 专用窗口并恢复生成。' if result.get('window_mode') == 'extension_minimized' else '已结束手动操作，等待连接器重新隐藏窗口并恢复生成。') if result.get('ok') else '后台窗口尚未登记，请等待连接。'})
         return RedirectResponse('/',status_code=303)
 
     @app.post("/pause")

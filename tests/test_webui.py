@@ -214,3 +214,20 @@ def test_bridge_failure_retains_fixed_code_and_rejects_late_pollution(tmp_path):
     before=db.get_state('deepseek_last_test_failure')
     assert client.post('/browser-bridge/result',json={'id':'test','error':'private exception text'},headers=headers).status_code==409
     assert db.get_state('deepseek_last_test_failure')==before
+
+
+def test_daily_production_failure_is_not_a_test_or_global_pause(tmp_path):
+    import time
+    from app.config import AppConfig
+    from app.web_llm import WebReplyLLM
+    config=AppConfig(project_root=tmp_path,openai={'provider':'hybrid_web'})
+    db=Database(tmp_path/'health.sqlite3');client=TestClient(create_app(config,db))
+    queue=WebReplyLLM(config)
+    token=(config.resolve(config.paths.browser_bridge)/'pairing_token.txt').read_text().strip()
+    with queue.connect() as conn:
+        conn.execute("insert into jobs(id,status,created,expires,provider,is_test) values('prod','claimed',?,?,'doubao',0)",(time.time(),time.time()+60))
+    response=client.post('/browser-bridge/result',json={'id':'prod','error':'doubao_login_or_load'},headers={'authorization':'Bearer '+token})
+    assert response.status_code==200
+    assert not config.resolve(config.paths.pause_file).exists()
+    types=[event['event_type'] for event in db.recent_events()]
+    assert 'browser_model_error' in types and 'browser_test_error' not in types

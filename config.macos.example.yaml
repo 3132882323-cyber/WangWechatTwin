@@ -1,0 +1,53 @@
+# Mac 草稿版：只导入你提供的消息，不连接或发送本机微信。
+# 启动器首次复制成 config.macos.local.yaml；已有配置不会被覆盖。
+owner_name: 用户
+owner_alias: 我
+adapter: mock
+mode: shadow
+openai:
+  provider: hybrid_web
+  deepseek_drafts: false
+  deepseek_fast: true
+  web_reply_timeout_seconds: 180
+  primary_model: gpt-6
+  high_risk_model: gpt-6
+wechat:
+  poll_seconds: 2.0
+  allow_groups: false
+  allow_unknown_contacts: false
+  unknown_contact_mode: shadow
+  exact_contact_match: true
+  sender_all_existing_chats: false
+  sender_allowed_contacts: []
+  group_only_mentions: true
+  ignore_simple_acknowledgments: false
+  send_holding_on_review: false
+proactive:
+  enabled: false
+  review_only: true
+stickers:
+  enabled: false
+media:
+  voice_enabled: false
+  images_enabled: false
+local_api:
+  auto_load: false
+web:
+  enabled: true
+  host: 127.0.0.1
+  # 与 browser_extension 中的本机桥接地址保持一致。
+  port: 18769
+paths:
+  database: .runtime/macos/drafts.sqlite3
+  personal_database: .runtime/macos/personal_memory.sqlite3
+  browser_bridge: .runtime/macos/browser_bridge
+  history_reader: .runtime/macos/history_reader
+  role_profile: .runtime/macos/history_reader/role_profile.json
+  chat_memory: .runtime/macos/history_reader/chat_memory.sqlite3
+  style_history: .runtime/macos/history_reader/style_samples.sqlite3
+  learned_style: .runtime/macos/learned_style_summary.json
+  persona: data/persona.md
+  business_rules: data/business_rules.md
+  reply_samples: data/reply_samples.csv
+  pause_file: .runtime/macos/PAUSE
+contacts: []

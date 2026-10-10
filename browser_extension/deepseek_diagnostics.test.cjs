@@ -133,7 +133,7 @@ for(const [change,code] of [
   assert.deepEqual(fixture.saved.deepseekLastFailure.ready_state,{url_matches_expected:state.url===url,document_ready:state.ready,editor:state.editor,has_known_turn:state.hasKnownTurn,visible_users:1,visible_answers:1});
   assert.deepEqual(fixture.saved.deepseekConversations,fixture.before);
   assert.equal(fixture.calls.creates+fixture.calls.updates+fixture.calls.reply+fixture.calls.setup,0);
-  assert.ok(fixture.time.now()>=30000);
+  assert.ok(fixture.time.now()>=8000&&fixture.time.now()<8400);
  });
 }
 

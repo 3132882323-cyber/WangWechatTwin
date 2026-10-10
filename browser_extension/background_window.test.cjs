@@ -21,7 +21,7 @@ function harness(options={}){
  const session=structuredClone(options.session||{});
  const tabs=new Map((options.tabs||[]).map(tab=>[tab.id,{active:false,...structuredClone(tab)}]));
  const windows=new Map((options.windows||[{id:1,type:'normal',incognito:false}]).map(window=>[window.id,structuredClone(window)]));
- const calls={windows:[],creates:[],moves:[],updates:[],requests:[],titles:[],queries:[],scripts:[],messages:[],storageWrites:[]};
+ const calls={windows:[],windowUpdates:[],creates:[],moves:[],updates:[],requests:[],titles:[],queries:[],scripts:[],messages:[],storageWrites:[]};
  let nextWindow=100,nextTab=1000;
  const storage=target=>({
   async get(keys){
@@ -39,6 +39,11 @@ function harness(options={}){
   },
   windows:{
    async get(windowId){if(!windows.has(windowId))throw Error('window closed');return structuredClone(windows.get(windowId));},
+   async update(windowId,properties){
+    calls.windowUpdates.push({windowId,...structuredClone(properties)});const window=windows.get(windowId);if(!window)throw Error('window closed');
+    if(!options.ignoreWindowUpdate)Object.assign(window,structuredClone(properties));
+    options.onWindowUpdate?.(window,properties,{calls,tabs,windows});return structuredClone(window);
+   },
    async create(properties){
      calls.windows.push(structuredClone(properties));options.beforeWindowCreate?.(properties,{calls,tabs,windows});const window={id:nextWindow++,type:properties.type,incognito:false,state:properties.state,focused:properties.focused};windows.set(window.id,window);
      let tab;
@@ -77,6 +82,7 @@ function harness(options={}){
   const body=request.body?JSON.parse(request.body):{},kind=url.split('/').at(-1);
   calls.requests.push({kind,...request,body,bodyText:request.body});
   const reply={ok:true,window_id:body.window_id,host_tab_id:body.host_tab_id,title,manual_reveal:options.manualReveal===true};
+  if(kind==='register'&&options.platform==='macos')reply.capabilities={platform:'macos',mode:'extension_minimized',native_hide:false,extension_minimize:true,fully_hidden:false};
   if(kind==='next')return {ok:true,async json(){return {job:null};}};
   if(kind==='register'&&options.recoveryNonce!==undefined)reply.recovery_requested={nonce:options.recoveryNonce};
   if(kind==='recovered')reply.nonce=body.nonce;
@@ -84,8 +90,10 @@ function harness(options={}){
   if(kind==='hide'){
    if(options.manualReveal){Object.assign(reply,{ok:false,hidden:false,visible:null,verified:false,error:'background_window_manual_reveal'});}
    else Object.assign(reply,{hidden:true,visible:false,verified:true});
+   if(options.platform==='macos'&&!options.manualReveal)Object.assign(reply,{action:'minimize',window_mode:'extension_minimized',hidden:false,visible:null,verified:false});
    options.onHide?.({tabs,windows,calls,reply});
   }
+  if(kind==='visibility')Object.assign(reply,{window_mode:'extension_minimized',hidden:false,visible:body.state==='normal',minimized:body.state==='minimized',verified:true,verification_source:'chrome_extension'});
   options.reply?.(kind,reply,body);
   if(kind==='retire-for-recovery'&&reply.ok===true&&reply.retired===true&&reply.visible===true&&reply.verified===true&&reply.manual_reveal===false&&reply.nonce===body.nonce)windows.get(body.window_id).visible=true;
   if(kind==='recovered'&&reply.ok===true&&reply.nonce===body.nonce&&reply.window_id===body.window_id&&reply.host_tab_id===body.host_tab_id)delete options.recoveryNonce;
@@ -124,6 +132,113 @@ function renderingHarness(){
   await fixture.api().releaseRendering('not-the-owner');
  };
  return fixture;
+}
+
+test('macOS uses a dedicated minimized window and never claims native hiding',async()=>{
+ const fixture=harness({...ownedOptions(),platform:'macos'});
+ const state=await fixture.api().ensure('deepseek');
+ assert.equal(state.windowMode,'extension_minimized');
+ assert.equal(fixture.windows.get(state.windowId).state,'minimized');
+ assert.equal(fixture.tabs.get(99).windowId,1);assert.equal(fixture.tabs.get(99).active,true);
+ assert.equal(fixture.tabs.get(98).windowId,1);
+ assert.equal(fixture.calls.moves.length,5);
+ const health=fixture.local.bridgeBackgroundWindowHealth;
+ assert.equal(health.ready,true);assert.equal(health.hidden,false);assert.equal(health.minimized,true);
+ assert.equal(health.verified,true);assert.equal(health.verification_source,'chrome_extension');
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='visibility').length,2);
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='heartbeat').at(-1).body.blocked,false);
+ fixture.windows.get(state.windowId).state='normal';
+ await fixture.api().ensure();
+ assert.deepEqual(fixture.calls.windowUpdates,[{windowId:state.windowId,state:'minimized'}]);
+ assert.equal(fixture.calls.windowUpdates.some(call=>call.windowId===1),false);
+});
+
+test('macOS refuses readiness when Chrome does not confirm minimization',async()=>{
+ const fixture=harness({...ownedOptions(),platform:'macos',ignoreWindowUpdate:true,
+  onWindowCreate(_tab,window){window.state='normal';}
+ });
+ await assert.rejects(fixture.api().ensure('deepseek'),/background_window_visibility_unverified/);
+ assert.equal(fixture.calls.moves.length,0);
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='visibility').length,0);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.ready,false);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.hidden,false);
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='heartbeat').at(-1).body.blocked,true);
+});
+
+test('macOS manual reveal restores only the owned window then blocks new work until resumed',async()=>{
+ const fixture=harness({...ownedOptions(),platform:'macos'});const state=await fixture.api().ensure();
+ fixture.options.manualReveal=true;
+ await assert.rejects(fixture.api().ensure('deepseek'),/background_window_manual_reveal/);
+ assert.deepEqual(fixture.calls.windowUpdates,[{windowId:state.windowId,state:'normal',focused:true}]);
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='visibility').at(-1).body.state,'normal');
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='heartbeat').at(-1).body.blocked,true);
+ fixture.options.manualReveal=false;await fixture.api().ensure('deepseek');
+ assert.equal(fixture.windows.get(state.windowId).state,'minimized');
+ assert.deepEqual(fixture.calls.windowUpdates.at(-1),{windowId:state.windowId,state:'minimized'});
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.hidden,false);
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='heartbeat').at(-1).body.blocked,false);
+});
+
+test('macOS render leases preserve truthful minimized health and leave the rendering tab active',async()=>{
+ const fixture=renderingHarness();fixture.options.platform='macos';const state=await fixture.api().ensure();
+ const lease=await fixture.api().acquireRendering(12,'doubao','mac-turn');
+ await fixture.api().ensureOwnedTab(11,'deepseek');
+ assert.equal(fixture.tabs.get(12).active,true);assert.equal(fixture.windows.get(state.windowId).state,'minimized');
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.hidden,false);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.minimized,true);
+ await fixture.api().releaseRendering(lease);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.hidden,false);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.minimized,true);
+ assert.equal(fixture.tabs.get(state.hostTabId).active,true);
+});
+
+test('macOS restored windows cannot emit ready heartbeats from a stale minimized receipt',async()=>{
+ const fixture=harness({...ownedOptions(),platform:'macos'});const state=await fixture.api().ensure();
+ fixture.windows.get(state.windowId).state='normal';
+ await fixture.api().pulse('deepseek');
+ assert.equal(fixture.calls.requests.filter(call=>call.kind==='heartbeat').at(-1).body.blocked,true);
+ assert.equal(fixture.calls.windowUpdates.length,0);
+});
+
+test('macOS rechecks window contents immediately before minimization and preserves personal tabs',async()=>{
+ const fixture=harness({...ownedOptions(),platform:'macos'});const state=await fixture.api().ensure();
+ fixture.windows.get(state.windowId).state='normal';
+ const before=fixture.calls.windowUpdates.length;
+ fixture.options.onHide=({tabs})=>{tabs.set(88,{id:88,windowId:state.windowId,url:'https://personal.example/',active:true});};
+ await assert.rejects(fixture.api().ensure(),/background_window_mixed_tabs/);
+ assert.equal(fixture.calls.windowUpdates.length,before);
+ assert.equal(fixture.windows.get(state.windowId).state,'normal');
+ assert.equal(fixture.tabs.get(88).windowId,state.windowId);
+});
+
+test('macOS mixed-window recovery fails closed without native retirement or moving the host',async()=>{
+ const fixture=harness({...ownedOptions(),platform:'macos'});const state=await fixture.api().ensure();
+ fixture.tabs.set(88,{id:88,windowId:state.windowId,url:'https://personal.example/',active:true});
+ fixture.options.recoveryNonce=recoveryNonce;
+ const before={updates:fixture.calls.windowUpdates.length,moves:fixture.calls.moves.length,windows:fixture.calls.windows.length};
+ await assert.rejects(fixture.api().ensure(),/background_window_mixed_tabs/);
+ assert.equal(fixture.calls.requests.some(call=>call.kind==='retire-for-recovery'),false);
+ assert.equal(fixture.calls.windowUpdates.length,before.updates);assert.equal(fixture.calls.moves.length,before.moves);
+ assert.equal(fixture.calls.windows.length,before.windows);assert.equal(fixture.tabs.get(state.hostTabId).windowId,state.windowId);
+});
+
+for(const changed of [{verified:false},{hidden:true},{window_id:999},{host_tab_id:999},{title:'wrong'},
+ {minimized:false},{visible:true},{verification_source:'native'},{window_mode:'native_hidden'},{manual_reveal:true}]){
+ test('macOS rejects mismatched or unverified extension visibility receipt '+JSON.stringify(changed),async()=>{
+  const fixture=harness({...ownedOptions(),platform:'macos',reply(kind,reply){if(kind==='visibility')Object.assign(reply,changed);}});
+  await assert.rejects(fixture.api().ensure(),/background_window_visibility_rejected/);
+  assert.equal(fixture.calls.moves.length,0);assert.equal(fixture.local.bridgeBackgroundWindowHealth.ready,false);
+ });
+}
+
+for(const capability of [{platform:'linux',mode:'unsupported'},{platform:'macos',mode:'native_hidden',native_hide:false},
+ {platform:'macos',mode:'extension_minimized',native_hide:false,extension_minimize:true,fully_hidden:true}]){
+ test('unsupported or contradictory window capability fails closed '+JSON.stringify(capability),async()=>{
+  const fixture=harness({...ownedOptions(),reply(kind,reply){if(kind==='register')reply.capabilities=capability;}});
+  await assert.rejects(fixture.api().ensure(),/background_window_platform_unsupported/);
+  assert.equal(fixture.calls.moves.length,0);assert.equal(fixture.calls.windowUpdates.length,0);
+  assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,0);
+ });
 }
 
 test('Doubao exclusively renders in the hidden owned window while DeepSeek and GPT stay inactive',async()=>{
