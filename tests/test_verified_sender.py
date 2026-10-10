@@ -1,3 +1,9 @@
+import sys
+import pytest
+
+if sys.platform != "win32":
+    pytest.skip("Windows GUI sender contract; no Mac native sender is implemented", allow_module_level=True)
+
 from types import SimpleNamespace
 
 import pytest
