@@ -218,6 +218,14 @@ def install_agent(root: Path, config: Path, *, home: Path | None = None) -> Path
     planned = make_launch_agent(root, python, config)
     if existing is not None and existing != planned:
         raise MacSetupError("已有自启使用另一份配置或设置，未覆盖；请先 uninstall 再 install。")
+    target = service_target()
+    if launchctl("print", target).returncode == 0:
+        if existing is None:
+            # A loaded job retains its original arguments after its plist is
+            # removed. Do not create a new checkout's ownership file over it.
+            raise MacSetupError("检测到已加载的同名服务，但缺少本目录自启文件；未写入或接管。请先从原目录处理旧服务。")
+        print("此目录的登录自启已加载，未重复启动。")
+        return path
     if existing is None:
         path.parent.mkdir(parents=True, exist_ok=True)
         (root / ".runtime" / "macos").mkdir(parents=True, exist_ok=True)
@@ -227,10 +235,6 @@ def install_agent(root: Path, config: Path, *, home: Path | None = None) -> Path
             raise MacSetupError("登录自启文件刚被其他进程创建，未覆盖；请重新核对。") from None
         with os.fdopen(fd, "wb") as stream:
             plistlib.dump(planned, stream)
-    target = service_target()
-    if launchctl("print", target).returncode == 0:
-        print("此目录的登录自启已加载，未重复启动。")
-        return path
     result = launchctl("enable", target)
     if result.returncode:
         raise MacSetupError(f"launchctl enable 失败：{result.stderr.strip()}")

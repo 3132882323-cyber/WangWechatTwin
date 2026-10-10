@@ -166,6 +166,25 @@ def test_install_does_not_replace_an_agent_from_another_checkout(monkeypatch, tm
     assert path.read_bytes() == saved
 
 
+def test_loaded_job_without_plist_cannot_be_adopted_by_another_checkout(monkeypatch, tmp_path):
+    ready_mac(monkeypatch)
+    root, config = prepared_project(tmp_path)
+    home = tmp_path / "home"
+    calls = []
+    saved_config = config.read_bytes()
+    monkeypatch.setattr(macos, "launchctl", lambda *args: calls.append(args) or result())
+    monkeypatch.setattr(macos.os, "open", lambda *args: pytest.fail("must not create an ownership file"))
+    with pytest.raises(macos.MacSetupError, match="缺少本目录自启文件"):
+        macos.install_agent(root, config, home=home)
+    assert calls == [("print", "gui/501/" + macos.LABEL)]
+    assert not home.exists() and not (root / ".runtime").exists()
+    assert config.read_bytes() == saved_config
+    # With no newly created ownership file, this checkout cannot stop the
+    # previous checkout's still-running service either.
+    macos.stop_agent(root, home=home, uninstall=True)
+    assert calls == [("print", "gui/501/" + macos.LABEL)]
+
+
 def test_install_does_not_replace_existing_agent_settings(monkeypatch, tmp_path):
     ready_mac(monkeypatch)
     root, config = prepared_project(tmp_path)
