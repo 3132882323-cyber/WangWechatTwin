@@ -30,7 +30,7 @@ def test_draft_import_cannot_send_even_with_auto_config(tmp_path, monkeypatch, c
     assert len(drafts)==1 and drafts[0].reply=='啥面'
 
 
-@pytest.mark.parametrize('value',[[],[{'contact':'x','content':'y','media_paths':['private.png']}],{'contact':'x','content':2},[{'contact':'x','content':'y'}]*101])
+@pytest.mark.parametrize('value',[[],[{'contact':'x','content':'y','media_paths':['private.png']}],{'contact':'x','content':2}, {'contact':'x','content':'y','chat_type':[]}, {'contact':'x','content':'y','chat_type':{}},[{'contact':'x','content':'y'}]*101])
 def test_invalid_import_has_no_database_side_effect(tmp_path,monkeypatch,value):
     monkeypatch.setattr(cli,'load_config',lambda path:pytest.fail('config touched before input validated'))
     source=tmp_path/'bad.json';source.write_text(json.dumps(value),encoding='utf-8')

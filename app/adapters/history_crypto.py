@@ -57,9 +57,21 @@ if sys.platform == 'win32':
     _bcrypt.BCryptSetProperty.argtypes = [wt.HANDLE, ctypes.c_wchar_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_ulong]
     _bcrypt.BCryptGenerateSymmetricKey.argtypes = [wt.HANDLE, ctypes.POINTER(wt.HANDLE), ctypes.c_char_p, ctypes.c_ulong, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_ulong]
     _bcrypt.BCryptDecrypt.argtypes = [wt.HANDLE, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_char_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_ulong]
+    _bcrypt.BCryptDestroyKey.argtypes = [wt.HANDLE]
+    _bcrypt.BCryptCloseAlgorithmProvider.argtypes = [wt.HANDLE, ctypes.c_ulong]
 
 def aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
-    """AES-256-CBC 解密（无 padding），走 CNG 的 bcrypt.dll。"""
+    """Raw AES-CBC, without unpadding; callers authenticate each page first.
+
+    Windows retains CNG. Other hosts use the optional PyCryptodome primitive;
+    this does not add support for macOS WeChat key extraction or DB formats.
+    """
+    if sys.platform != 'win32':
+        try:
+            from Crypto.Cipher import AES
+        except ImportError as exc:
+            raise RuntimeError('非 Windows AES-CBC 解密需要可选依赖 pycryptodome') from exc
+        return AES.new(key, AES.MODE_CBC, iv=iv).decrypt(data)
     h_alg = wt.HANDLE()
     status = _bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(h_alg), 'AES', None, 0)
     if status != 0:
@@ -106,5 +118,3 @@ def _decrypt_page(enc_key: bytes, page_data: bytes, pgno: int) -> bytes:
         encrypted = page_data[:PAGE_SZ - RESERVE_SZ]
         decrypted = aes_cbc_decrypt(enc_key, iv, encrypted)
         return decrypted + b'\x00' * RESERVE_SZ
-_bcrypt.BCryptDestroyKey.argtypes = [wt.HANDLE]
-_bcrypt.BCryptCloseAlgorithmProvider.argtypes = [wt.HANDLE, ctypes.c_ulong]

@@ -6,8 +6,6 @@ if sys.platform != "win32":
 
 from types import SimpleNamespace
 
-import pytest
-
 from app.adapters.verified_sender import HistoryVerifiedSender
 
 

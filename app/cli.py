@@ -369,7 +369,7 @@ def command_draft(args: argparse.Namespace) -> int:
                 raise ValueError('contact/content 必须为非空且长度有效的文字')
             if 'sender' in item and (not isinstance(item['sender'],str) or not item['sender'].strip() or len(item['sender']) > 256):
                 raise ValueError('sender 字段无效')
-            if item.get('chat_type','friend') not in {'friend','group'} or item.get('message_type','text') != 'text':
+            if not isinstance(item.get('chat_type','friend'), str) or item.get('chat_type','friend') not in {'friend','group'} or item.get('message_type','text') != 'text':
                 raise ValueError('此入口仅接受私聊或群聊文字')
     except (OSError, ValueError, UnicodeError):
         print('草稿输入无效：请使用不超过 1 MiB 的 UTF-8 消息 JSON', file=sys.stderr)
