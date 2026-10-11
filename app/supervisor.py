@@ -59,12 +59,24 @@ def main():
     parser.add_argument('--config', default='config.http-api.yaml')
     args = parser.parse_args()
     from app.config import load_config
-    from app.cli import SingleInstanceLock
+    from app.instance_lock import SingleInstanceLock
     config = load_config(args.config)
     root = config.resolve('.runtime/startup')
     lock = SingleInstanceLock(root / 'supervisor.lock')
     if not lock.acquire():
-        return 0
+        reason = getattr(lock, 'failure_reason', None) or 'unknown'
+        diagnostic = getattr(lock, 'diagnostic', None) or reason
+        event = {'at': time.time(), 'pid': os.getpid(),
+                 'event': 'supervisor_lock_rejected', 'reason': reason,
+                 'diagnostic': str(diagnostic)}
+        print(f"supervisor lock rejected ({reason}): {diagnostic}", file=sys.stderr, flush=True)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            with (root / 'startup.jsonl').open('a', encoding='utf-8') as log:
+                log.write(json.dumps(event, ensure_ascii=False) + '\n')
+        except OSError as exc:
+            print(f"supervisor startup log unavailable: {exc}", file=sys.stderr, flush=True)
+        return 0 if reason in {'locked', 'legacy_owner_active'} else 2
     try:
         def healthy(pid):
             import sqlite3

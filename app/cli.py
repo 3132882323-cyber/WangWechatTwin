@@ -23,70 +23,7 @@ from app.webui import start_webui
 
 
 
-class SingleInstanceLock:
-    def __init__(self, path: Path):
-        self.path = path
-        self.fd: int | None = None
-
-    @staticmethod
-    def _alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if sys.platform == "win32":
-            # os.kill(pid, 0) terminates processes on Windows; query instead.
-            import ctypes
-            from ctypes import wintypes
-
-            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel.OpenProcess.restype = wintypes.HANDLE
-            kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-            handle = kernel.OpenProcess(0x1000, False, pid)
-            if not handle:
-                return ctypes.get_last_error() == 5  # Access denied: assume alive.
-            try:
-                code = wintypes.DWORD()
-                if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
-                    return True
-                return code.value == 259  # STILL_ACTIVE
-            finally:
-                kernel.CloseHandle(handle)
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-
-    def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            try:
-                old_pid = int(self.path.read_text(encoding="utf-8").strip())
-            except Exception:
-                old_pid = -1
-            if self._alive(old_pid):
-                return False
-            self.path.unlink(missing_ok=True)
-        try:
-            self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self.fd, str(os.getpid()).encode("ascii"))
-            return True
-        except FileExistsError:
-            return False
-
-    def release(self) -> None:
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
-        self.path.unlink(missing_ok=True)
+from app.instance_lock import SingleInstanceLock
 
 def merge_incoming_messages(messages: list[IncomingMessage], *, separate_media: bool=False) -> list[IncomingMessage]:
     """Merge a burst from the same conversation into one coherent turn."""
@@ -272,7 +209,8 @@ def command_run(args: argparse.Namespace) -> int:
     db.cleanup(config.memory.retain_message_days)
     lock = SingleInstanceLock(config.resolve(config.paths.database).parent / "RUNNING.lock")
     if not lock.acquire():
-        print("检测到另一个数字分身进程正在运行。请先关闭原运行窗口。", file=sys.stderr)
+        print("实例锁未取得：" + lock.diagnostic, file=sys.stderr, flush=True)
+        db.add_event("runtime_lock_rejected", lock.failure_reason, level="warning")
         return 2
 
     adapter = None

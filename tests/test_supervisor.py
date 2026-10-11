@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from app.supervisor import supervise
 
 
@@ -24,7 +28,6 @@ def test_explicit_supervisor_stop_prevents_launch(tmp_path):
 
 
 def test_real_child_crash_is_restarted_without_touching_wechat(tmp_path):
-    import json
     import sys
     script = tmp_path / 'isolated_child.py'
     marker = tmp_path / 'starts.txt'
@@ -67,3 +70,39 @@ def test_windows_launcher_runtime_is_recognized_as_owned(monkeypatch):
     monkeypatch.setattr(psutil, 'Process', lambda pid: SimpleNamespace(parents=lambda: [SimpleNamespace(pid=12)]))
     assert owns_process(12, 34)
     assert not owns_process(99, 34)
+
+
+@pytest.mark.parametrize(('reason', 'expected_code'), [
+    ('locked', 0),
+    ('legacy_owner_active', 0),
+    ('lock_io_error', 2),
+])
+def test_rejected_supervisor_lock_leaves_startup_diagnostic(
+        monkeypatch, tmp_path, capsys, reason, expected_code):
+    from types import SimpleNamespace
+    import app.config
+    import app.instance_lock
+    import app.supervisor
+
+    class RejectedLock:
+        failure_reason = reason
+        diagnostic = 'lock diagnostic'
+
+        def __init__(self, path):
+            assert path == tmp_path / 'supervisor.lock'
+
+        def acquire(self):
+            return False
+
+    monkeypatch.setattr(app.config, 'load_config',
+                        lambda path: SimpleNamespace(resolve=lambda ignored: tmp_path))
+    monkeypatch.setattr(app.instance_lock, 'SingleInstanceLock', RejectedLock)
+    monkeypatch.setattr(app.supervisor.sys, 'argv', ['supervisor', '--config', 'test.yaml'])
+
+    assert app.supervisor.main() == expected_code
+    event = json.loads((tmp_path / 'startup.jsonl').read_text(encoding='utf-8'))
+    assert event['event'] == 'supervisor_lock_rejected'
+    assert event['reason'] == reason
+    assert event['diagnostic'] == 'lock diagnostic'
+    assert event['pid'] > 0
+    assert 'lock diagnostic' in capsys.readouterr().err
