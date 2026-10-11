@@ -11,7 +11,24 @@ from pydantic import BaseModel, Field, model_validator
 from app.models import ContactProfile
 
 
+class LocalProxySettings(BaseModel):
+    enabled: bool = False
+    base_url: str
+    api_key_file: str
+    session_db: str = ".runtime/local_proxy/sessions.sqlite3"
+    timeout_seconds: float = Field(default=45, ge=1, le=120)
+
+    @model_validator(mode="after")
+    def require_loopback_proxy(self):
+        if self.base_url not in {"http://127.0.0.1:19655/v1", "http://127.0.0.1:19656/v1"}:
+            raise ValueError("local proxy must use its fixed loopback endpoint")
+        if not self.api_key_file.strip():
+            raise ValueError("local proxy requires a private API key file")
+        return self
+
+
 class OpenAISettings(BaseModel):
+    local_proxies: dict[Literal["deepseek", "doubao"], LocalProxySettings] = Field(default_factory=dict)
     deepseek_drafts: bool=False
     deepseek_fast: bool=False
     provider: Literal["auto", "api", "account", "web", "deepseek_web", "doubao_web", "hybrid_web"] = "auto"
@@ -20,6 +37,19 @@ class OpenAISettings(BaseModel):
     high_risk_model: str = "gpt-6.1-sol"
     timeout_seconds: float = 30.0
     max_output_tokens: int = 600
+
+    @model_validator(mode="after")
+    def validate_proxy_lanes(self):
+        session_files = {item.session_db for item in self.local_proxies.values() if item.enabled}
+        if len(session_files) > 1:
+            raise ValueError("enabled local proxy lanes must share their session database")
+        for lane, settings in self.local_proxies.items():
+            expected = "http://127.0.0.1:" + ("19655" if lane == "deepseek" else "19656") + "/v1"
+            if settings.base_url != expected:
+                raise ValueError("local proxy endpoint does not match its lane")
+        if any(item.enabled for item in self.local_proxies.values()) and self.provider != "hybrid_web":
+            raise ValueError("local proxy lanes require hybrid_web routing")
+        return self
 
 
 class WeChatSettings(BaseModel):

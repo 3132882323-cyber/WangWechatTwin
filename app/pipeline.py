@@ -250,6 +250,11 @@ class ReplyPipeline:
         vision_ready=(self.db.get_state('browser_bridge') or {}).get('build') in {'sticker-vision-v1','fast-sticker-v2'}
         media_route=ReplyLLM.route(json.dumps({'incoming':{'content':message.content,'message_type':message.message_type},'__media_paths':message.media_paths}),risk.level)
         if media_route=='doubao' and self.config.openai.provider in {'hybrid_web','doubao_web'}:vision_ready=bool((self.db.get_state('doubao_bridge') or {}).get('ready'))
+        proxy = self.config.openai.local_proxies.get('doubao')
+        if media_route == 'doubao' and proxy and proxy.enabled:
+            # The adapter validates media and the actual response. A browser
+            # heartbeat must not disable the independent HTTP transport.
+            vision_ready = True
         recognized_sticker=message.message_type=='sticker' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web','doubao_web'} and vision_ready
         recognized_image=message.message_type=='image' and 0<len(message.media_paths)<=3 and self.config.openai.provider in {'web','hybrid_web','doubao_web'} and vision_ready
         if message.message_type != "text" and not (recognized_sticker or recognized_image):

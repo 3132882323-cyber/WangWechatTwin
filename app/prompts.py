@@ -106,6 +106,7 @@ class PromptBuilder:
             'conversation_key': hashlib.sha256((message.contact+'|'+self.identity_fingerprint).encode('utf-8')).hexdigest(),
             "contact_profile": contact.model_dump(),
             "incoming": {
+                "external_id": message.external_id,
                 "sender": message.sender,
                 'sender_key':message.sender_key,
                 "content": message.content,

@@ -350,6 +350,39 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 return now - value
             return None
         for provider in required:
+            proxy = config.openai.local_proxies.get(provider)
+            if proxy and proxy.enabled:
+                import socket
+                from urllib.parse import urlsplit
+                endpoint = urlsplit(proxy.base_url)
+                try:
+                    with socket.create_connection((endpoint.hostname, endpoint.port), timeout=0.25):
+                        reachable = True
+                except OSError:
+                    reachable = False
+                verified_at = None
+                try:
+                    import sqlite3
+                    session_path = config.resolve(proxy.session_db)
+                    if session_path.exists():
+                        with sqlite3.connect(session_path.as_uri() + '?mode=ro', uri=True, timeout=0.25) as session_db:
+                            verified_at = session_db.execute(
+                                "SELECT max(created) FROM local_proxy_turns WHERE lane=? AND status='done'", (provider,)
+                            ).fetchone()[0]
+                except (OSError, sqlite3.Error):
+                    verified_at = None
+                verified_age = age_of(verified_at)
+                recent_inference = verified_age is not None and verified_age <= 120
+                model_bridges[provider] = {
+                    'status': 'ready' if reachable and recent_inference else 'reachable_unverified' if reachable else 'unreachable',
+                    'transport': 'local_http_proxy',
+                    'transport_reachable': reachable,
+                    'inference_verified': reachable and recent_inference,
+                    'inference_seen_at': verified_at,
+                    'heartbeat_seen_at': None,
+                    'seen_at': None,
+                }
+                continue
             key = 'browser_bridge' if provider == 'chatgpt' else provider + '_bridge'
             state = db.get_state(key) or {}
             pulse = state.get('heartbeat_seen_at')
