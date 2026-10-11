@@ -49,6 +49,10 @@ def proxy(tmp_path, monkeypatch):
             state["requests"].append({"path": self.path, "body": body,
                                       "authorization": self.headers.get("Authorization")})
             state["started"].set()
+            if state.get("drop_after_read"):
+                # The full request was received, but its outcome is unknown.
+                self.close_connection = True
+                return
             if state["gate"]:
                 state["gate"].wait(3)
             time.sleep(state.get("header_delay", 0))
@@ -149,6 +153,50 @@ def test_completed_external_id_is_never_resubmitted_in_another_lane(proxy):
     call(LocalProxyReplyLLM(config, "deepseek"))
     with pytest.raises(LLMError, match="local_proxy_duplicate_turn"):
         call(LocalProxyReplyLLM(config, "doubao"))
+    assert len(state["requests"]) == 1
+
+
+@pytest.mark.parametrize("lane", ["deepseek", "doubao"])
+def test_refused_before_request_keeps_old_turn_but_allows_new_message(proxy, monkeypatch, lane):
+    config, state = proxy
+    actual_factory = http.client.HTTPConnection
+
+    class RefusedConnection:
+        def connect(self):
+            raise ConnectionRefusedError("mock local listener is down")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.local_proxy_llm.http.client.HTTPConnection",
+                        lambda *args, **kwargs: RefusedConnection())
+    adapter = LocalProxyReplyLLM(config, lane)
+    with pytest.raises(LLMError, match="local_proxy_not_submitted") as error:
+        call(adapter)
+    assert error.value.fallback_safe is False
+    assert not state["requests"]
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT status FROM local_proxy_turns WHERE lane=?", (lane,)).fetchone()[0] == "not_submitted"
+        assert db.execute("SELECT state FROM local_proxy_sessions WHERE lane=?", (lane,)).fetchone()[0] == "ready"
+
+    monkeypatch.setattr("app.local_proxy_llm.http.client.HTTPConnection", actual_factory)
+    with pytest.raises(LLMError, match="local_proxy_not_submitted"):
+        call(LocalProxyReplyLLM(config, lane))
+    assert not state["requests"]
+    assert call(LocalProxyReplyLLM(config, lane), payload(external_id="turn-2")).action == "send"
+    assert len(state["requests"]) == 1
+
+
+def test_disconnect_after_request_still_blocks_new_turn(proxy):
+    config, state = proxy
+    state["drop_after_read"] = True
+    adapter = LocalProxyReplyLLM(config, "deepseek")
+    with pytest.raises(LLMError, match="local_proxy_request_unknown"):
+        call(adapter)
+    assert len(state["requests"]) == 1
+    state["drop_after_read"] = False
+    with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+        call(adapter, payload(external_id="turn-2"))
     assert len(state["requests"]) == 1
 
 

@@ -38,6 +38,10 @@ def _fail(code: str) -> LLMError:
     return LLMError(code, fallback_safe=False)
 
 
+class _NoSubmission(Exception):
+    """The TCP connection failed before HTTP request bytes could be sent."""
+
+
 class LocalProxyReplyLLM:
     def __init__(self, config, lane: str):
         self.config = config
@@ -88,8 +92,10 @@ class LocalProxyReplyLLM:
                 WHERE conversation_key=? AND request_key=?""",
                 (conversation_key, request_key)).fetchone()
             if previous:
-                raise _fail("local_proxy_unknown_result" if previous[0] != "done"
-                            else "local_proxy_duplicate_turn")
+                code = ("local_proxy_duplicate_turn" if previous[0] == "done" else
+                        "local_proxy_not_submitted" if previous[0] == "not_submitted" else
+                        "local_proxy_unknown_result")
+                raise _fail(code)
             # A shared DB also prevents a later local lane from continuing an
             # unresolved contact turn under a different model.
             blocked = db.execute("""SELECT 1 FROM local_proxy_sessions
@@ -112,6 +118,21 @@ class LocalProxyReplyLLM:
             db.execute("UPDATE local_proxy_sessions SET state='pending' WHERE lane=? AND conversation_key=?",
                        (self.lane, conversation_key))
             return session
+
+    def _not_submitted(self, conversation_key, request_key):
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            updated = db.execute("""UPDATE local_proxy_turns
+                SET status='not_submitted',error_code='local_proxy_not_submitted'
+                WHERE lane=? AND conversation_key=? AND request_key=? AND status='pending'""",
+                (self.lane, conversation_key, request_key)).rowcount
+            if updated != 1:
+                raise _fail("local_proxy_state_conflict")
+            updated = db.execute("""UPDATE local_proxy_sessions SET state='ready'
+                WHERE lane=? AND conversation_key=? AND state='pending'""",
+                (self.lane, conversation_key)).rowcount
+            if updated != 1:
+                raise _fail("local_proxy_state_conflict")
 
     def _unknown(self, conversation_key, request_key, code):
         with self._connect() as db:
@@ -189,6 +210,14 @@ class LocalProxyReplyLLM:
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
         deadline = time.monotonic() + self.timeout
         try:
+            try:
+                connection.connect()
+            except Exception:
+                # HTTPConnection.connect only opens the local TCP socket. No
+                # request bytes have been handed to the transport yet.
+                raise _NoSubmission from None
+            if connection.sock:
+                connection.sock.settimeout(max(.01, deadline - time.monotonic()))
             connection.request("POST", "/v1/chat/completions", body=body, headers={
                 "Authorization": "Bearer " + key, "Content-Type": "application/json",
                 "Content-Length": str(len(body)), "Connection": "close"})
@@ -294,6 +323,14 @@ class LocalProxyReplyLLM:
                     raise _fail("local_proxy_conversation_changed")
             self._complete(conversation_key, request_key, remote_id)
             return decision
+        except _NoSubmission:
+            try:
+                self._not_submitted(conversation_key, request_key)
+            except (OSError, sqlite3.Error, LLMError):
+                # A pending claim remains durable if the release cannot be
+                # confirmed. Never retry this same external message.
+                raise _fail("local_proxy_state_error") from None
+            raise _fail("local_proxy_not_submitted") from None
         except Exception as exc:
             code = str(exc) if isinstance(exc, LLMError) and re.fullmatch(r"local_proxy_[a-z_]+", str(exc)) else "local_proxy_request_unknown"
             try:
