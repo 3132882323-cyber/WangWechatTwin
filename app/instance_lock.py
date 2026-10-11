@@ -235,8 +235,11 @@ class SingleInstanceLock:
                         return self._fail("lock_metadata_unknown", "原锁文件内容过大；无法安全迁移")
                     content = content.strip()
                     if content.isdigit() or (content[:1] in {b"+", b"-"} and content[1:].isdigit()):
-                        pid = int(content)
-                        state, detail = _legacy_owner(pid, self.path) if pid > 0 else ("stale", "无效 PID")
+                        try:
+                            pid = int(content)
+                            state, detail = _legacy_owner(pid, self.path) if pid > 0 else ("stale", "无效 PID")
+                        except (ValueError, OverflowError) as exc:
+                            return self._fail("lock_metadata_unknown", f"原锁文件 PID 无法合法解析或查询（{type(exc).__name__}）")
                         if state != "stale":
                             return self._fail("legacy_owner_active" if state == "active" else "legacy_owner_unknown", detail)
                     else:

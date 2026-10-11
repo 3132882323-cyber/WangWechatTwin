@@ -301,6 +301,42 @@ def test_nonpositive_legacy_pid_is_stale(tmp_path, invalid_pid):
     lock.release()
 
 
+@pytest.mark.skipif(not hasattr(sys, "set_int_max_str_digits"), reason="requires configurable integer digit limit")
+def test_large_legacy_pid_respects_python_digit_limit_without_escaping_diagnostic(tmp_path):
+    lock = SingleInstanceLock(tmp_path / "RUNNING.lock")
+    content = "9" * 641
+    lock.path.write_text(content, encoding="ascii")
+    previous = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(640)
+        assert not lock.acquire()
+        assert lock.failure_reason == "lock_metadata_unknown"
+        assert "ValueError" in lock.diagnostic
+        assert lock.fd is None
+    finally:
+        sys.set_int_max_str_digits(previous)
+        lock.release()
+    assert lock.path.read_text(encoding="ascii") == content
+
+
+@pytest.mark.parametrize("error_type", [OverflowError, ValueError])
+def test_legacy_process_query_range_exception_is_diagnosed(tmp_path, monkeypatch, error_type):
+    real_process = psutil.Process
+    def inspect(pid=None):
+        if pid == 12345:
+            raise error_type("test process PID conversion failure")
+        return real_process(pid)
+    monkeypatch.setattr(module.psutil, "Process", inspect)
+    lock = SingleInstanceLock(tmp_path / "RUNNING.lock")
+    lock.path.write_text("12345", encoding="ascii")
+    assert not lock.acquire()
+    assert lock.failure_reason == "lock_metadata_unknown"
+    assert error_type.__name__ in lock.diagnostic
+    assert lock.fd is None
+    lock.release()
+    assert lock.path.read_text(encoding="ascii") == "12345"
+
+
 def test_uninspectable_legacy_pid_fails_closed_with_diagnostic(tmp_path, monkeypatch):
     class Denied(_Process):
         def cmdline(self):
