@@ -8,23 +8,41 @@ import sys
 import time
 
 
-def supervise(command, root, *, launch=subprocess.Popen, wait=time.sleep, max_runs=None, healthy=None, terminate=None):
+def supervise(command, root, *, launch=subprocess.Popen, wait=time.sleep, max_runs=None,
+              healthy=None, terminate=None, watchdog_check=None):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     stop = root / 'STOP_SUPERVISOR'
     runs, delay = 0, 10
+
+    def check_watchdog():
+        if watchdog_check is None:
+            return
+        try:
+            watchdog_check()
+        except Exception:
+            # Watchdog inspection/start failure must never restart or kill the
+            # backend. Do not record paths, command lines, or credentials.
+            event = {'at': time.time(), 'event': 'deepseek_watchdog_check_failed'}
+            try:
+                with (root / 'startup.jsonl').open('a', encoding='utf-8') as log:
+                    log.write(json.dumps(event) + '\n')
+            except OSError:
+                print('deepseek_watchdog_check_failed', file=sys.stderr, flush=True)
+
     while not stop.exists() and (max_runs is None or runs < max_runs):
         from app.resource_health import available_commit_bytes, under_pressure
         if under_pressure(available_commit_bytes()):
             wait(30)
             continue
+        check_watchdog()
         started = time.monotonic()
         stamp = time.strftime('%Y%m%d-%H%M%S')
         with (root / ('backend-' + stamp + '.log')).open('ab') as log:
             child = launch(command, stdout=log, stderr=subprocess.STDOUT,
                            env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
             (root / 'supervisor.json').write_text(json.dumps({'pid': os.getpid(), 'child_pid': child.pid, 'started': time.time()}), encoding='utf-8')
-            if healthy is None:
+            if healthy is None and watchdog_check is None:
                 code = child.wait()
             else:
                 while True:
@@ -32,7 +50,8 @@ def supervise(command, root, *, launch=subprocess.Popen, wait=time.sleep, max_ru
                         code = child.wait(timeout=30)
                         break
                     except subprocess.TimeoutExpired:
-                        if time.monotonic() - started > 600 and not healthy(child.pid):
+                        check_watchdog()
+                        if healthy is not None and time.monotonic() - started > 600 and not healthy(child.pid):
                             (terminate or (lambda process: process.terminate()))(child)
                             try:
                                 child.wait(timeout=30)
@@ -88,7 +107,15 @@ def main():
             except (OSError, ValueError, sqlite3.Error):
                 # A transient DB lock alone must never terminate the backend.
                 return True
-        supervise([sys.executable, '-u', '-m', 'app', '--config', args.config, 'run'], root, healthy=healthy, terminate=terminate_owned)
+        watchdog_check = None
+        if os.name == 'nt' and config.openai.provider == 'hybrid_web':
+            proxy = config.openai.local_proxies.get('deepseek')
+            script = root / 'deepseek_watchdog.py'
+            if proxy is not None and proxy.enabled and script.is_file():
+                from app.local_proxy_watchdog import ensure_deepseek_watchdog
+                watchdog_check = lambda: ensure_deepseek_watchdog(script)
+        supervise([sys.executable, '-u', '-m', 'app', '--config', args.config, 'run'], root,
+                  healthy=healthy, terminate=terminate_owned, watchdog_check=watchdog_check)
         return 0
     finally:
         lock.release()

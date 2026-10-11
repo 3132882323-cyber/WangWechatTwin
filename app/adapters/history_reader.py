@@ -23,6 +23,23 @@ class SnapshotBusyError(RuntimeError):
     """The source changed while copying; retry reading, never retry sending."""
 
 
+def mentions_owner(source_text, content, account, display_name):
+    """Prefer exact protocol recipient IDs; never treat a prefix as the owner."""
+    source = source_text if isinstance(source_text, str) else ""
+    match = re.search(r"<atuserlist\b[^>]*>(.*?)</atuserlist>", source, re.S)
+    if match:
+        value = match[1].strip()
+        cdata = re.fullmatch(r"<!\[CDATA\[(.*?)\]\]>", value, re.S)
+        if cdata:
+            value = cdata[1]
+        recipients = {item for item in re.split(r"[,;\s]+", value.strip()) if item}
+        return bool(account and account in recipients)
+    if re.search(r"<atuserlist\b", source):
+        return False  # Empty/malformed protocol metadata is not an invitation.
+    return bool(display_name and isinstance(content, str) and re.search(
+        r"@" + re.escape(display_name) + r"(?=\s|$)", content))
+
+
 def wal_checksum(data, state=(0, 0), endian="<"):
     values = struct.unpack(endian + str(len(data) // 4) + "I", data)
     a, b = state
@@ -274,9 +291,7 @@ class HistoryReadOnlyAdapter(MessageAdapter):
                                 if isinstance(source_text, bytes):
                                     source_text = (bounded_decompress(source_text, max_bytes=1024*1024)
                                                    if source_compression else source_text).decode("utf-8")
-                                at_match = re.search(r"<atuserlist>(.*?)</atuserlist>", source_text or "", re.S)
-                                addressed = (bool(at_match and (account in at_match[1] or "notify@all" in at_match[1]))
-                                             or bool(self.self_display_name and "@" + self.self_display_name in content))
+                                addressed = mentions_owner(source_text, content, account, self.self_display_name)
                                 if not addressed:
                                     continue
                                 prefix = users.get(sender, "") + ":\n"

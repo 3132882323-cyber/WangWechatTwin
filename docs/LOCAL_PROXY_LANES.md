@@ -38,4 +38,20 @@ openai:
 
 所有私聊及群聊 @ 范围沿用原配置；主动聊天、重要承诺及不确定媒体不改变审核规则。后台持续运行依赖本机开机、网络、微信登录和模型会话；启动策略和连续 24 小时的实测证据分别报告。
 
+面向已有私聊与新好友自动发现的配置如下。新好友首条入站消息会刷新联系人与既有会话名单，再采用未配置联系人的默认模式，不要求手工维护发送白名单。已有联系人若有显式 `off`/`shadow` 配置仍应先核对，不因接入代理自动覆盖。
+
+```yaml
+mode: low_risk_auto
+wechat:
+  sender_all_existing_chats: true
+  allow_unknown_contacts: true
+  unknown_contact_mode: low_risk_auto
+  allow_groups: true
+  group_only_mentions: true
+```
+
+群消息优先按协议中的精确 recipient ID 判断；不能把另一个 ID 或昵称的前缀当成本人，明确的协议名单也不能被正文昵称覆盖。单独 `@所有人` 不作为 `@本人` 自动回复。
+
+Windows supervisor 可看护本项目已有的私有 `deepseek_watchdog.py`：启动前及等待超时后核验命令行与进程创建时间，确认缺失才补拉；检查异常只记固定码，不重启微信后台。当前本机已实测单独终止看护进程后，由 supervisor 恢复看护，模型 Node 与后台未被停止。这不等同于整机重启或 24 小时运行验收。该机制不启动豆包。
+
 本机豆包试验可执行文件启动曾被自动审批返回 `blocked by policy`；用户手动启动成功。不得通过其他启动器、计划任务或后台启动包装绕过这次拒绝；需由用户再次启动该服务后再完成接入。

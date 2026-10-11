@@ -1,8 +1,131 @@
 import json
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from app.supervisor import supervise
+
+
+def test_optional_watchdog_checks_before_launch_and_on_timeout(tmp_path):
+    checks, launches = [], []
+
+    class Child:
+        pid = 456
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired('backend', timeout)
+            return 0
+
+    def launch(*args, **kwargs):
+        launches.append(args)
+        return Child()
+
+    assert supervise(['fake-backend'], tmp_path, launch=launch, max_runs=1,
+                     watchdog_check=lambda: checks.append('checked')) == 1
+    assert len(launches) == 1
+    assert checks == ['checked', 'checked']
+
+
+def test_watchdog_check_error_is_fixed_code_and_does_not_restart_backend(tmp_path):
+    launches, terminated = [], []
+
+    class Child:
+        pid = 789
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired('backend', timeout)
+            return 0
+
+    def launch(*args, **kwargs):
+        launches.append(args)
+        return Child()
+
+    def bad_check():
+        raise RuntimeError('private token must not enter logs')
+
+    assert supervise(['fake-backend'], tmp_path, launch=launch, max_runs=1,
+                     watchdog_check=bad_check, terminate=terminated.append) == 1
+    assert len(launches) == 1 and terminated == []
+    logged = (tmp_path / 'startup.jsonl').read_text(encoding='utf-8')
+    events = [json.loads(line) for line in logged.splitlines()]
+    assert [event['event'] for event in events] == ['deepseek_watchdog_check_failed'] * 2
+    assert 'private token' not in logged
+
+
+def _watchdog_fixture(tmp_path):
+    script = tmp_path / '.runtime' / 'startup' / 'deepseek_watchdog.py'
+    script.parent.mkdir(parents=True)
+    script.write_text('pass\n', encoding='utf-8')
+    script.with_name('deepseek-watchdog.json').write_text(
+        json.dumps({'pid': 123, 'started': 101.0}), encoding='utf-8')
+    return script
+
+
+def test_owned_watchdog_is_left_running(tmp_path):
+    from app.local_proxy_watchdog import ensure_deepseek_watchdog
+
+    script = _watchdog_fixture(tmp_path)
+    process = SimpleNamespace(create_time=lambda: 100.0,
+                              cmdline=lambda: [sys.executable, str(script)],
+                              name=lambda: 'python.exe')
+
+    def spawn(*args, **kwargs):
+        raise AssertionError('owned watchdog must not be restarted')
+
+    assert ensure_deepseek_watchdog(script, process_factory=lambda pid: process,
+                                    spawn=spawn) == 'running'
+
+
+def test_dead_watchdog_is_started_hidden_without_starting_go(tmp_path):
+    import psutil
+    from app.local_proxy_watchdog import ensure_deepseek_watchdog
+
+    script = _watchdog_fixture(tmp_path)
+    launched = []
+
+    def missing(pid):
+        raise psutil.NoSuchProcess(pid)
+
+    def spawn(args, **kwargs):
+        launched.append((args, kwargs))
+
+    assert ensure_deepseek_watchdog(script, process_factory=missing, spawn=spawn,
+                                    python_executable='python.exe') == 'started'
+    assert len(launched) == 1
+    assert launched[0][0] == ['python.exe', str(script.resolve())]
+    assert launched[0][1]['creationflags'] == getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    assert 'doubao' not in ' '.join(launched[0][0]).lower()
+
+
+@pytest.mark.parametrize(('name', 'birth', 'argv_kind'), [
+    ('node.exe', 100.0, 'expected'),
+    ('python.exe', 102.0, 'expected'),
+    ('python.exe', 100.0, 'different'),
+])
+def test_foreign_or_reused_pid_cannot_impersonate_watchdog(tmp_path, name, birth, argv_kind):
+    from app.local_proxy_watchdog import ensure_deepseek_watchdog
+
+    script = _watchdog_fixture(tmp_path)
+    argv_script = script if argv_kind == 'expected' else script.with_name('other.py')
+    process = SimpleNamespace(create_time=lambda: birth,
+                              cmdline=lambda: [sys.executable, str(argv_script)],
+                              name=lambda: name)
+    launches = []
+    assert ensure_deepseek_watchdog(script, process_factory=lambda pid: process,
+                                    spawn=lambda *args, **kwargs: launches.append(args)) == 'started'
+    assert len(launches) == 1
 
 
 def test_crash_restarts_with_backoff_and_normal_stop_stays_stopped(tmp_path):
