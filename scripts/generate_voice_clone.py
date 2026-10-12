@@ -364,7 +364,10 @@ def parse_generated_wav(log: Path, wav: Path) -> int:
             raise PreviewFailure("tts_result_unverified")
         output = log.read_text(encoding="utf-8", errors="replace")
         output = re.sub(r"\x1b\[[0-9;]*m", "", output)
-        matches = re.findall(r"^generated (\d+) frames, (\d+) bytes of WAV audio \((\d+) Hz\)\s*$",
+        # b10679 common/log.cpp prints optional [M.s.ms.us] and INFO "I "
+        # prefixes. Accept those exact formats, never an arbitrary line prefix.
+        matches = re.findall(r"^(?:(?:[0-9]+\.[0-5][0-9]\.[0-9]{3}\.[0-9]{3} )?I )?"
+                             r"generated (\d+) frames, (\d+) bytes of WAV audio \((\d+) Hz\)[ \t]*\r?$",
                              output, flags=re.MULTILINE)
         if len(matches) != 1:
             raise PreviewFailure("tts_result_unverified")

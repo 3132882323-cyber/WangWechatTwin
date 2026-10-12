@@ -43,7 +43,7 @@ def harness(tmp_path, monkeypatch):
         assert json.loads((output / "preview_01.attempt.json").read_text())["status"] == "pending"
         checkpoint("running", child_pid=42)
         wav.write_bytes(b"synthetic-wav")
-        log.write_text(SECRET + "\ngenerated 12 frames, 13 bytes of WAV audio (24000 Hz)\n", encoding="utf-8")
+        log.write_text(SECRET + "\n0.03.067.924 I generated 12 frames, 13 bytes of WAV audio (24000 Hz)\n", encoding="utf-8")
         checkpoint("tts_exit", native_exit_code=0)
         return 0
 
@@ -349,6 +349,36 @@ def test_unverified_native_result_is_unknown(harness, monkeypatch, line):
     with pytest.raises(voice.PreviewFailure, match="tts_result_unverified"):
         voice.generate_preview(**harness.args)
     assert not (harness.output / "preview_01.mp3").exists()
+
+
+@pytest.mark.parametrize("prefix", ["", "I ", "0.03.067.924 I ",
+                                    "\x1b[34m0.03.067.924\x1b[0m \x1b[32mI \x1b[0m"])
+def test_actual_b10679_info_line_accepts_fixed_optional_prefix(tmp_path, prefix):
+    log, wav = tmp_path / "private.log", tmp_path / "raw.wav"
+    wav.write_bytes(b"x" * 142124)
+    log.write_text(prefix + "generated 37 frames, 142124 bytes of WAV audio (24000 Hz)\n")
+    assert voice.parse_generated_wav(log, wav) == 37
+
+
+@pytest.mark.parametrize("line", [
+    "0.03.067.924 W generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+    "0.03.067.924 E generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+    "0.03.067.924 D generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+    "0.03.067.924 generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+    "0.60.067.924 I generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+    "embedded 0.03.067.924 I generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+    "0.03.067.924 I generated 37 frames, 142124 bytes of WAV audio (24000 Hz) trailing",
+    "0.03.067.924 I generated 37 frames, 142124 bytes of WAV audio (24000 Hz)\n"
+    "0.03.067.925 I generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+    "generated 37 frames, 142124 bytes of WAV audio (24000 Hz)\n"
+    "0.03.067.924 I generated 37 frames, 142124 bytes of WAV audio (24000 Hz)",
+])
+def test_unapproved_prefix_or_duplicate_result_is_rejected(tmp_path, line):
+    log, wav = tmp_path / "private.log", tmp_path / "raw.wav"
+    wav.write_bytes(b"x" * 142124)
+    log.write_text(line + "\n")
+    with pytest.raises(voice.PreviewFailure, match="tts_result_unverified"):
+        voice.parse_generated_wav(log, wav)
 
 
 def pinned_fixture(tmp_path, monkeypatch):
