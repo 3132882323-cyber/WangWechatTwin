@@ -7,6 +7,7 @@ module does not read credentials, create keys, start a server, or call a model.
 from __future__ import annotations
 
 import asyncio
+import argparse
 import codecs
 from contextlib import contextmanager
 import hashlib
@@ -156,6 +157,23 @@ class Ledger:
             db.commit()
             return remote or ""
 
+    def recover_orphaned_pending(self, now: float) -> int:
+        """Call only after the process-wide service OS lock has been acquired.
+
+        A dead service cannot complete its pending requests. Make that state
+        visible as terminal unknown; keep all IDs and remote ownership blocked.
+        """
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            count = db.execute("UPDATE requests SET status='unknown',completed_at=?,error_code='gateway_restarted_unknown' "
+                               "WHERE status='pending'", (now,)).rowcount
+            db.execute("UPDATE sessions SET state='unknown' WHERE state='pending'")
+            previous = db.execute("SELECT value FROM metadata WHERE key='orphaned_pending_count'").fetchone()
+            total = (int(previous[0]) if previous else 0) + count
+            db.execute("INSERT OR REPLACE INTO metadata VALUES('orphaned_pending_count',?)", (str(total),))
+            db.commit()
+            return count
+
     def observe_remote(self, contact: str, remote: str):
         # Reserve every observed ID, including an unexpected or malformed turn's
         # ID, before accepting any text. Never transfer ownership from a contact.
@@ -218,11 +236,13 @@ class Ledger:
             counts = dict(db.execute("SELECT status,COUNT(*) FROM requests GROUP BY status").fetchall())
             last_done = db.execute("SELECT MAX(completed_at) FROM requests WHERE status='done'").fetchone()[0]
             tool_seen_count = db.execute("SELECT COUNT(*) FROM requests WHERE tool_metadata_seen=1").fetchone()[0]
+            oldest_pending = db.execute("SELECT MIN(claimed_at) FROM requests WHERE status='pending'").fetchone()[0]
             latest = db.execute("SELECT status FROM requests ORDER BY rowid DESC LIMIT 1").fetchone()
             meta = dict(db.execute("SELECT key,value FROM metadata").fetchall())
         verified = bool(latest and latest[0] == "done" and last_done is not None and 0 <= now - last_done <= 120)
         auth_success = float(meta["auth_last_success"]) if meta.get("auth_last_success") else None
         auth_error = meta.get("auth_last_error") or None
+        pending_age = max(0, now - oldest_pending) if oldest_pending is not None else None
         diagnostic = None
         if meta.get("last_unsupported_output"):
             try:
@@ -246,6 +266,9 @@ class Ledger:
                           "tool_metadata_seen_count": tool_seen_count,
                           "done_count": counts.get("done", 0), "pending_count": counts.get("pending", 0),
                           "unknown_count": counts.get("unknown", 0)},
+            "maintenance": {"orphaned_pending_count": int(meta.get("orphaned_pending_count", "0")),
+                            "oldest_pending_seconds": pending_age,
+                            "overdue_pending": pending_age is not None and pending_age > MAX_SECONDS + 30},
         }
 
 
@@ -287,8 +310,11 @@ def _validate_body(body):
     return contact, request_id, messages
 
 
-def _prompt(messages: list[dict]) -> str:
-    return ("本轮仅为隔离的虚构文字草稿验收，不发送微信，不执行工具，不读取文件或网页。"
+def _prompt(messages: list[dict], *, production_mode: bool = False) -> str:
+    opening = ("本轮根据本人授权的当前联系人消息与必要本机上下文起草回复。"
+               "是否发送由本机的风险、审核和发送检查决定；你只返回决策，不执行工具，不读取文件或网页。"
+               if production_mode else "本轮仅为隔离的虚构文字草稿验收，不发送微信，不执行工具，不读取文件或网页。")
+    return (opening +
             "只根据下面调用方本轮提供的消息回答；此前模型草稿不能当作本人经历或已发送消息。"
             "必须输出完整ReplyDecision JSON，给出内容不同的A/B/C三个候选。不要代码围栏。\n"
             + json.dumps(ReplyDecision.model_json_schema(), ensure_ascii=False)
@@ -411,7 +437,8 @@ def _default_client():
 def create_app(*, ledger_path: Path, api_key: str, credential_reader: Callable[[], dict],
                client_factory: Callable[[], httpx.AsyncClient] = _default_client,
                now: Callable[[], float] = time.time, credential_writer: Callable[[dict], None] | None = None,
-               credential_available: Callable[[], bool] | None = None) -> FastAPI:
+               credential_available: Callable[[], bool] | None = None,
+               production_mode: bool = False, process_identity: dict | None = None) -> FastAPI:
     """Inject a temporary ledger and MockTransport client for all offline tests."""
     if not isinstance(api_key, str) or not api_key:
         raise ValueError("gateway_key_required")
@@ -439,7 +466,11 @@ def create_app(*, ledger_path: Path, api_key: str, credential_reader: Callable[[
         authorize(request)
         try:
             configured = bool(credential_available()) if credential_available else True
-            return ledger.health(now(), configured)
+            result = ledger.health(now(), configured)
+            result.update(service="glm-local-gateway" if production_mode else "glm-normal-trial",
+                          mode="production" if production_mode else "trial",
+                          synthetic_only=not production_mode, instance=process_identity)
+            return result
         except Exception:
             raise GatewayFailure("gateway_state_error", 503) from None
 
@@ -462,7 +493,7 @@ def create_app(*, ledger_path: Path, api_key: str, credential_reader: Callable[[
             except (ValueError, UnicodeDecodeError):
                 raise GatewayFailure("invalid_json", 400) from None
             contact, request_id, messages = _validate_body(body)
-            prompt = _prompt(messages)
+            prompt = _prompt(messages, production_mode=production_mode)
             expected = ledger.claim(contact, request_id, now())
             claimed = True
             try:
@@ -544,58 +575,93 @@ def create_app(*, ledger_path: Path, api_key: str, credential_reader: Callable[[
     return app
 
 
-def _read_authorized_credentials():
-    if AUTH_PATH.is_symlink() or AUTH_PATH.parent.resolve() != TRIAL / "auth":
+def _read_authorized_credentials(auth_path: Path = AUTH_PATH):
+    if auth_path.is_symlink() or auth_path.parent.resolve() != auth_path.parent:
         raise GatewayFailure("invalid_auth_path", 503)
-    return json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+    return json.loads(auth_path.read_text(encoding="utf-8"))
 
 
-def _write_authorized_credentials(value: dict):
-    if (value.get("source") != AUTH_SOURCE or AUTH_PATH.is_symlink()
-            or AUTH_PATH.parent.resolve() != TRIAL / "auth"):
+def _write_authorized_credentials(value: dict, auth_path: Path = AUTH_PATH):
+    if (value.get("source") != AUTH_SOURCE or auth_path.is_symlink()
+            or auth_path.parent.resolve() != auth_path.parent):
         raise GatewayFailure("invalid_auth_source", 503)
-    pending = AUTH_PATH.with_name("refresh.update-" + uuid.uuid4().hex + ".json")
+    pending = auth_path.with_name("refresh.update-" + uuid.uuid4().hex + ".json")
     try:
         with pending.open("x", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(pending, AUTH_PATH)
+        os.replace(pending, auth_path)
     finally:
         pending.unlink(missing_ok=True)
 
 
-def _runtime_key():
-    KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if KEY_PATH.is_symlink():
+def _runtime_key(key_path: Path = KEY_PATH):
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if key_path.is_symlink():
         raise ValueError("invalid_gateway_key_path")
-    if not KEY_PATH.exists():
+    if not key_path.exists():
         try:
-            with KEY_PATH.open("x", encoding="utf-8") as handle:
+            with key_path.open("x", encoding="utf-8") as handle:
                 handle.write(secrets.token_urlsafe(48))
                 handle.flush()
                 os.fsync(handle.fileno())
         except FileExistsError:
             pass
-    key = KEY_PATH.read_text(encoding="utf-8").strip()
+    key = key_path.read_text(encoding="utf-8").strip()
     if len(key) < 32 or len(key) > 256 or not re.fullmatch(r"[A-Za-z0-9_-]+", key):
         raise ValueError("invalid_gateway_key")
     return key
 
 
-def main():
+def runtime_directory(value: str | None, mode: str) -> Path:
+    if mode == "production":
+        expected = PUBLIC / ".runtime" / "glm_proxy"
+        if value is None or Path(value).resolve() != expected or expected.resolve() != expected:
+            raise ValueError("production_runtime_directory_required")
+        return expected
+    if value is not None and Path(value).resolve() != TRIAL:
+        raise ValueError("trial_runtime_directory_mismatch")
+    return TRIAL
+
+
+def main(argv=None):
     import logging
+    import psutil
     import uvicorn
+    from app.instance_lock import SingleInstanceLock
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runtime-dir")
+    parser.add_argument("--mode", choices=("trial", "production"), default="trial")
+    args = parser.parse_args(argv)
     logging.disable(logging.CRITICAL)
+    lock = None
     try:
-        app = create_app(ledger_path=LEDGER_PATH, api_key=_runtime_key(),
-                         credential_reader=_read_authorized_credentials,
-                         credential_writer=_write_authorized_credentials,
-                         credential_available=lambda: AUTH_PATH.is_file())
+        runtime = runtime_directory(args.runtime_dir, args.mode)
+        runtime.mkdir(parents=True, exist_ok=True)
+        lock = SingleInstanceLock(runtime / "gateway.lock")
+        if not lock.acquire():
+            return 0 if lock.failure_reason == "locked" else 2
+        auth_path = runtime / "auth" / "refresh.json"
+        identity = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
+        app = create_app(ledger_path=runtime / "state" / "gateway.sqlite3", api_key=_runtime_key(runtime / "local-key.txt"),
+                         credential_reader=lambda: _read_authorized_credentials(auth_path),
+                         credential_writer=lambda value: _write_authorized_credentials(value, auth_path),
+                         credential_available=lambda: auth_path.is_file(),
+                         production_mode=args.mode == "production", process_identity=identity)
+        app.state.ledger.recover_orphaned_pending(time.time())
+        record = {**identity, "script": str(Path(__file__).resolve()), "runtime_dir": str(runtime),
+                  "mode": args.mode}
+        temporary = runtime / ("gateway-process-" + uuid.uuid4().hex + ".tmp")
+        temporary.write_text(json.dumps(record), encoding="utf-8")
+        temporary.replace(runtime / "gateway-process.json")
         uvicorn.run(app, host=HOST, port=PORT, workers=1, access_log=False, log_config=None)
     except Exception:
         print("glm_gateway_start_failed", file=sys.stderr)
         return 1
+    finally:
+        if lock is not None:
+            lock.release()
     return 0
 
 

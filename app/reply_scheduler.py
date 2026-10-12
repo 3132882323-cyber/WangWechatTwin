@@ -11,7 +11,7 @@ class ReplyScheduler:
     FETCH_BATCH_SIZE = 32
     MAX_PAYLOAD_CHARS = 262144
     HEALTH_INTERVAL_SECONDS = 5
-    LANES = ('deepseek', 'chatgpt', 'doubao')
+    LANES = ('deepseek', 'chatgpt', 'doubao', 'glm')
 
     def __init__(self, config, db, pipeline, adapter):
         self.config, self.db, self.pipeline, self.adapter = config, db, pipeline, adapter

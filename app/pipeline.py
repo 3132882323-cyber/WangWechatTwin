@@ -88,7 +88,7 @@ class ReplyPipeline:
     @staticmethod
     def _neutral_date_question(message, decision, risk, route) -> bool:
         if (
-            message.message_type != "text" or route not in {"deepseek", "doubao"}
+            message.message_type != "text" or route not in {"deepseek", "doubao", "glm"}
             or risk.level != RiskLevel.medium
             or risk.reasons != ["包含日期、数量、金额或交付信息"]
             or decision.action != "send" or decision.risk != RiskLevel.low
@@ -168,6 +168,14 @@ class ReplyPipeline:
         if mode == "shadow":
             if decision.action != "ignore":
                 decision.action = "review"
+            return decision
+
+        if decision._tool_metadata_seen or decision._manual_review_required:
+            # Neither social acknowledgments nor low-confidence holding rules
+            # may send a turn whose transport observed tool activity.
+            decision.action = "review"
+            decision.confidence = 0.0
+            decision.holding_reply = None
             return decision
 
         if mode=='low_risk_auto' and decision.action=='review' and decision.risk==RiskLevel.low and decision.confidence>=.85 and not decision.facts_to_confirm:
@@ -302,6 +310,10 @@ class ReplyPipeline:
             except LLMError as exc:
                 self.db.add_event("llm_error", str(exc), level="error", contact=message.contact)
                 decision = self._fallback(risk.level, risk.safe_holding_reply, str(exc))
+                if media_route == 'glm':
+                    # A refused or uncertain turn cannot authorize an automatic
+                    # holding reply or a replay through another model lane.
+                    decision._manual_review_required = True
 
         if decision.candidates:
             self.db.add_event('reply_candidate_selection',json.dumps({

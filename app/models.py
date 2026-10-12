@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 
 class RiskLevel(str, Enum):
@@ -78,6 +78,10 @@ class ReplyCandidate(BaseModel):
 
 
 class ReplyDecision(BaseModel):
+    # Set only by a local transport after observing upstream tool metadata.
+    # Never ask the model to attest to this flag or put it into the schema.
+    _tool_metadata_seen: bool = PrivateAttr(default=False)
+    _manual_review_required: bool = PrivateAttr(default=False)
     sticker_id: str = ""
     media_description: str = ''
     media_confidence: float = Field(default=0,ge=0,le=1)

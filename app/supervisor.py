@@ -9,26 +9,31 @@ import time
 
 
 def supervise(command, root, *, launch=subprocess.Popen, wait=time.sleep, max_runs=None,
-              healthy=None, terminate=None, watchdog_check=None):
+              healthy=None, terminate=None, watchdog_check=None, watchdog_checks=None):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     stop = root / 'STOP_SUPERVISOR'
     runs, delay = 0, 10
+    checks = dict(watchdog_checks or {})
+    if watchdog_check is not None:
+        checks['deepseek'] = watchdog_check
+    if set(checks) - {'deepseek', 'glm'}:
+        raise ValueError('unsupported_watchdog')
 
     def check_watchdog():
-        if watchdog_check is None:
-            return
-        try:
-            watchdog_check()
-        except Exception:
-            # Watchdog inspection/start failure must never restart or kill the
-            # backend. Do not record paths, command lines, or credentials.
-            event = {'at': time.time(), 'event': 'deepseek_watchdog_check_failed'}
+        for name, callback in checks.items():
             try:
-                with (root / 'startup.jsonl').open('a', encoding='utf-8') as log:
-                    log.write(json.dumps(event) + '\n')
-            except OSError:
-                print('deepseek_watchdog_check_failed', file=sys.stderr, flush=True)
+                callback()
+            except Exception:
+                # One provider's monitor failure cannot stop another monitor or
+                # restart the backend. Logs contain fixed codes only.
+                code = name + '_watchdog_check_failed'
+                event = {'at': time.time(), 'event': code}
+                try:
+                    with (root / 'startup.jsonl').open('a', encoding='utf-8') as log:
+                        log.write(json.dumps(event) + '\n')
+                except OSError:
+                    print(code, file=sys.stderr, flush=True)
 
     while not stop.exists() and (max_runs is None or runs < max_runs):
         from app.resource_health import available_commit_bytes, under_pressure
@@ -42,7 +47,7 @@ def supervise(command, root, *, launch=subprocess.Popen, wait=time.sleep, max_ru
             child = launch(command, stdout=log, stderr=subprocess.STDOUT,
                            env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
             (root / 'supervisor.json').write_text(json.dumps({'pid': os.getpid(), 'child_pid': child.pid, 'started': time.time()}), encoding='utf-8')
-            if healthy is None and watchdog_check is None:
+            if healthy is None and not checks:
                 code = child.wait()
             else:
                 while True:
@@ -107,18 +112,32 @@ def main():
             except (OSError, ValueError, sqlite3.Error):
                 # A transient DB lock alone must never terminate the backend.
                 return True
-        watchdog_check = None
-        if os.name == 'nt' and config.openai.provider == 'hybrid_web':
-            proxy = config.openai.local_proxies.get('deepseek')
-            script = root / 'deepseek_watchdog.py'
-            if proxy is not None and proxy.enabled and 'deepseek' not in config.openai.disabled_lanes and script.is_file():
-                from app.local_proxy_watchdog import ensure_deepseek_watchdog
-                watchdog_check = lambda: ensure_deepseek_watchdog(script)
         supervise([sys.executable, '-u', '-m', 'app', '--config', args.config, 'run'], root,
-                  healthy=healthy, terminate=terminate_owned, watchdog_check=watchdog_check)
+                  healthy=healthy, terminate=terminate_owned, watchdog_checks=provider_watchdog_checks(config, root))
         return 0
     finally:
         lock.release()
+
+
+def provider_watchdog_checks(config, root: Path, *, platform_name=None):
+    """Enable only configured Python monitors; Doubao startup is never added."""
+    if (platform_name or os.name) != 'nt' or config.openai.provider != 'hybrid_web':
+        return {}
+    from app.local_proxy_watchdog import ensure_deepseek_watchdog, ensure_glm_watchdog
+    checks = {}
+    root = Path(root)
+    disabled = config.openai.disabled_lanes
+    deepseek = config.openai.local_proxies.get('deepseek')
+    ds_script = root / 'deepseek_watchdog.py'
+    if (deepseek is not None and deepseek.enabled and 'deepseek' not in disabled and ds_script.is_file()
+            and not (root / 'STOP_DEEPSEEK_PROXY').exists()):
+        checks['deepseek'] = lambda: ensure_deepseek_watchdog(ds_script)
+    glm = config.openai.local_proxies.get('glm')
+    glm_script = root.parents[1] / 'scripts' / 'glm_watchdog.py'
+    if (glm is not None and glm.enabled and 'glm' not in disabled and glm_script.is_file()
+            and not (root / 'STOP_GLM_PROXY').exists()):
+        checks['glm'] = lambda: ensure_glm_watchdog(glm_script, root.parent / 'glm_proxy')
+    return checks
 
 
 def owns_process(launcher_pid, runtime_pid):

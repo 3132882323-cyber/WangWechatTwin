@@ -11,6 +11,13 @@ from pydantic import BaseModel, Field, model_validator
 from app.models import ContactProfile
 
 
+LOCAL_PROXY_ENDPOINTS = {
+    "deepseek": "http://127.0.0.1:19655/v1",
+    "doubao": "http://127.0.0.1:19656/v1",
+    "glm": "http://127.0.0.1:19659/v1",
+}
+
+
 class LocalProxySettings(BaseModel):
     enabled: bool = False
     base_url: str
@@ -20,7 +27,7 @@ class LocalProxySettings(BaseModel):
 
     @model_validator(mode="after")
     def require_loopback_proxy(self):
-        if self.base_url not in {"http://127.0.0.1:19655/v1", "http://127.0.0.1:19656/v1"}:
+        if self.base_url not in LOCAL_PROXY_ENDPOINTS.values():
             raise ValueError("local proxy must use its fixed loopback endpoint")
         if not self.api_key_file.strip():
             raise ValueError("local proxy requires a private API key file")
@@ -28,9 +35,9 @@ class LocalProxySettings(BaseModel):
 
 
 class OpenAISettings(BaseModel):
-    local_proxies: dict[Literal["deepseek", "doubao"], LocalProxySettings] = Field(default_factory=dict)
-    everyday_lane: Literal["deepseek", "doubao"] = "deepseek"
-    disabled_lanes: list[Literal["chatgpt", "deepseek", "doubao"]] = Field(default_factory=list)
+    local_proxies: dict[Literal["deepseek", "doubao", "glm"], LocalProxySettings] = Field(default_factory=dict)
+    everyday_lane: Literal["deepseek", "doubao", "glm"] = "deepseek"
+    disabled_lanes: list[Literal["chatgpt", "deepseek", "doubao", "glm"]] = Field(default_factory=list)
     deepseek_drafts: bool=False
     deepseek_fast: bool=False
     provider: Literal["auto", "api", "account", "web", "deepseek_web", "doubao_web", "hybrid_web"] = "auto"
@@ -55,12 +62,23 @@ class OpenAISettings(BaseModel):
         for lane, settings in self.local_proxies.items():
             if lane in self.disabled_lanes and settings.enabled:
                 raise ValueError("disabled lane cannot have an enabled local proxy")
-            expected = "http://127.0.0.1:" + ("19655" if lane == "deepseek" else "19656") + "/v1"
+            expected = LOCAL_PROXY_ENDPOINTS[lane]
             if settings.base_url != expected:
                 raise ValueError("local proxy endpoint does not match its lane")
         if any(item.enabled for item in self.local_proxies.values()) and self.provider != "hybrid_web":
             raise ValueError("local proxy lanes require hybrid_web routing")
+        if self.everyday_lane == "glm":
+            proxy = self.local_proxies.get("glm")
+            if self.provider != "hybrid_web" or proxy is None or not proxy.enabled:
+                raise ValueError("GLM everyday lane requires an enabled local proxy with hybrid_web routing")
         return self
+
+    def required_lanes(self) -> tuple[str, ...]:
+        required = {
+            "web": ("chatgpt",), "deepseek_web": ("deepseek",), "doubao_web": ("doubao",),
+            "hybrid_web": ("chatgpt", self.everyday_lane, "doubao"),
+        }.get(self.provider, ())
+        return tuple(dict.fromkeys(lane for lane in required if lane not in self.disabled_lanes))
 
 
 class WeChatSettings(BaseModel):

@@ -99,7 +99,7 @@ def upstream_current_text(request):
     return json.loads(prompt.rsplit("\n本轮消息：\n", 1)[1])[-1]["content"]
 
 
-def app_with_mock(tmp_path, upstream, *, ledger=None, now=None, credentials=None):
+def app_with_mock(tmp_path, upstream, *, ledger=None, now=None, credentials=None, production_mode=False):
     module = load_gateway()
     factory_calls = []
     credential_calls = []
@@ -117,6 +117,7 @@ def app_with_mock(tmp_path, upstream, *, ledger=None, now=None, credentials=None
         ledger_path=ledger or tmp_path / "synthetic-ledger.sqlite3",
         api_key="synthetic-local-key", credential_reader=credential_reader,
         client_factory=client_factory, now=now or (lambda: 1_700_000_000.0),
+        production_mode=production_mode,
     )
     return app, factory_calls, credential_calls
 
@@ -521,3 +522,61 @@ def test_tool_metadata_does_not_relax_same_remote_id_requirement(tmp_path):
             "unknown", 1)
         owners = dict(db.execute("SELECT remote_id,conversation_key FROM remote_ids"))
         assert owners == {"remote-a": "a" * 64, "remote-b": "a" * 64}
+
+
+def test_production_prompt_uses_authorized_current_context_and_keeps_tool_review(tmp_path):
+    captured = []
+
+    async def upstream(request):
+        if request.url.path.endswith("/refresh"):
+            return refresh_response()
+        captured.append(json.loads(request.content)["messages"][0]["content"][0]["text"])
+        return event_stream(metadata_event("do-not-execute"), text_event(json.dumps(decision(), ensure_ascii=False)))
+
+    app, _, _ = app_with_mock(tmp_path, upstream, production_mode=True)
+    body = request_body(content="当前联系人本轮的必要消息")
+    body["messages"][0]["content"] = "根据本人当前偏好认真回复。"
+    response = asyncio.run(post(app, body))
+    assert response.status_code == 200
+    assert captured[0].startswith("本轮根据本人授权的当前联系人消息与必要本机上下文")
+    assert "本轮仅为隔离的虚构" not in captured[0]
+    assert "当前联系人本轮的必要消息" in captured[0]
+    value = json.loads(response.json()["choices"][0]["message"]["content"])
+    assert value["action"] == "review" and value["confidence"] == 0 and value["holding_reply"] is None
+    status = asyncio.run(health(app)).json()
+    assert status["mode"] == "production" and status["synthetic_only"] is False
+
+
+def test_orphan_recovery_marks_unknown_without_replaying_or_releasing_remote(tmp_path):
+    module = load_gateway()
+    ledger = module.Ledger(tmp_path / "state.sqlite3")
+    ledger.claim("a" * 64, "old-id", 100)
+    ledger.observe_remote("a" * 64, "old-remote")
+    before = ledger.health(300, True)
+    assert before["maintenance"]["overdue_pending"] is True
+    assert ledger.recover_orphaned_pending(300) == 1
+    assert ledger.recover_orphaned_pending(301) == 0
+    status = ledger.health(301, True)
+    assert status["inference"]["pending_count"] == 0 and status["inference"]["unknown_count"] == 1
+    assert status["maintenance"]["orphaned_pending_count"] == 1
+    with pytest.raises(module.GatewayFailure, match="duplicate_request_unknown"):
+        ledger.claim("b" * 64, "old-id", 302)
+    with pytest.raises(module.GatewayFailure, match="conversation_unknown"):
+        ledger.claim("a" * 64, "new-id", 302)
+    # An app-approved new generation is a new opaque session key, never an old
+    # request replay. Even that key cannot reclaim the quarantined remote ID.
+    ledger.claim("b" * 64, "new-id", 302)
+    with pytest.raises(module.GatewayFailure, match="remote_id_owned_by_other_contact"):
+        ledger.observe_remote("b" * 64, "old-remote")
+
+
+def test_production_paths_are_private_and_never_default_to_published_auth(monkeypatch, tmp_path):
+    module = load_gateway()
+    monkeypatch.setattr(module, "PUBLIC", tmp_path)
+    expected = tmp_path / ".runtime" / "glm_proxy"
+    assert module.runtime_directory(str(expected), "production") == expected
+    with pytest.raises(ValueError, match="production_runtime_directory_required"):
+        module.runtime_directory(None, "production")
+    with pytest.raises(ValueError, match="production_runtime_directory_required"):
+        module.runtime_directory(str(tmp_path / "public-auth"), "production")
+    assert module.runtime_directory(None, "trial") == module.TRIAL

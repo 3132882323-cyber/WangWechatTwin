@@ -30,14 +30,14 @@ class ReplyLLM:
         if config.openai.provider=='hybrid_web':
             from app.web_llm import WebReplyLLM
             self.hybrid = {}
-            for lane, provider in {'chatgpt': 'web', 'deepseek': 'deepseek_web', 'doubao': 'doubao_web'}.items():
+            for lane, provider in {'chatgpt': 'web', 'deepseek': 'deepseek_web', 'doubao': 'doubao_web', 'glm': None}.items():
                 if lane in config.openai.disabled_lanes:
                     continue
                 settings = config.openai.local_proxies.get(lane)
                 if settings and settings.enabled:
                     from app.local_proxy_llm import LocalProxyReplyLLM
                     self.hybrid[lane] = LocalProxyReplyLLM(config, lane)
-                else:
+                elif provider is not None:
                     lane_config = config.model_copy(update={'openai': config.openai.model_copy(update={'provider': provider})})
                     self.hybrid[lane] = WebReplyLLM(lane_config)
             return

@@ -344,13 +344,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         now = time.time()
         stale = bool(heartbeat) and now - heartbeat.get("seen_at", 0) > 120
         runtime_ok = not bool(workers.get("dead_lanes")) and not stale
-        required = {
-            'web': ('chatgpt',),
-            'deepseek_web': ('deepseek',),
-            'doubao_web': ('doubao',),
-            'hybrid_web': ('chatgpt', 'deepseek', 'doubao'),
-        }.get(config.openai.provider, ())
-        required = tuple(lane for lane in required if lane not in config.openai.disabled_lanes)
+        required = config.openai.required_lanes()
         model_bridges = {}
         def age_of(value):
             if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= now + 120:

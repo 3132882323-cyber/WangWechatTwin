@@ -131,16 +131,30 @@ def command_doctor(args: argparse.Namespace) -> int:
             ).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
-    web_providers = {'web': ('chatgpt',), 'deepseek_web': ('deepseek',),
-                     'doubao_web': ('doubao',), 'hybrid_web': ('chatgpt', 'deepseek', 'doubao')}
-    required_bridges = web_providers.get(config.openai.provider, ())
+    required_bridges = config.openai.required_lanes()
     bridge_readiness = {}
+    proxy_readiness = {}
     for provider in required_bridges:
+        proxy = config.openai.local_proxies.get(provider)
+        if proxy and proxy.enabled:
+            import socket
+            from urllib.parse import urlsplit
+            endpoint = urlsplit(proxy.base_url)
+            try:
+                with socket.create_connection((endpoint.hostname, endpoint.port), timeout=.25):
+                    reachable = True
+            except OSError:
+                reachable = False
+            available = config.resolve(proxy.api_key_file).is_file()
+            proxy_readiness[provider] = {"transport_reachable": reachable, "key_file_present": available,
+                                         "inference_verified": False}
+            continue
         state = db.get_state('browser_bridge' if provider == 'chatgpt' else provider + '_bridge') or {}
         heartbeat = state.get('heartbeat_seen_at')
         bridge_readiness[provider] = (isinstance(heartbeat, (int, float))
             and 0 <= time.time() - heartbeat < 120 and not state.get('blocked', False))
-    model_ready = all(bridge_readiness.values()) if required_bridges else account_ready if uses_account else bool(key)
+    model_ready = (all(bridge_readiness.values()) and all(item["transport_reachable"] and item["key_file_present"]
+                   for item in proxy_readiness.values())) if required_bridges else account_ready if uses_account else bool(key)
     python_supported = (3, 10) <= sys.version_info[:2] < (3, 13)
     report = {
         "ok": model_ready and python_supported,
@@ -154,6 +168,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "openai_key_present": bool(key),
         "inference_provider": config.openai.provider if required_bridges else "account" if uses_account else "api",
         "browser_bridges": bridge_readiness,
+        "local_proxies": proxy_readiness,
         "model_credentials_available": model_ready,
         "model_inference_verified": False,
         "openai_base_url": base or "official",
@@ -161,7 +176,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "warnings": [],
     }
     if not model_ready:
-        report["warnings"].append("网页桥接心跳尚未就绪，请连接扩展并登录所选网页模型；心跳不代表生成验收通过" if required_bridges else "AI 尚未连接，请先登录 Codex 或配置模型密钥")
+        report["warnings"].append("本机模型网关或专用网页连接尚未就绪；端口与心跳不代表生成验收通过" if required_bridges else "AI 尚未连接，请先登录 Codex 或配置模型密钥")
     if not python_supported:
         report["warnings"].append("建议使用 Python 3.11 或 3.12")
     try:

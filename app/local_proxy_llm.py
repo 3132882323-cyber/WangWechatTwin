@@ -25,15 +25,18 @@ from app.llm import LLMError
 from app.models import ReplyDecision, RiskLevel
 
 
-_ENDPOINTS = {"deepseek": (19655, "deepseek-chat"), "doubao": (19656, "doubao")}
+_ENDPOINTS = {"deepseek": (19655, "deepseek-chat"), "doubao": (19656, "doubao"),
+              "glm": (19659, "chatglm-web")}
 _MAX_IMAGE_BYTES = 2 * 1024 * 1024
 _MAX_TOTAL_IMAGE_BYTES = 4 * 1024 * 1024
 _MAX_REQUEST_BYTES = 8 * 1024 * 1024
+_MAX_GLM_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_PAYLOAD_BYTES = 256 * 1024
 _ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _RECOVERY_BACKOFF_SECONDS = 30.0
 _MAX_RECOVERY_BACKOFF_SECONDS = 300.0
+_TOOL_REVIEW_REASON = "上游返回了工具元数据，本轮草稿须先核对本轮本机事实后再决定是否发送。"
 
 
 def _fail(code: str) -> LLMError:
@@ -449,6 +452,8 @@ class LocalProxyReplyLLM:
                 raise ValueError
             if not isinstance(external_id, str) or not external_id.strip() or len(external_id) > 512 or mode not in {"abc", "direct"}:
                 raise ValueError
+            if self.lane == "glm" and (mode != "abc" or payload.get("incoming", {}).get("message_type", "text") != "text"):
+                raise ValueError
             images = self._images(payload.pop("__media_paths", []))
             payload.pop("__is_local_test", None)
             evidence = payload.pop("__local_proxy_recovery_context", None)
@@ -474,9 +479,12 @@ class LocalProxyReplyLLM:
             # Validate serialization and the largest possible routing metadata
             # before a durable pending claim is made.
             for candidate_body in (base_body, recovery_body):
-                preflight_body = {**candidate_body, **({"user": "wechat-proxy-" + "f" * 32}
-                    if self.lane == "deepseek" else {"conversation_id": "x" * 128})}
-                if len(json.dumps(preflight_body, ensure_ascii=False).encode("utf-8")) > _MAX_REQUEST_BYTES:
+                metadata = ({"user": "f" * 64, "request_id": request_key} if self.lane == "glm" else
+                            {"user": "wechat-proxy-" + "f" * 32} if self.lane == "deepseek" else
+                            {"conversation_id": "x" * 128})
+                preflight_body = {**candidate_body, **metadata}
+                request_limit = _MAX_GLM_REQUEST_BYTES if self.lane == "glm" else _MAX_REQUEST_BYTES
+                if len(json.dumps(preflight_body, ensure_ascii=False).encode("utf-8")) > request_limit:
                     raise ValueError
         except (KeyError, TypeError, ValueError, AttributeError):
             raise _fail("local_proxy_invalid_payload") from None
@@ -490,11 +498,16 @@ class LocalProxyReplyLLM:
             body = dict(recovery_body if session["rebuild_required"] else base_body)
             if self.lane == "deepseek":
                 body["user"] = session["session_key"]
+            elif self.lane == "glm":
+                # Stable across ordinary turns; a verified new-message recovery
+                # changes the generation while preserving old IDs and claims.
+                body["user"] = hashlib.sha256(session["session_key"].encode()).hexdigest()
+                body["request_id"] = request_key
             else:
                 body["conversation_id"] = session["remote_id"] or ""
             response = self._post(json.dumps(body, ensure_ascii=False).encode("utf-8"), key)
             remote_id = None
-            if self.lane == "doubao":
+            if self.lane in {"doubao", "glm"}:
                 remote_id = response.get("conversation_id")
                 if not isinstance(remote_id, str) or not _ID.fullmatch(remote_id):
                     raise _fail("local_proxy_missing_conversation")
@@ -502,6 +515,24 @@ class LocalProxyReplyLLM:
                 if session["remote_id"] and remote_id != session["remote_id"]:
                     raise _fail("local_proxy_conversation_changed")
             decision = self._decision(response, mode)
+            if self.lane == "glm":
+                tool_metadata_seen = response.get("tool_metadata_seen")
+                if type(tool_metadata_seen) is not bool:
+                    raise _fail("local_proxy_invalid_tool_metadata")
+                # Even ignore must contain ABC in this text-only GLM contract.
+                candidates = decision.candidates or []
+                normalized = {re.sub(r"[\s，,。.!！?？…~～]+", "", item.reply).casefold() for item in candidates}
+                if len(candidates) != 3 or {item.label for item in candidates} != {"A", "B", "C"} or len(normalized) != 3:
+                    raise _fail("local_proxy_invalid_decision")
+                if tool_metadata_seen:
+                    decision = decision.model_copy(update={"action": "review", "confidence": 0.0,
+                        "holding_reply": None, "reason": _TOOL_REVIEW_REASON})
+                    decision._tool_metadata_seen = True
+                if session["rebuild_required"]:
+                    decision = decision.model_copy(update={"action": "review", "confidence": 0.0,
+                        "holding_reply": None,
+                        "reason": (decision.reason + "；GLM 未知会话已用当前本机记录建立新代次，首次恢复草稿须审核").strip("；")})
+                    decision._manual_review_required = True
             self._complete(conversation_key, request_key, remote_id, session["started"])
             return decision
         except _NoSubmission:
