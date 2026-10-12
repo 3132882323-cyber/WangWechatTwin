@@ -16,7 +16,17 @@ python -m app.doubao_voice --help
 
 ## 本人声线
 
-本机参考声线可以研究官方 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 的 Base 模型。其本机推理与豆包网页预设音色不同；首次需下载模型并安装独立依赖，不能直接升级已运行微信后台的 Python 环境。参考音频只应来自已核对、本人确认的录音，转写不确定时不能把它当作可信字稿。
+提供独立的 `scripts/generate_voice_clone.py`，使用官方 [llama.cpp TTS](https://github.com/ggml-org/llama.cpp/blob/master/tools/tts/README.md) 与 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) Base GGUF 在本机生成本人参考声线。其本机推理与豆包网页预设音色不同，不上传参考声音。
+
+当前校验固定 Windows CUDA 12.4 的 b10679 二进制与官方 1.7B Base Q4_K_M/Q8 音频投影模型。CLI 不下载或安装模型，不升级微信后台的 Python；需要先从官方来源准备、核验资产。参考音频只应来自已核对、本人确认的录音，转写不确定时不能把它当作可信字稿。
+
+```text
+python scripts/generate_voice_clone.py --reference-audio "<本人参考.wav>" --i-own-this-voice --text-file "<单句UTF-8文本.txt>" --assets-dir "<已核验资产目录>" --request-id "<唯一编号>"
+```
+
+输出默认保存在 `.runtime/voice_clones`，不会自动发送。固定 4096 上下文、4 条计算线程，启动前需要至少 7 GiB 可用提交内存及 4 GiB 空闲显存，运行中低于 1 GiB 提交余量就停止自己的合成进程。提交余量与空闲物理内存不同；本机实测曾在物理内存仍有余量时耗尽提交上限。未知或已完成的编号都不重发。
+
+Windows 已有一份真实本机试听：使用本人确认的约 6 秒参考录音，合成约 3 秒新语句，用户反馈“音色接近”。这只是一份案例，没有发表参考录音、生成声音或声线特征，不代表其他设备或其他录音都能得到相同效果。
 
 音频生成成功不证明音色、口气或文本内容完全一致；先试听核对，再决定是否启用。应让 GPU 与系统内存不足时停止该条任务，避免阻塞微信文字回复。
 
