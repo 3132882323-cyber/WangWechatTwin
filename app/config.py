@@ -29,6 +29,8 @@ class LocalProxySettings(BaseModel):
 
 class OpenAISettings(BaseModel):
     local_proxies: dict[Literal["deepseek", "doubao"], LocalProxySettings] = Field(default_factory=dict)
+    everyday_lane: Literal["deepseek", "doubao"] = "deepseek"
+    disabled_lanes: list[Literal["chatgpt", "deepseek", "doubao"]] = Field(default_factory=list)
     deepseek_drafts: bool=False
     deepseek_fast: bool=False
     provider: Literal["auto", "api", "account", "web", "deepseek_web", "doubao_web", "hybrid_web"] = "auto"
@@ -40,10 +42,19 @@ class OpenAISettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_proxy_lanes(self):
+        if self.provider == "hybrid_web" and self.everyday_lane in self.disabled_lanes:
+            raise ValueError("everyday lane cannot be disabled")
+        provider_lane = {"web": "chatgpt", "deepseek_web": "deepseek", "doubao_web": "doubao"}.get(self.provider)
+        if provider_lane in self.disabled_lanes:
+            raise ValueError("configured provider uses a disabled model lane")
+        if "deepseek" in self.disabled_lanes and self.deepseek_drafts:
+            raise ValueError("disabled DeepSeek cannot generate comparison drafts")
         session_files = {item.session_db for item in self.local_proxies.values() if item.enabled}
         if len(session_files) > 1:
             raise ValueError("enabled local proxy lanes must share their session database")
         for lane, settings in self.local_proxies.items():
+            if lane in self.disabled_lanes and settings.enabled:
+                raise ValueError("disabled lane cannot have an enabled local proxy")
             expected = "http://127.0.0.1:" + ("19655" if lane == "deepseek" else "19656") + "/v1"
             if settings.base_url != expected:
                 raise ValueError("local proxy endpoint does not match its lane")

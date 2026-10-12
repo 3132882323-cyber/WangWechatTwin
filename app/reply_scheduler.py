@@ -224,11 +224,11 @@ class ReplyScheduler:
         self.wake.set()
 
     @staticmethod
-    def lane(message):
+    def lane(message, everyday_lane='deepseek'):
         from app.llm import ReplyLLM
         from app.risk import assess_risk
         return ReplyLLM.route(json.dumps({'incoming': {'content': message.content, 'message_type': message.message_type},
-                                         '__media_paths': message.media_paths}), assess_risk(message.content).level)
+                                         '__media_paths': message.media_paths}), assess_risk(message.content).level, everyday_lane=everyday_lane)
 
     def _occupied(self, connection, message):
         wanted = self.occupancy_key(message)
@@ -255,7 +255,7 @@ class ReplyScheduler:
                         self.db.quarantine_reply_job(connection, identity, reason)
                         continue
                     recovered = self.recovering(message)
-                    if self.lane(message) != lane or self._occupied(connection, message):
+                    if self.lane(message, self.config.openai.everyday_lane) != lane or self._occupied(connection, message):
                         continue
                 except (ValueError, TypeError, AttributeError):
                     connection.execute("UPDATE reply_jobs SET status='invalid',updated=? WHERE id=?", (time.time(), identity))

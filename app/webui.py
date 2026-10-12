@@ -124,7 +124,7 @@ small{{color:#9ca3af}}
 <header><div><strong>微信聊天分身</strong><br><small>{'当前只生成草稿，不会发送微信消息' if draft_only else '已接管已有聊天：日常文字自动回复，重要事项待审核；群聊只处理@你的消息' if config.wechat.sender_all_existing_chats else '仅接管已确认的测试联系人，其他联系人只生成草稿' if config.adapter == 'history_verified_sender' else '已开启发送功能'}</small></div>
 <div><span class="badge">{'已暂停' if paused else '运行中'}</span></div></header>
 <main>
-<section class="card"><strong>本人的专属聊天数据库</strong><p>已保存 {personal_count} 条双向记录，识别纠正 {correction_count} 条。本人原文、AI 回复与听写结果分开记录；本人发出的文字和已解码媒体也进入当前聊天上下文。{'日常文字与语音转写由 DeepSeek 回复，图片表情交给豆包，专业与激动情绪交给 GPT；共用本机审核及发送规则。' if config.openai.provider=='hybrid_web' else 'DeepSeek 仅生成对照草稿，不直接发送。'}</p></section>
+<section class="card"><strong>本人的专属聊天数据库</strong><p>已保存 {personal_count} 条双向记录，识别纠正 {correction_count} 条。本人原文、AI 回复与听写结果分开记录；本人发出的文字和已解码媒体也进入当前聊天上下文。{'日常文字、语音转写及图片表情按当前通道配置处理，专业与激动情绪交给 GPT；共用本机审核及发送规则。' if config.openai.provider=='hybrid_web' else 'DeepSeek 仅生成对照草稿，不直接发送。'}</p></section>
 <div class="card">{'普通 ChatGPT 网页：不个性化临时会话，只输入微信上下文；连接失败不会自动切回 Codex。' if config.openai.provider == 'web' else '使用当前配置的模型连接。'}</div>
 <form method="post" action="/{'resume' if paused else 'pause'}"><input type="hidden" name="_csrf" value="{csrf_token}"><button class="pause">{'恢复处理' if paused else '立即暂停'}</button></form>
 <section class="card"><strong>后台网页：{window_status}</strong><p>专用网页与日常浏览器窗口分开。需要登录或检查时显示，完成后恢复后台；显示期间不启动新网页任务，已开始的一轮可能完成。</p>
@@ -195,13 +195,15 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             result = await asyncio.to_thread(register, db, body.get('window_id'), body.get('host_tab_id'))
             result['capabilities'] = capabilities()
             recovery = db.get_state('browser_model_recovery') or {}
-            if result.get('ok') and recovery.get('nonce') and not recovery.get('completed'):
+            if not config.openai.disabled_lanes and result.get('ok') and recovery.get('nonce') and not recovery.get('completed'):
                 result['recovery_requested'] = {'nonce': recovery['nonce']}
             return result
 
         @app.post('/browser-bridge/window/retire-for-recovery')
         async def retire_browser_window_for_recovery(request: Request):
             bridge_auth(request)
+            if config.openai.disabled_lanes:
+                raise HTTPException(409, '已停用的模型不会恢复')
             body = await request.json()
             if not isinstance(body, dict):
                 raise HTTPException(400, '恢复参数无效')
@@ -213,6 +215,8 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         @app.post('/browser-bridge/window/recovered')
         async def browser_models_recovered(request: Request):
             bridge_auth(request)
+            if config.openai.disabled_lanes:
+                raise HTTPException(409, '已停用的模型不会恢复')
             body = await request.json()
             recovery = db.get_state('browser_model_recovery') or {}
             window = db.get_state('browser_bridge_window') or {}
@@ -271,6 +275,8 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             bridge_auth(request)
             provider=request.headers.get('x-wechat-bridge-provider','chatgpt')
             if provider not in {'chatgpt','deepseek','doubao'}:raise HTTPException(400,'未知网页提供方')
+            if provider in config.openai.disabled_lanes:
+                return JSONResponse(status_code=204, content=None)
             if provider=='chatgpt' and request.headers.get('x-wechat-bridge-version') == '4':
                 state = db.get_state('browser_bridge') or {}
                 db.set_state('browser_bridge', {**state, 'version':4,'seen_at':time.time(),
@@ -344,6 +350,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
             'doubao_web': ('doubao',),
             'hybrid_web': ('chatgpt', 'deepseek', 'doubao'),
         }.get(config.openai.provider, ())
+        required = tuple(lane for lane in required if lane not in config.openai.disabled_lanes)
         model_bridges = {}
         def age_of(value):
             if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= now + 120:
@@ -361,6 +368,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                 except OSError:
                     reachable = False
                 verified_at = None
+                last_outcome = None
                 try:
                     import sqlite3
                     session_path = config.resolve(proxy.session_db)
@@ -369,10 +377,14 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
                             verified_at = session_db.execute(
                                 "SELECT max(created) FROM local_proxy_turns WHERE lane=? AND status='done'", (provider,)
                             ).fetchone()[0]
+                            last_row = session_db.execute(
+                                "SELECT status FROM local_proxy_turns WHERE lane=? ORDER BY created DESC,rowid DESC LIMIT 1", (provider,)
+                            ).fetchone()
+                            last_outcome = last_row[0] if last_row else None
                 except (OSError, sqlite3.Error):
                     verified_at = None
                 verified_age = age_of(verified_at)
-                recent_inference = verified_age is not None and verified_age <= 120
+                recent_inference = verified_age is not None and verified_age <= 120 and last_outcome == 'done'
                 model_bridges[provider] = {
                     'status': 'ready' if reachable and recent_inference else 'reachable_unverified' if reachable else 'unreachable',
                     'transport': 'local_http_proxy',
@@ -444,6 +456,8 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
     @app.post('/browser-window/recover-models')
     async def request_models_recovery(request: Request):
         await owner_action(request)
+        if config.openai.disabled_lanes:
+            raise HTTPException(409, '已停用的模型不会恢复；当前接口仅支持完整三路恢复。')
         from app.browser_window import resume
         await asyncio.to_thread(resume, db)
         db.set_state('browser_model_recovery', {'nonce': secrets.token_hex(16), 'requested_at': time.time(), 'completed': False})

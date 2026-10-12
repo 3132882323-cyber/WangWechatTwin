@@ -29,15 +29,22 @@ class ReplyLLM:
         self.hybrid=None
         if config.openai.provider=='hybrid_web':
             from app.web_llm import WebReplyLLM
-            self.hybrid={'chatgpt':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'web'})})),
-                         'deepseek':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'deepseek_web'})})),
-                         'doubao':WebReplyLLM(config.model_copy(update={'openai':config.openai.model_copy(update={'provider':'doubao_web'})}))}
-            for lane, settings in config.openai.local_proxies.items():
-                if settings.enabled:
+            self.hybrid = {}
+            for lane, provider in {'chatgpt': 'web', 'deepseek': 'deepseek_web', 'doubao': 'doubao_web'}.items():
+                if lane in config.openai.disabled_lanes:
+                    continue
+                settings = config.openai.local_proxies.get(lane)
+                if settings and settings.enabled:
                     from app.local_proxy_llm import LocalProxyReplyLLM
                     self.hybrid[lane] = LocalProxyReplyLLM(config, lane)
+                else:
+                    lane_config = config.model_copy(update={'openai': config.openai.model_copy(update={'provider': provider})})
+                    self.hybrid[lane] = WebReplyLLM(lane_config)
             return
         if config.openai.provider in {"web","deepseek_web","doubao_web"}:
+            lane = {"web": "chatgpt", "deepseek_web": "deepseek", "doubao_web": "doubao"}[config.openai.provider]
+            if lane in config.openai.disabled_lanes:
+                raise LLMError("model_lane_disabled")
             from app.web_llm import WebReplyLLM
             self.account = WebReplyLLM(config)
             return
@@ -65,14 +72,14 @@ class ReplyLLM:
         self.client = OpenAI(**kwargs)
 
     @staticmethod
-    def route(user_payload,risk):
+    def route(user_payload,risk, everyday_lane="deepseek"):
         parsed=payload_data(user_payload)
         visual=parsed.get('incoming',{}).get('message_type') in {'image','sticker'} or bool(parsed.get('__media_paths'))
         import re
         legacy_complex = bool(re.search('分析|对比', parsed.get('incoming',{}).get('content','')))
         if risk in {RiskLevel.high,RiskLevel.critical} or legacy_complex or is_professional_request(parsed) or is_emotional_request(parsed):
             return 'chatgpt'
-        return 'doubao' if visual else 'deepseek'
+        return 'doubao' if visual else everyday_lane
 
     def decide(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
         system_prompt, prepared_payload, mode = prepare_selection_request(system_prompt, user_payload)
@@ -80,17 +87,22 @@ class ReplyLLM:
         return select_reply(decision, mode=mode, user_payload=user_payload, incoming_risk=risk)
 
     def _decide_once(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
-        if self.hybrid:
-            lane = self.route(user_payload,risk)
+        if self.hybrid is not None:
+            lane = self.route(user_payload, risk, self.config.openai.everyday_lane)
+            if lane in self.config.openai.disabled_lanes:
+                raise LLMError("model_lane_disabled")
+            client = self.hybrid.get(lane)
+            if client is None:
+                raise LLMError("model_lane_unavailable")
             try:
-                return self.hybrid[lane].decide(system_prompt,user_payload,risk)
+                return client.decide(system_prompt,user_payload,risk)
             except LLMError as exc:
                 # Only a definitively cancelled, unclaimed job may change lanes.
                 # Unknown submission outcomes remain on review.
                 if not exc.fallback_safe:
                     raise
                 backup = FALLBACK_LANES.get(lane)
-                if backup and backup in self.hybrid:
+                if backup and backup not in self.config.openai.disabled_lanes and backup in self.hybrid:
                     return self.hybrid[backup].decide(system_prompt,user_payload,risk)
                 raise
         if self.account is not None:

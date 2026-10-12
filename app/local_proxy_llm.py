@@ -1,8 +1,9 @@
 """One-attempt local proxy draft requests with durable conversation ownership.
 
 No browser history, account credentials, redirects, retries, or WeChat sender is
-used here. A pending/unknown turn requires human review before its conversation
-can accept another request, including after a process restart.
+used here. Pending turns block their contact. Terminal unknown model drafts are
+never retried; a later message may rebuild an isolated session from verified
+local context while preserving the old turn and conversation bindings.
 """
 from __future__ import annotations
 
@@ -31,6 +32,8 @@ _MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_PAYLOAD_BYTES = 256 * 1024
 _ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_RECOVERY_BACKOFF_SECONDS = 30.0
+_MAX_RECOVERY_BACKOFF_SECONDS = 300.0
 
 
 def _fail(code: str) -> LLMError:
@@ -79,13 +82,40 @@ class LocalProxyReplyLLM:
                 PRIMARY KEY(lane,conversation_key,request_key));
             CREATE INDEX IF NOT EXISTS idx_local_proxy_turn_identity
                 ON local_proxy_turns(conversation_key,request_key);
+            CREATE TABLE IF NOT EXISTS local_proxy_session_history(
+                lane TEXT NOT NULL, conversation_key TEXT NOT NULL,
+                generation INTEGER NOT NULL, session_key TEXT NOT NULL,
+                remote_id TEXT, state TEXT NOT NULL, quarantined_at REAL NOT NULL,
+                PRIMARY KEY(lane,conversation_key,generation), UNIQUE(lane,session_key),
+                UNIQUE(lane,remote_id));
+            CREATE TABLE IF NOT EXISTS local_proxy_backoff(
+                lane TEXT NOT NULL, conversation_key TEXT NOT NULL, failures INTEGER NOT NULL,
+                retry_after REAL NOT NULL, last_failure REAL NOT NULL,
+                PRIMARY KEY(lane,conversation_key));
+            CREATE TABLE IF NOT EXISTS local_proxy_quarantined_ids(
+                lane TEXT NOT NULL, remote_id TEXT NOT NULL, conversation_key TEXT NOT NULL,
+                generation INTEGER NOT NULL, request_key TEXT NOT NULL, quarantined_at REAL NOT NULL,
+                PRIMARY KEY(lane,remote_id));
             """)
+            # Existing production rows are generation zero. Serialize additive
+            # migration so concurrent first requests cannot race ALTER TABLE.
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for table, additions in (
+                    ("local_proxy_sessions", {"generation": "INTEGER NOT NULL DEFAULT 0",
+                                              "rebuild_required": "INTEGER NOT NULL DEFAULT 0"}),
+                    ("local_proxy_turns", {"generation": "INTEGER NOT NULL DEFAULT 0"}),
+                ):
+                    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+                    for name, definition in additions.items():
+                        if name not in columns:
+                            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
             with connection:
                 yield connection
         finally:
             connection.close()
 
-    def _reserve(self, conversation_key, request_key):
+    def _reserve(self, conversation_key, request_key, recovery_context):
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = db.execute("""SELECT status FROM local_proxy_turns
@@ -96,28 +126,63 @@ class LocalProxyReplyLLM:
                         "local_proxy_not_submitted" if previous[0] == "not_submitted" else
                         "local_proxy_unknown_result")
                 raise _fail(code)
-            # A shared DB also prevents a later local lane from continuing an
-            # unresolved contact turn under a different model.
-            blocked = db.execute("""SELECT 1 FROM local_proxy_sessions
-                WHERE conversation_key=? AND state!='ready' LIMIT 1""",
+            # Even a stale pending claim has no confirmed terminal outcome.
+            # Recovery never expires it or races an in-flight request in a lane.
+            blocked = db.execute("""SELECT 1 FROM local_proxy_turns
+                WHERE conversation_key=? AND status='pending' LIMIT 1""",
                 (conversation_key,)).fetchone()
-            if blocked:
+            sessions = [dict(row) for row in db.execute("""SELECT * FROM local_proxy_sessions
+                WHERE conversation_key=?""", (conversation_key,))]
+            if blocked or any(row["state"] == "pending" for row in sessions):
                 raise _fail("local_proxy_unknown_session")
+            if any(row["state"] not in {"ready", "unknown"} for row in sessions):
+                raise _fail("local_proxy_state_error")
+            if any(type(row["generation"]) is not int or row["generation"] < 0 for row in sessions):
+                raise _fail("local_proxy_state_error")
+            generation = max((row["generation"] for row in sessions), default=0)
+            for row in sessions:
+                if row["state"] == "unknown" and not db.execute("""SELECT 1 FROM local_proxy_turns
+                    WHERE lane=? AND conversation_key=? AND generation=? AND status='unknown' LIMIT 1""",
+                    (row["lane"], conversation_key, row["generation"])).fetchone():
+                    raise _fail("local_proxy_state_error")
+            target = next((row for row in sessions if row["lane"] == self.lane), None)
+            quarantine = any(row["state"] == "unknown" for row in sessions)
+            needs_context = quarantine or bool(target and target["rebuild_required"]) or (not target and generation > 0)
+            if needs_context and recovery_context != "ready":
+                raise _fail(recovery_context)
+            now = time.time()
+            backoff = db.execute("""SELECT retry_after FROM local_proxy_backoff
+                WHERE lane=? AND conversation_key=?""", (self.lane, conversation_key)).fetchone()
+            if backoff and backoff[0] > now:
+                raise _fail("local_proxy_cooldown")
+            if quarantine:
+                # All old lane contexts are sealed together. An unknown draft
+                # is not a WeChat send, and is not replayed into the replacement.
+                generation += 1
+                for row in sessions:
+                    db.execute("""INSERT INTO local_proxy_session_history
+                        (lane,conversation_key,generation,session_key,remote_id,state,quarantined_at)
+                        VALUES(?,?,?,?,?,?,?)""", (row["lane"], conversation_key, row["generation"],
+                        row["session_key"], row["remote_id"], row["state"], now))
+                    db.execute("""UPDATE local_proxy_sessions
+                        SET session_key=?,remote_id=NULL,state='ready',generation=?,rebuild_required=1
+                        WHERE lane=? AND conversation_key=?""",
+                        ("wechat-proxy-" + uuid.uuid4().hex, generation, row["lane"], conversation_key))
             db.execute("""INSERT OR IGNORE INTO local_proxy_sessions
-                (lane,conversation_key,session_key) VALUES(?,?,?)""",
-                (self.lane, conversation_key, "wechat-proxy-" + uuid.uuid4().hex))
-            session = dict(db.execute("""SELECT session_key,remote_id FROM local_proxy_sessions
+                (lane,conversation_key,session_key,generation,rebuild_required) VALUES(?,?,?,?,?)""",
+                (self.lane, conversation_key, "wechat-proxy-" + uuid.uuid4().hex, generation, int(generation > 0)))
+            session = dict(db.execute("""SELECT session_key,remote_id,generation,rebuild_required FROM local_proxy_sessions
                 WHERE lane=? AND conversation_key=?""", (self.lane, conversation_key)).fetchone())
             if not isinstance(session["session_key"], str) or not re.fullmatch(r"wechat-proxy-[a-f0-9]{32}", session["session_key"]):
                 raise _fail("local_proxy_state_error")
             if session["remote_id"] is not None and (not isinstance(session["remote_id"], str) or not _ID.fullmatch(session["remote_id"])):
                 raise _fail("local_proxy_state_error")
             db.execute("""INSERT INTO local_proxy_turns
-                (lane,conversation_key,request_key,status,created) VALUES(?,?,?,'pending',?)""",
-                (self.lane, conversation_key, request_key, time.time()))
+                (lane,conversation_key,request_key,status,created,generation) VALUES(?,?,?,'pending',?,?)""",
+                (self.lane, conversation_key, request_key, now, session["generation"]))
             db.execute("UPDATE local_proxy_sessions SET state='pending' WHERE lane=? AND conversation_key=?",
                        (self.lane, conversation_key))
-            return session
+            return {**session, "started": now}
 
     def _not_submitted(self, conversation_key, request_key):
         with self._connect() as db:
@@ -134,15 +199,57 @@ class LocalProxyReplyLLM:
             if updated != 1:
                 raise _fail("local_proxy_state_conflict")
 
-    def _unknown(self, conversation_key, request_key, code):
+    def _unknown(self, conversation_key, request_key, code, observed_remote_id=None):
         with self._connect() as db:
-            db.execute("""UPDATE local_proxy_turns SET status='unknown',error_code=?
+            db.execute("BEGIN IMMEDIATE")
+            updated = db.execute("""UPDATE local_proxy_turns SET status='unknown',error_code=?
                 WHERE lane=? AND conversation_key=? AND request_key=? AND status='pending'""",
-                (code, self.lane, conversation_key, request_key))
-            db.execute("UPDATE local_proxy_sessions SET state='unknown' WHERE lane=? AND conversation_key=?",
-                       (self.lane, conversation_key))
+                (code, self.lane, conversation_key, request_key)).rowcount
+            if updated != 1:
+                raise _fail("local_proxy_state_conflict")
+            session = db.execute("""SELECT generation,remote_id FROM local_proxy_sessions
+                WHERE lane=? AND conversation_key=? AND state='pending'""",
+                (self.lane, conversation_key)).fetchone()
+            if session is None:
+                raise _fail("local_proxy_state_conflict")
+            now = time.time()
+            # An unexpected new ID and the prior known ID can both refer to
+            # untrusted upstream history. Seal every observed unowned ID, without
+            # replacing the current binding or claiming another contact's ID.
+            for remote_id in {session["remote_id"], observed_remote_id} - {None}:
+                owner = db.execute("""SELECT conversation_key FROM local_proxy_sessions
+                    WHERE lane=? AND remote_id=?""", (self.lane, remote_id)).fetchone()
+                archived = db.execute("""SELECT conversation_key FROM local_proxy_session_history
+                    WHERE lane=? AND remote_id=?""", (self.lane, remote_id)).fetchone()
+                quarantined = db.execute("""SELECT conversation_key FROM local_proxy_quarantined_ids
+                    WHERE lane=? AND remote_id=?""", (self.lane, remote_id)).fetchone()
+                if any(row and row[0] != conversation_key for row in (owner, archived, quarantined)):
+                    continue
+                db.execute("""INSERT OR IGNORE INTO local_proxy_quarantined_ids
+                    (lane,remote_id,conversation_key,generation,request_key,quarantined_at)
+                    VALUES(?,?,?,?,?,?)""", (self.lane, remote_id, conversation_key,
+                    session["generation"], request_key, now))
+                if remote_id == observed_remote_id and not archived and not quarantined:
+                    # A malformed first decision can still establish the new
+                    # session's observed ID, which will be archived on recovery.
+                    db.execute("""UPDATE local_proxy_sessions SET remote_id=?
+                        WHERE lane=? AND conversation_key=? AND state='pending'
+                        AND (remote_id IS NULL OR remote_id=?)""",
+                        (remote_id, self.lane, conversation_key, remote_id))
+            updated = db.execute("""UPDATE local_proxy_sessions SET state='unknown'
+                WHERE lane=? AND conversation_key=? AND state='pending'""",
+                (self.lane, conversation_key)).rowcount
+            if updated != 1:
+                raise _fail("local_proxy_state_conflict")
+            previous = db.execute("""SELECT failures FROM local_proxy_backoff
+                WHERE lane=? AND conversation_key=?""", (self.lane, conversation_key)).fetchone()
+            failures = min(32, (previous[0] if previous else 0) + 1)
+            delay = min(_MAX_RECOVERY_BACKOFF_SECONDS, _RECOVERY_BACKOFF_SECONDS * 2 ** min(failures - 1, 4))
+            db.execute("""INSERT OR REPLACE INTO local_proxy_backoff
+                (lane,conversation_key,failures,retry_after,last_failure) VALUES(?,?,?,?,?)""",
+                (self.lane, conversation_key, failures, now + delay, now))
 
-    def _complete(self, conversation_key, request_key, remote_id):
+    def _complete(self, conversation_key, request_key, remote_id, started):
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if remote_id:
@@ -150,13 +257,25 @@ class LocalProxyReplyLLM:
                     WHERE lane=? AND remote_id=?""", (self.lane, remote_id)).fetchone()
                 if owner and owner[0] != conversation_key:
                     raise _fail("local_proxy_conversation_collision")
+                archived = db.execute("""SELECT conversation_key FROM local_proxy_session_history
+                    WHERE lane=? AND remote_id=? UNION ALL
+                    SELECT conversation_key FROM local_proxy_quarantined_ids
+                    WHERE lane=? AND remote_id=?""", (self.lane, remote_id, self.lane, remote_id)).fetchone()
+                if archived:
+                    raise _fail("local_proxy_quarantined_conversation" if archived[0] == conversation_key
+                                else "local_proxy_conversation_collision")
             updated = db.execute("""UPDATE local_proxy_turns SET status='done'
                 WHERE lane=? AND conversation_key=? AND request_key=? AND status='pending'""",
                 (self.lane, conversation_key, request_key)).rowcount
             if updated != 1:
                 raise _fail("local_proxy_state_conflict")
-            db.execute("""UPDATE local_proxy_sessions SET state='ready',remote_id=?
-                WHERE lane=? AND conversation_key=?""", (remote_id, self.lane, conversation_key))
+            updated = db.execute("""UPDATE local_proxy_sessions SET state='ready',remote_id=?,rebuild_required=0
+                WHERE lane=? AND conversation_key=? AND state='pending'""", (remote_id, self.lane, conversation_key)).rowcount
+            if updated != 1:
+                raise _fail("local_proxy_state_conflict")
+            # A request started before a later failure must not clear its delay.
+            db.execute("""DELETE FROM local_proxy_backoff
+                WHERE lane=? AND conversation_key=? AND last_failure<=?""", (self.lane, conversation_key, started))
 
     def _read_key(self):
         try:
@@ -226,7 +345,10 @@ class LocalProxyReplyLLM:
             active_socket = connection.sock
             response = connection.getresponse()
             if response.status != 200:
-                raise _fail("local_proxy_http_error")
+                # Status is sufficient for auth/rate-limit/upstream diagnosis;
+                # do not read or echo an error body, URL or authentication data.
+                code = f"local_proxy_http_{response.status}" if 100 <= response.status <= 599 else "local_proxy_http_error"
+                raise _fail(code)
             chunks, total = [], 0
             while total <= _MAX_RESPONSE_BYTES:
                 if response.isclosed():
@@ -259,6 +381,9 @@ class LocalProxyReplyLLM:
             content = choice["message"]["content"]
             if not isinstance(content, str):
                 raise ValueError
+            fenced = re.fullmatch(r"\s*```json[ \t]*\r?\n(.*?)\r?\n```\s*", content, re.DOTALL)
+            if fenced:
+                content = fenced[1]
             raw = json.loads(content)
             if not isinstance(raw, dict):
                 raise ValueError
@@ -274,6 +399,41 @@ class LocalProxyReplyLLM:
         except (KeyError, IndexError, TypeError, ValueError, ValidationError):
             raise _fail("local_proxy_invalid_decision") from None
 
+    @staticmethod
+    def _recovery_context(payload, evidence, external_id, has_images):
+        """Check the private marker made by the local PromptBuilder, not the model.
+
+        The caller must establish completeness and media dependencies from local
+        WeChat records. Lists or a model's own assertion alone never opt in.
+        """
+        required = "local_proxy_recovery_context_required"
+        if (not isinstance(evidence, dict) or type(evidence.get("version")) is not int
+                or evidence["version"] != 1 or evidence.get("source") != "local_wechat"
+                or evidence.get("conversation_key") != payload["conversation_key"]
+                or evidence.get("external_id") != external_id or evidence.get("complete") is not True):
+            return required
+        if evidence.get("unresolved_media") is not False:
+            return "local_proxy_recovery_media_unresolved"
+        incoming = payload.get("incoming", {})
+        kind = incoming.get("message_type")
+        if kind not in {"text", "image", "sticker"} or not isinstance(incoming.get("content"), str) or not incoming["content"].strip():
+            return required
+        if kind != "text" and not has_images:
+            return "local_proxy_recovery_media_unresolved"
+        recent = payload.get("recent_messages")
+        personal = payload.get("current_personal_conversation")
+        if not isinstance(recent, list) or not recent or not isinstance(personal, list):
+            return required
+        for rows, type_field in ((recent, "message_type"), (personal, "kind")):
+            if any(not isinstance(row, dict) or row.get("direction") not in {"in", "out"}
+                   or not isinstance(row.get("content"), str) or not isinstance(row.get(type_field), str)
+                   for row in rows):
+                return required
+        if not any(row["direction"] == "in" and row["content"] == incoming["content"]
+                   and row["message_type"] == kind for row in recent):
+            return required
+        return "ready"
+
     def decide(self, system_prompt: str, user_payload: str, risk: RiskLevel) -> ReplyDecision:
         try:
             if not isinstance(user_payload, str) or len(user_payload.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
@@ -281,6 +441,9 @@ class LocalProxyReplyLLM:
             payload = json.loads(user_payload)
             conversation_key = payload["conversation_key"]
             external_id = payload.get("external_id") or payload["incoming"].get("external_id")
+            incoming_external_id = payload.get("incoming", {}).get("external_id")
+            if incoming_external_id is not None and incoming_external_id != external_id:
+                raise ValueError
             mode = payload.get("reply_selection", {}).get("mode", "abc")
             if not isinstance(conversation_key, str) or not re.fullmatch(r"[a-f0-9]{64}", conversation_key):
                 raise ValueError
@@ -288,40 +451,58 @@ class LocalProxyReplyLLM:
                 raise ValueError
             images = self._images(payload.pop("__media_paths", []))
             payload.pop("__is_local_test", None)
+            evidence = payload.pop("__local_proxy_recovery_context", None)
+            recovery_context = self._recovery_context(payload, evidence, external_id, bool(images))
             request_key = hashlib.sha256(external_id.encode("utf-8")).hexdigest()
             schema = json.dumps(ReplyDecision.model_json_schema(), ensure_ascii=False)
-            messages = [{"role": "system", "content": system_prompt + "\n仅依据本轮payload核对事实；旧网页对话和模型草稿不能当作本人事实。只返回符合以下完整结构的JSON，不要普通文本或代码围栏：\n" + schema},
-                        {"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}, *images] if images else json.dumps(payload, ensure_ascii=False)}]
-            base_body = {"model": self.model, "stream": False, "messages": messages}
+            def make_body(value, recovery=False):
+                prompt = system_prompt + "\n仅依据本轮payload核对事实；旧网页对话和模型草稿不能当作本人事实。"
+                if recovery:
+                    prompt += "本轮是隔离旧模型会话后建立的新会话，只根据本轮本机微信记录重建语境；旧模型草稿不表示已向微信发送。缺少必需事实、指代不明或依赖未识别媒体时必须review，不猜测、不补答旧消息。"
+                prompt += "只返回符合以下完整结构的JSON，不要普通文本或代码围栏：\n" + schema
+                text = json.dumps(value, ensure_ascii=False)
+                return {"model": self.model, "stream": False, "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": [{"type": "text", "text": text}, *images] if images else text}]}
+            base_body = make_body(payload)
+            # Unsent suggestions and old model summaries are not authoritative
+            # WeChat history and must not reconstruct a quarantined conversation.
+            rebuilt_payload = {key: value for key, value in payload.items()
+                               if key not in {"optional_model_candidates", "contact_memories",
+                                              "historical_conversation_memory", "style_examples", "owner_role_profile"}}
+            recovery_body = make_body(rebuilt_payload, recovery=True)
             # Validate serialization and the largest possible routing metadata
             # before a durable pending claim is made.
-            preflight_body = {**base_body, **({"user": "wechat-proxy-" + "f" * 32}
-                if self.lane == "deepseek" else {"conversation_id": "x" * 128})}
-            if len(json.dumps(preflight_body, ensure_ascii=False).encode("utf-8")) > _MAX_REQUEST_BYTES:
-                raise ValueError
+            for candidate_body in (base_body, recovery_body):
+                preflight_body = {**candidate_body, **({"user": "wechat-proxy-" + "f" * 32}
+                    if self.lane == "deepseek" else {"conversation_id": "x" * 128})}
+                if len(json.dumps(preflight_body, ensure_ascii=False).encode("utf-8")) > _MAX_REQUEST_BYTES:
+                    raise ValueError
         except (KeyError, TypeError, ValueError, AttributeError):
             raise _fail("local_proxy_invalid_payload") from None
         key = self._read_key()
         try:
-            session = self._reserve(conversation_key, request_key)
+            session = self._reserve(conversation_key, request_key, recovery_context)
         except (OSError, sqlite3.Error):
             raise _fail("local_proxy_state_error") from None
+        observed_remote_id = None
         try:
-            body = dict(base_body)
+            body = dict(recovery_body if session["rebuild_required"] else base_body)
             if self.lane == "deepseek":
                 body["user"] = session["session_key"]
             else:
                 body["conversation_id"] = session["remote_id"] or ""
             response = self._post(json.dumps(body, ensure_ascii=False).encode("utf-8"), key)
-            decision = self._decision(response, mode)
             remote_id = None
             if self.lane == "doubao":
                 remote_id = response.get("conversation_id")
                 if not isinstance(remote_id, str) or not _ID.fullmatch(remote_id):
                     raise _fail("local_proxy_missing_conversation")
+                observed_remote_id = remote_id
                 if session["remote_id"] and remote_id != session["remote_id"]:
                     raise _fail("local_proxy_conversation_changed")
-            self._complete(conversation_key, request_key, remote_id)
+            decision = self._decision(response, mode)
+            self._complete(conversation_key, request_key, remote_id, session["started"])
             return decision
         except _NoSubmission:
             try:
@@ -332,9 +513,9 @@ class LocalProxyReplyLLM:
                 raise _fail("local_proxy_state_error") from None
             raise _fail("local_proxy_not_submitted") from None
         except Exception as exc:
-            code = str(exc) if isinstance(exc, LLMError) and re.fullmatch(r"local_proxy_[a-z_]+", str(exc)) else "local_proxy_request_unknown"
+            code = str(exc) if isinstance(exc, LLMError) and re.fullmatch(r"local_proxy_(?:[a-z_]+|http_[1-5][0-9]{2})", str(exc)) else "local_proxy_request_unknown"
             try:
-                self._unknown(conversation_key, request_key, code)
-            except (OSError, sqlite3.Error):
+                self._unknown(conversation_key, request_key, code, observed_remote_id)
+            except (OSError, sqlite3.Error, LLMError):
                 pass  # The committed pending claim still blocks later turns.
             raise _fail(code) from None

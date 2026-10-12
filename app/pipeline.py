@@ -88,7 +88,7 @@ class ReplyPipeline:
     @staticmethod
     def _neutral_date_question(message, decision, risk, route) -> bool:
         if (
-            message.message_type != "text" or route != "deepseek"
+            message.message_type != "text" or route not in {"deepseek", "doubao"}
             or risk.level != RiskLevel.medium
             or risk.reasons != ["包含日期、数量、金额或交付信息"]
             or decision.action != "send" or decision.risk != RiskLevel.low
@@ -248,7 +248,7 @@ class ReplyPipeline:
         risk = assess_risk(message.content)
         inbound_id = self.db.add_incoming(message, risk=risk.level.value)
         vision_ready=(self.db.get_state('browser_bridge') or {}).get('build') in {'sticker-vision-v1','fast-sticker-v2'}
-        media_route=ReplyLLM.route(json.dumps({'incoming':{'content':message.content,'message_type':message.message_type},'__media_paths':message.media_paths}),risk.level)
+        media_route=ReplyLLM.route(json.dumps({'incoming':{'content':message.content,'message_type':message.message_type},'__media_paths':message.media_paths}),risk.level, everyday_lane=self.config.openai.everyday_lane)
         if media_route=='doubao' and self.config.openai.provider in {'hybrid_web','doubao_web'}:vision_ready=bool((self.db.get_state('doubao_bridge') or {}).get('ready'))
         proxy = self.config.openai.local_proxies.get('doubao')
         if media_route == 'doubao' and proxy and proxy.enabled:

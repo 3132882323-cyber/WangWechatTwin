@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
+import pytest
 
 from app.config import AppConfig, load_config
 from app.llm import LLMError, ReplyLLM
@@ -77,15 +78,88 @@ def test_high_risk_message_uses_gpt_without_fallback_confusion(tmp_path):
     assert llm.route(json.dumps({'incoming': {'content': '在吗', 'message_type': 'text'}}), RiskLevel.low) == 'deepseek'
 
 
-def test_unknown_submission_never_falls_back(tmp_path):
-    import pytest
-    llm = ReplyLLM(AppConfig(project_root=tmp_path, openai={'provider': 'hybrid_web'}))
+@pytest.mark.parametrize('lane', ['deepseek', 'doubao'])
+def test_unknown_submission_never_falls_back(tmp_path, lane):
+    llm = ReplyLLM(AppConfig(project_root=tmp_path, openai={'provider': 'hybrid_web', 'everyday_lane': lane}))
     calls = []
     class Stub:
         def decide(self, *args):
-            calls.append('deepseek')
+            calls.append(lane)
             raise LLMError('提交结果未知')
-    llm.hybrid = {'deepseek': Stub(), 'chatgpt': Stub()}
+    llm.hybrid = {lane: Stub(), 'chatgpt': Stub()}
     with pytest.raises(LLMError, match='提交结果未知'):
         llm._decide_once('sys', json.dumps({'incoming': {'content': '在吗'}}), RiskLevel.low)
-    assert calls == ['deepseek']
+    assert calls == [lane]
+
+
+def test_doubao_safe_fallback_never_uses_disabled_deepseek(tmp_path):
+    config = AppConfig(project_root=tmp_path, openai={
+        'provider': 'hybrid_web', 'everyday_lane': 'doubao', 'disabled_lanes': ['deepseek'],
+    })
+    llm = ReplyLLM(config)
+    calls = []
+
+    class Stub:
+        def __init__(self, lane):
+            self.lane = lane
+
+        def decide(self, *args):
+            calls.append(self.lane)
+            if self.lane == 'doubao':
+                raise LLMError('任务未领取且已原子取消', fallback_safe=True)
+            return ReplyDecision(action='review', risk=RiskLevel.low, reply='测试')
+
+    llm.hybrid = {name: Stub(name) for name in ('chatgpt', 'deepseek', 'doubao')}
+    llm._decide_once('system', json.dumps({'incoming': {'content': '你吃饭了吗'}}), RiskLevel.low)
+    assert calls == ['doubao', 'chatgpt']
+
+
+def test_disabled_backup_is_not_called_even_if_injected(tmp_path):
+    config = AppConfig(project_root=tmp_path, openai={
+        'provider': 'hybrid_web', 'everyday_lane': 'doubao', 'disabled_lanes': ['deepseek', 'chatgpt'],
+    })
+    llm = ReplyLLM(config)
+    calls = []
+
+    class Stub:
+        def decide(self, *args):
+            calls.append('called')
+            raise LLMError('任务未领取且已原子取消', fallback_safe=True)
+
+    llm.hybrid = {'doubao': Stub(), 'chatgpt': Stub()}
+    with pytest.raises(LLMError, match='任务未领取且已原子取消'):
+        llm._decide_once('system', json.dumps({'incoming': {'content': '你吃饭了吗'}}), RiskLevel.low)
+    assert calls == ['called']
+    with pytest.raises(LLMError, match='model_lane_disabled'):
+        llm._decide_once('system', json.dumps({'incoming': {'content': '分析施工方案'}}), RiskLevel.high)
+    assert calls == ['called']
+
+
+def test_missing_everyday_doubao_does_not_silently_return_to_deepseek(tmp_path):
+    config = AppConfig(project_root=tmp_path, openai={
+        'provider': 'hybrid_web', 'everyday_lane': 'doubao', 'disabled_lanes': ['deepseek'],
+    })
+    llm = ReplyLLM(config)
+    calls = []
+
+    class Stub:
+        def decide(self, *args):
+            calls.append('deepseek')
+
+    llm.hybrid = {'deepseek': Stub()}
+    with pytest.raises(LLMError, match='model_lane_unavailable'):
+        llm._decide_once('system', json.dumps({'incoming': {'content': '你吃饭了吗'}}), RiskLevel.low)
+    assert calls == []
+
+
+def test_disabled_web_provider_is_blocked_after_unvalidated_copy(tmp_path, monkeypatch):
+    from app import web_llm
+    config = AppConfig(project_root=tmp_path, openai={
+        'provider': 'hybrid_web', 'everyday_lane': 'doubao', 'disabled_lanes': ['deepseek'],
+    })
+    config.openai = config.openai.model_copy(update={'provider': 'deepseek_web'})
+    constructed = []
+    monkeypatch.setattr(web_llm, 'WebReplyLLM', lambda config: constructed.append(config))
+    with pytest.raises(LLMError, match='model_lane_disabled'):
+        ReplyLLM(config)
+    assert constructed == []

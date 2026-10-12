@@ -111,7 +111,7 @@ def main():
         if os.name == 'nt' and config.openai.provider == 'hybrid_web':
             proxy = config.openai.local_proxies.get('deepseek')
             script = root / 'deepseek_watchdog.py'
-            if proxy is not None and proxy.enabled and script.is_file():
+            if proxy is not None and proxy.enabled and 'deepseek' not in config.openai.disabled_lanes and script.is_file():
                 from app.local_proxy_watchdog import ensure_deepseek_watchdog
                 watchdog_check = lambda: ensure_deepseek_watchdog(script)
         supervise([sys.executable, '-u', '-m', 'app', '--config', args.config, 'run'], root,

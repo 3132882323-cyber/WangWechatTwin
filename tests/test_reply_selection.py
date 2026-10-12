@@ -269,6 +269,7 @@ def test_each_backend_receives_abc_once_and_local_code_selects(backend):
     if backend == "account":
         router.account = Account()
     elif backend == "hybrid":
+        router.config = SimpleNamespace(openai=SimpleNamespace(everyday_lane="deepseek", disabled_lanes=[]))
         router.hybrid = {"deepseek": Account()}
     else:
         router.config = SimpleNamespace(openai=SimpleNamespace(primary_model="fake", high_risk_model="fake-high", max_output_tokens=1000))

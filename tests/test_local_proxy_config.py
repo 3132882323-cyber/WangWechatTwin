@@ -11,7 +11,40 @@ def settings(lane="deepseek", **overrides):
 
 
 def test_existing_config_has_no_proxy_enabled():
-    assert OpenAISettings(provider="hybrid_web").local_proxies == {}
+    config = OpenAISettings(provider="hybrid_web")
+    assert config.local_proxies == {}
+    assert config.everyday_lane == 'deepseek'
+    assert config.disabled_lanes == []
+
+
+@pytest.mark.parametrize('value, message', [
+    ({'provider': 'hybrid_web', 'disabled_lanes': ['deepseek']}, 'everyday lane cannot be disabled'),
+    ({'provider': 'deepseek_web', 'disabled_lanes': ['deepseek']}, 'provider uses a disabled model lane'),
+    ({'provider': 'hybrid_web', 'everyday_lane': 'doubao', 'disabled_lanes': ['deepseek'], 'deepseek_drafts': True},
+     'disabled DeepSeek cannot generate comparison drafts'),
+])
+def test_disabled_lanes_reject_active_routes(value, message):
+    with pytest.raises(ValidationError, match=message):
+        OpenAISettings(**value)
+
+
+def test_disabled_deepseek_proxy_requires_explicit_disable():
+    value = settings()
+    value.update(everyday_lane='doubao', disabled_lanes=['deepseek'])
+    with pytest.raises(ValidationError, match='disabled lane cannot have an enabled local proxy'):
+        OpenAISettings(**value)
+    value['local_proxies']['deepseek']['enabled'] = False
+    config = OpenAISettings(**value)
+    assert config.everyday_lane == 'doubao'
+    assert config.disabled_lanes == ['deepseek']
+
+
+@pytest.mark.parametrize('value', [
+    {'everyday_lane': 'chatgpt'}, {'everyday_lane': 'unknown'}, {'disabled_lanes': ['unknown']},
+])
+def test_rejects_unknown_everyday_or_disabled_lane(value):
+    with pytest.raises(ValidationError):
+        OpenAISettings(**value)
 
 
 @pytest.mark.parametrize("url", ["https://example.com/v1", "http://localhost:19655/v1", "http://127.0.0.1:19655/v1/", "http://127.0.0.1:19655/v1?token=x"])

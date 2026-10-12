@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -34,10 +35,24 @@ def payload(contact="fictional-a", external_id="turn-1", **extra):
                        "reply_selection": {"mode": "abc"}, **extra}, ensure_ascii=False)
 
 
+def recovery_payload(contact="fictional-a", external_id="turn-2", **extra):
+    value = json.loads(payload(contact, external_id, **extra))
+    incoming = value["incoming"]
+    value.setdefault("recent_messages", [{"direction": "in", "sender": contact,
+                     "content": incoming["content"], "message_type": incoming["message_type"]}])
+    value.setdefault("current_personal_conversation", [{"direction": "in", "content": incoming["content"],
+                     "kind": incoming["message_type"], "provenance": "wechat_original"}])
+    value.setdefault("__local_proxy_recovery_context", {"version": 1, "source": "local_wechat",
+                     "conversation_key": value["conversation_key"], "external_id": external_id,
+                     "complete": True, "unresolved_media": False})
+    return json.dumps(value, ensure_ascii=False)
+
+
 @pytest.fixture
 def proxy(tmp_path, monkeypatch):
     state = {"requests": [], "response": decision(), "status": 200, "conv_count": 0,
-             "force_conv": None, "missing_conv": False, "gate": None, "started": threading.Event()}
+             "force_conv": None, "missing_conv": False, "gate": None, "started": threading.Event(),
+             "now": 1_700_000_000.0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -60,7 +75,7 @@ def proxy(tmp_path, monkeypatch):
             if state["status"] == 302:
                 self.send_header("Location", "http://127.0.0.1:19656/forbidden-redirect")
             response = {"choices": [{"finish_reason": "stop", "message": {"role": "assistant",
-                        "content": json.dumps(state["response"], ensure_ascii=False)}}]}
+                        "content": state.get("raw_assistant", json.dumps(state["response"], ensure_ascii=False))}}]}
             if body["model"] == "doubao" and not state["missing_conv"]:
                 if not body.get("conversation_id"):
                     state["conv_count"] += 1
@@ -86,6 +101,7 @@ def proxy(tmp_path, monkeypatch):
         return actual_connection(host, server.server_port, **kwargs)
 
     monkeypatch.setattr("app.local_proxy_llm.http.client.HTTPConnection", mock_connection)
+    monkeypatch.setattr("app.local_proxy_llm.time", SimpleNamespace(time=lambda: state["now"], monotonic=time.monotonic))
     key = tmp_path / "private-key.txt"
     key.write_text("mock-private-key", encoding="utf-8")
     key.chmod(0o600)
@@ -187,7 +203,7 @@ def test_refused_before_request_keeps_old_turn_but_allows_new_message(proxy, mon
     assert len(state["requests"]) == 1
 
 
-def test_disconnect_after_request_still_blocks_new_turn(proxy):
+def test_disconnect_requires_verified_local_context_before_a_new_turn(proxy):
     config, state = proxy
     state["drop_after_read"] = True
     adapter = LocalProxyReplyLLM(config, "deepseek")
@@ -195,21 +211,22 @@ def test_disconnect_after_request_still_blocks_new_turn(proxy):
         call(adapter)
     assert len(state["requests"]) == 1
     state["drop_after_read"] = False
-    with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+    with pytest.raises(LLMError, match="local_proxy_recovery_context_required"):
         call(adapter, payload(external_id="turn-2"))
     assert len(state["requests"]) == 1
 
 
 @pytest.mark.parametrize("status", [302, 401, 429, 503])
-def test_http_failures_never_follow_redirect_retry_or_continue_unknown_contact(proxy, status):
+def test_http_failures_have_fixed_status_and_never_redirect_retry_or_reuse_context(proxy, status):
     config, state = proxy; state["status"] = status
     adapter = LocalProxyReplyLLM(config, "deepseek")
-    with pytest.raises(LLMError, match="local_proxy_http_error"):
+    with pytest.raises(LLMError, match=f"local_proxy_http_{status}$"):
         call(adapter)
-    for subsequent in [payload(), payload(external_id="turn-2")]:
-        with pytest.raises(LLMError, match="local_proxy_unknown"):
-            call(LocalProxyReplyLLM(config, "deepseek"), subsequent)
-    with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+    with pytest.raises(LLMError, match="local_proxy_unknown_result"):
+        call(LocalProxyReplyLLM(config, "deepseek"), payload())
+    with pytest.raises(LLMError, match="local_proxy_recovery_context_required"):
+        call(LocalProxyReplyLLM(config, "deepseek"), payload(external_id="turn-2"))
+    with pytest.raises(LLMError, match="local_proxy_recovery_context_required"):
         call(LocalProxyReplyLLM(config, "doubao"), payload(external_id="turn-3"))
     assert len(state["requests"]) == 1
     state["status"] = 200
@@ -233,7 +250,7 @@ def test_timeout_survives_restart_as_unknown_and_does_not_retry(proxy):
     with pytest.raises(LLMError, match="local_proxy_request_unknown"):
         call(LocalProxyReplyLLM(config, "deepseek"))
     state["gate"].set()
-    with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+    with pytest.raises(LLMError, match="local_proxy_recovery_context_required"):
         call(LocalProxyReplyLLM(config, "deepseek"), payload(external_id="turn-2"))
     assert len(state["requests"]) == 1
 
@@ -276,7 +293,7 @@ def test_doubao_missing_or_changed_conversation_is_not_reused(proxy, changed):
         state["missing_conv"] = True
     with pytest.raises(LLMError, match="local_proxy_(conversation_changed|missing_conversation)"):
         call(adapter, payload(external_id="turn-2"))
-    with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+    with pytest.raises(LLMError, match="local_proxy_recovery_context_required"):
         call(adapter, payload(external_id="turn-3"))
 
 
@@ -321,6 +338,16 @@ def test_missing_external_id_or_key_fails_before_submission(proxy):
     assert not state["requests"]
 
 
+def test_conflicting_external_id_aliases_are_rejected_before_claim(proxy):
+    config, state = proxy
+    value = json.loads(payload())
+    value["external_id"] = "different-turn"
+    with pytest.raises(LLMError, match="local_proxy_invalid_payload"):
+        call(LocalProxyReplyLLM(config, "doubao"), json.dumps(value))
+    assert not state["requests"]
+    assert not config.resolve(config.openai.local_proxies["doubao"].session_db).exists()
+
+
 def test_utf8_bom_in_private_key_is_accepted(proxy):
     config, state = proxy; adapter = LocalProxyReplyLLM(config, "deepseek")
     adapter.key_file.write_text("mock-private-key", encoding="utf-8-sig")
@@ -359,3 +386,392 @@ def test_unknown_exception_details_and_credentials_never_escape(proxy, monkeypat
         call(adapter)
     assert str(error.value) == "local_proxy_request_unknown"
     assert error.value.fallback_safe is False
+
+
+def test_unknown_draft_can_rebuild_only_for_a_new_message_after_cooldown(proxy):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "deepseek")
+    state["drop_after_read"] = True
+    with pytest.raises(LLMError, match="local_proxy_request_unknown"):
+        call(adapter)
+    original = state["requests"][0]["body"]["user"]
+    state["drop_after_read"] = False
+    clean = recovery_payload(optional_model_candidates=[{"content": "UNSENT-DRAFT"}],
+                             contact_memories=["OLD-SUMMARY"], historical_conversation_memory=[{"content": "OLD-AI-MEDIA"}],
+                             style_examples=[{"preferred_reply": "OLD-STYLE"}], owner_role_profile={"summary": "OLD-PROFILE"})
+    with pytest.raises(LLMError, match="local_proxy_cooldown"):
+        call(LocalProxyReplyLLM(config, "deepseek"), clean)
+    assert len(state["requests"]) == 1
+    state["now"] += 31
+    assert call(LocalProxyReplyLLM(config, "deepseek"), clean).action == "send"
+    replacement = state["requests"][1]["body"]
+    assert replacement["user"] != original
+    assert len(replacement["messages"]) == 2
+    wire = json.dumps(replacement, ensure_ascii=False)
+    assert all(token not in wire for token in ["UNSENT-DRAFT", "OLD-SUMMARY", "OLD-AI-MEDIA", "OLD-STYLE", "OLD-PROFILE",
+                                               "__local_proxy_recovery_context", "turn-1"])
+    assert "turn-2" in wire and "旧模型草稿不表示已向微信发送" in wire
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT status,generation FROM local_proxy_turns ORDER BY created").fetchall() == [("unknown", 0), ("done", 1)]
+        assert db.execute("SELECT session_key,state,generation FROM local_proxy_session_history").fetchone() == (original, "unknown", 0)
+        assert db.execute("SELECT state,generation,rebuild_required FROM local_proxy_sessions").fetchone() == ("ready", 1, 0)
+    for lane in ("deepseek", "doubao"):
+        with pytest.raises(LLMError, match="local_proxy_unknown_result"):
+            call(LocalProxyReplyLLM(config, lane), recovery_payload(external_id="turn-1"))
+        with pytest.raises(LLMError, match="local_proxy_duplicate_turn"):
+            call(LocalProxyReplyLLM(config, lane), clean)
+    assert len(state["requests"]) == 2
+    call(LocalProxyReplyLLM(config, "deepseek"), payload(external_id="turn-3"))
+    assert state["requests"][2]["body"]["user"] == replacement["user"]
+
+
+def test_other_contact_is_not_frozen_by_a_malformed_reply(proxy):
+    config, state = proxy
+    state["response"] = "not JSON"
+    with pytest.raises(LLMError, match="local_proxy_invalid_decision"):
+        call(LocalProxyReplyLLM(config, "deepseek"))
+    state["response"] = decision()
+    assert call(LocalProxyReplyLLM(config, "deepseek"), payload("fictional-new-friend")).action == "send"
+    assert len(state["requests"]) == 2
+    with pytest.raises(LLMError, match="local_proxy_cooldown"):
+        call(LocalProxyReplyLLM(config, "deepseek"), recovery_payload())
+
+
+def test_backoff_is_persistent_capped_and_only_actual_failed_requests_increase_it(proxy):
+    config, state = proxy
+    state["status"] = 503
+    adapter = LocalProxyReplyLLM(config, "deepseek")
+    for number, delay in enumerate([30, 60, 120, 240, 300, 300], 1):
+        value = recovery_payload(external_id=f"failure-{number}")
+        with pytest.raises(LLMError, match="local_proxy_http_503"):
+            call(LocalProxyReplyLLM(config, "deepseek"), value)
+        with sqlite3.connect(adapter.session_db) as db:
+            assert db.execute("SELECT failures,retry_after-last_failure FROM local_proxy_backoff").fetchone() == (number, delay)
+        for repeat in range(2):
+            with pytest.raises(LLMError, match="local_proxy_cooldown"):
+                call(LocalProxyReplyLLM(config, "deepseek"), recovery_payload(external_id=f"blocked-{number}-{repeat}"))
+        assert len(state["requests"]) == number
+        state["now"] += delay
+    state["status"] = 200
+    call(LocalProxyReplyLLM(config, "deepseek"), recovery_payload(external_id="success-after-backoff"))
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT count(*) FROM local_proxy_backoff").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM local_proxy_turns WHERE status='unknown'").fetchone()[0] == 6
+        assert db.execute("SELECT count(*) FROM local_proxy_session_history").fetchone()[0] == 6
+
+
+def test_cross_lane_recovery_quarantines_both_old_contexts_and_keeps_lane_cooldown(proxy):
+    config, state = proxy
+    call(LocalProxyReplyLLM(config, "deepseek"))
+    call(LocalProxyReplyLLM(config, "doubao"), payload(external_id="image-1"))
+    first_ds = state["requests"][0]["body"]["user"]
+    state["status"] = 503
+    with pytest.raises(LLMError, match="local_proxy_http_503"):
+        call(LocalProxyReplyLLM(config, "doubao"), payload(external_id="image-2"))
+    state["status"] = 200
+    assert call(LocalProxyReplyLLM(config, "deepseek"), recovery_payload(external_id="new-text")).action == "send"
+    assert state["requests"][-1]["body"]["user"] != first_ds
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT count(*) FROM local_proxy_session_history").fetchone()[0] == 2
+        assert db.execute("SELECT generation,rebuild_required,remote_id FROM local_proxy_sessions WHERE lane='doubao'").fetchone() == (1, 1, None)
+    with pytest.raises(LLMError, match="local_proxy_recovery_context_required"):
+        call(adapter, payload(external_id="new-image"))
+    with pytest.raises(LLMError, match="local_proxy_cooldown"):
+        call(adapter, recovery_payload(external_id="new-image"))
+    state["now"] += 31
+    call(adapter, recovery_payload(external_id="new-image"))
+    assert state["requests"][-1]["body"]["conversation_id"] == ""
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT generation,remote_id FROM local_proxy_sessions WHERE lane='doubao'").fetchone() == (1, "mock-conv-2")
+
+
+@pytest.mark.parametrize("other_lane", ["deepseek", "doubao"])
+def test_pending_request_blocks_recovery_in_every_lane_even_with_context(proxy, other_lane):
+    config, state = proxy
+    state["gate"] = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(call, LocalProxyReplyLLM(config, "deepseek"))
+        assert state["started"].wait(2)
+        with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+            call(LocalProxyReplyLLM(config, other_lane), recovery_payload())
+        state["gate"].set()
+        assert pending.result(3).action == "send"
+    assert len(state["requests"]) == 1
+
+
+def test_concurrent_recovery_claims_only_one_new_generation(proxy):
+    config, state = proxy
+    state["status"] = 503
+    with pytest.raises(LLMError, match="local_proxy_http_503"):
+        call(LocalProxyReplyLLM(config, "deepseek"))
+    state.update(status=200, now=state["now"] + 31, gate=threading.Event())
+    state["started"].clear()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(call, LocalProxyReplyLLM(config, "deepseek"), recovery_payload())
+        assert state["started"].wait(2)
+        for lane in ("deepseek", "doubao"):
+            with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+                call(LocalProxyReplyLLM(config, lane), recovery_payload(external_id="turn-3"))
+            with pytest.raises(LLMError, match="local_proxy_unknown_result"):
+                call(LocalProxyReplyLLM(config, lane), recovery_payload())
+        state["gate"].set()
+        assert pending.result(3).action == "send"
+    adapter = LocalProxyReplyLLM(config, "deepseek")
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT count(*) FROM local_proxy_session_history").fetchone()[0] == 1
+        assert db.execute("SELECT generation FROM local_proxy_sessions").fetchone()[0] == 1
+    assert len(state["requests"]) == 2
+
+
+@pytest.mark.parametrize("problem", ["no_marker", "wrong_source", "wrong_contact", "old_external", "incomplete", "bool_version",
+                                     "missing_recent", "missing_personal", "malformed_history", "different_incoming", "media_dependency"])
+def test_recovery_rejects_missing_stale_or_incomplete_local_evidence(proxy, problem):
+    config, state = proxy
+    state["status"] = 503
+    adapter = LocalProxyReplyLLM(config, "deepseek")
+    with pytest.raises(LLMError, match="local_proxy_http_503"):
+        call(adapter)
+    state.update(status=200, now=state["now"] + 31)
+    value = json.loads(recovery_payload())
+    evidence = value["__local_proxy_recovery_context"]
+    if problem == "no_marker": value.pop("__local_proxy_recovery_context")
+    elif problem == "wrong_source": evidence["source"] = "model_asserted"
+    elif problem == "wrong_contact": evidence["conversation_key"] = "f" * 64
+    elif problem == "old_external": evidence["external_id"] = "turn-1"
+    elif problem == "incomplete": evidence["complete"] = False
+    elif problem == "bool_version": evidence["version"] = True
+    elif problem == "missing_recent": value.pop("recent_messages")
+    elif problem == "missing_personal": value.pop("current_personal_conversation")
+    elif problem == "malformed_history": value["recent_messages"][0]["direction"] = "unknown"
+    elif problem == "different_incoming": value["incoming"]["content"] = "这个图多少钱"
+    elif problem == "media_dependency": evidence["unresolved_media"] = True
+    with pytest.raises(LLMError, match="local_proxy_recovery_(context_required|media_unresolved)"):
+        call(adapter, json.dumps(value, ensure_ascii=False))
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT count(*) FROM local_proxy_session_history").fetchone()[0] == 0
+        assert db.execute("SELECT state,generation FROM local_proxy_sessions").fetchone() == ("unknown", 0)
+        assert db.execute("SELECT count(*) FROM local_proxy_turns").fetchone()[0] == 1
+    assert len(state["requests"]) == 1
+
+
+@pytest.mark.parametrize("same_contact", [True, False])
+def test_quarantined_remote_id_is_never_accepted_again_even_for_its_original_contact(proxy, same_contact):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    call(adapter)
+    state["status"] = 503
+    with pytest.raises(LLMError, match="local_proxy_http_503"):
+        call(adapter, payload(external_id="turn-2"))
+    state.update(status=200, now=state["now"] + 31)
+    call(adapter, recovery_payload(external_id="turn-3"))
+    state["force_conv"] = "mock-conv-1"
+    if same_contact:
+        # Fail the replacement, then try to attach its next generation to the
+        # original remote. Normal same-generation changed-ID checks also remain.
+        state["status"] = 503
+        with pytest.raises(LLMError, match="local_proxy_http_503"):
+            call(adapter, payload(external_id="turn-4"))
+        state.update(status=200, now=state["now"] + 31)
+        value = recovery_payload(external_id="turn-5")
+        expected = "local_proxy_quarantined_conversation"
+    else:
+        value = payload("fictional-b")
+        expected = "local_proxy_conversation_collision"
+    with pytest.raises(LLMError, match=expected):
+        call(LocalProxyReplyLLM(config, "doubao"), value)
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT count(*) FROM local_proxy_session_history WHERE remote_id='mock-conv-1'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("same_contact", [True, False])
+def test_malformed_first_doubao_reply_keeps_remote_binding_for_quarantine(proxy, same_contact):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    state["response"] = "not a decision"
+    with pytest.raises(LLMError, match="local_proxy_invalid_decision"):
+        call(adapter)
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT state,remote_id FROM local_proxy_sessions").fetchone() == ("unknown", "mock-conv-1")
+    state.update(response=decision(), now=state["now"] + 31)
+    if same_contact:
+        value = recovery_payload()
+        expected = "local_proxy_quarantined_conversation"
+    else:
+        call(adapter, recovery_payload())
+        value = payload("fictional-b")
+        expected = "local_proxy_conversation_collision"
+    state["force_conv"] = "mock-conv-1"
+    with pytest.raises(LLMError, match=expected):
+        call(adapter, value)
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT remote_id,state FROM local_proxy_session_history").fetchone() == ("mock-conv-1", "unknown")
+        assert db.execute("SELECT count(*) FROM local_proxy_turns WHERE status='unknown'").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM local_proxy_sessions WHERE remote_id='mock-conv-1'").fetchone()[0] == 0
+
+
+def test_malformed_doubao_reply_never_steals_another_contacts_remote_binding(proxy):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    call(adapter)
+    state.update(response="not a decision", force_conv="mock-conv-1")
+    with pytest.raises(LLMError, match="local_proxy_invalid_decision"):
+        call(adapter, payload("fictional-b"))
+    with sqlite3.connect(adapter.session_db) as db:
+        rows = dict(db.execute("SELECT state,remote_id FROM local_proxy_sessions"))
+        assert rows == {"ready": "mock-conv-1", "unknown": None}
+        assert db.execute("SELECT status FROM local_proxy_turns ORDER BY rowid").fetchall() == [("done",), ("unknown",)]
+
+
+@pytest.mark.parametrize("same_contact", [True, False])
+@pytest.mark.parametrize("returned_id", ["mock-conv-1", "unexpected-old-context"])
+def test_changed_doubao_reply_quarantines_both_ids_across_restart(proxy, same_contact, returned_id):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    call(adapter)
+    state["force_conv"] = "unexpected-old-context"
+    with pytest.raises(LLMError, match="local_proxy_conversation_changed"):
+        call(adapter, payload(external_id="turn-2"))
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT remote_id,state FROM local_proxy_sessions").fetchone() == ("mock-conv-1", "unknown")
+        assert set(db.execute("SELECT remote_id,generation FROM local_proxy_quarantined_ids")) == {
+            ("mock-conv-1", 0), ("unexpected-old-context", 0)}
+    state.update(force_conv=returned_id, now=state["now"] + 31)
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    value = recovery_payload(external_id="turn-3") if same_contact else payload("fictional-b")
+    expected = "local_proxy_quarantined_conversation" if same_contact else "local_proxy_conversation_collision"
+    with pytest.raises(LLMError, match=expected):
+        call(adapter, value)
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT count(*) FROM local_proxy_turns WHERE status='unknown'").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM local_proxy_quarantined_ids").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM local_proxy_sessions WHERE remote_id='unexpected-old-context'").fetchone()[0] == 0
+
+
+def test_changed_doubao_reply_does_not_quarantine_another_contacts_live_id(proxy):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    call(adapter)
+    call(adapter, payload("fictional-b"))
+    state["force_conv"] = "mock-conv-2"
+    with pytest.raises(LLMError, match="local_proxy_conversation_changed"):
+        call(adapter, payload(external_id="turn-2"))
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT remote_id FROM local_proxy_quarantined_ids").fetchall() == [("mock-conv-1",)]
+    state["force_conv"] = None
+    assert call(adapter, payload("fictional-b", external_id="turn-2")).action == "send"
+    assert state["requests"][-1]["body"]["conversation_id"] == "mock-conv-2"
+
+
+def test_refused_recovery_keeps_fresh_context_requirement_and_original_unknown(proxy, monkeypatch):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    state["status"] = 503
+    with pytest.raises(LLMError, match="local_proxy_http_503"):
+        call(adapter)
+    state.update(status=200, now=state["now"] + 31)
+    actual_post = adapter._post
+
+    def refuse(*args):
+        from app.local_proxy_llm import _NoSubmission
+        raise _NoSubmission
+
+    monkeypatch.setattr(adapter, "_post", refuse)
+    with pytest.raises(LLMError, match="local_proxy_not_submitted"):
+        call(adapter, recovery_payload())
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT state,generation,rebuild_required FROM local_proxy_sessions").fetchone() == ("ready", 1, 1)
+        assert db.execute("SELECT failures FROM local_proxy_backoff").fetchone() == (1,)
+        assert db.execute("SELECT status FROM local_proxy_turns ORDER BY rowid").fetchall() == [("unknown",), ("not_submitted",)]
+    monkeypatch.setattr(adapter, "_post", actual_post)
+    with pytest.raises(LLMError, match="local_proxy_recovery_context_required"):
+        call(adapter, payload(external_id="turn-3"))
+    for lane in ("deepseek", "doubao"):
+        with pytest.raises(LLMError, match="local_proxy_not_submitted"):
+            call(LocalProxyReplyLLM(config, lane), recovery_payload())
+    assert call(adapter, recovery_payload(external_id="turn-3")).action == "send"
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT generation,rebuild_required FROM local_proxy_sessions").fetchone() == (1, 0)
+        assert db.execute("SELECT count(*) FROM local_proxy_session_history").fetchone()[0] == 1
+    assert len(state["requests"]) == 2
+
+
+def test_fresh_current_png_can_rebuild_doubao_but_missing_asset_cannot(proxy):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "doubao")
+    state["status"] = 503
+    with pytest.raises(LLMError, match="local_proxy_http_503"):
+        call(adapter)
+    state.update(status=200, now=state["now"] + 31)
+    current = {"external_id": "fresh-image", "content": "[图片]", "message_type": "image"}
+    with pytest.raises(LLMError, match="local_proxy_recovery_media_unresolved"):
+        call(adapter, recovery_payload(external_id="fresh-image", incoming=current))
+    root = config.resolve(config.paths.history_reader) / "image_assets"
+    root.mkdir(parents=True)
+    image = root / "fresh.png"
+    Image.new("RGB", (2, 2), "blue").save(image)
+    result = call(adapter, recovery_payload(external_id="fresh-image", incoming=current, __media_paths=[str(image)]))
+    assert result.media_description == "测试图片"
+    assert state["requests"][-1]["body"]["conversation_id"] == ""
+    assert state["requests"][-1]["body"]["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_existing_database_migrates_without_rewriting_terminal_unknown_history(proxy):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "deepseek")
+    adapter.session_db.parent.mkdir(parents=True, exist_ok=True)
+    contact = json.loads(payload())["conversation_key"]
+    request_key = hashlib.sha256(b"turn-1").hexdigest()
+    with sqlite3.connect(adapter.session_db) as db:
+        db.executescript("""CREATE TABLE local_proxy_sessions(lane TEXT NOT NULL,conversation_key TEXT NOT NULL,
+            session_key TEXT NOT NULL,remote_id TEXT,state TEXT NOT NULL DEFAULT 'ready',
+            PRIMARY KEY(lane,conversation_key),UNIQUE(lane,remote_id));
+            CREATE TABLE local_proxy_turns(lane TEXT NOT NULL,conversation_key TEXT NOT NULL,request_key TEXT NOT NULL,
+            status TEXT NOT NULL,error_code TEXT NOT NULL DEFAULT '',created REAL NOT NULL,
+            PRIMARY KEY(lane,conversation_key,request_key));""")
+        db.execute("INSERT INTO local_proxy_sessions VALUES(?,?,?,NULL,'unknown')", ("deepseek", contact, "wechat-proxy-" + "a" * 32))
+        db.execute("INSERT INTO local_proxy_turns VALUES(?,?,?,'unknown','local_proxy_http_error',?)", ("deepseek", contact, request_key, 123.0))
+    call(adapter, recovery_payload())
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT status,error_code,created,generation FROM local_proxy_turns WHERE request_key=?", (request_key,)).fetchone() == (
+            "unknown", "local_proxy_http_error", 123.0, 0)
+        assert db.execute("SELECT session_key FROM local_proxy_session_history").fetchone()[0] == "wechat-proxy-" + "a" * 32
+    assert len(state["requests"]) == 1
+
+
+def test_legacy_pending_after_restart_is_not_assumed_terminal_or_rotated(proxy):
+    config, state = proxy
+    adapter = LocalProxyReplyLLM(config, "deepseek")
+    contact = json.loads(payload())["conversation_key"]
+    adapter._reserve(contact, hashlib.sha256(b"turn-1").hexdigest(), "ready")
+    state["now"] += 86400
+    with pytest.raises(LLMError, match="local_proxy_unknown_session"):
+        call(LocalProxyReplyLLM(config, "doubao"), recovery_payload())
+    with sqlite3.connect(adapter.session_db) as db:
+        assert db.execute("SELECT status,generation FROM local_proxy_turns").fetchone() == ("pending", 0)
+        assert db.execute("SELECT count(*) FROM local_proxy_session_history").fetchone()[0] == 0
+    assert not state["requests"]
+
+
+def test_single_json_fence_is_allowed_with_the_same_strict_contract(proxy):
+    config, state = proxy
+    state["raw_assistant"] = "\n```json\n" + json.dumps(decision(), ensure_ascii=False) + "\n```\n"
+    assert call(LocalProxyReplyLLM(config, "deepseek")).action == "send"
+
+
+@pytest.mark.parametrize("wrapper", ["prefix", "suffix", "double", "wrong_label", "string_bool", "string_score", "missing_abc"])
+def test_json_fence_does_not_allow_extra_prose_or_relaxed_schema(proxy, wrapper):
+    config, state = proxy
+    value = decision()
+    if wrapper == "string_bool": value["candidates"][0]["invented_facts"] = "false"
+    elif wrapper == "string_score": value["candidates"][0]["style_match"] = "4"
+    elif wrapper == "missing_abc": value.pop("candidates")
+    content = "```json\n" + json.dumps(value, ensure_ascii=False) + "\n```"
+    if wrapper == "prefix": content = "这是我的回复：\n" + content
+    elif wrapper == "suffix": content += "\n请采纳。"
+    elif wrapper == "double": content += "\n" + content
+    elif wrapper == "wrong_label": content = content.replace("```json", "```python")
+    state["raw_assistant"] = content
+    with pytest.raises(LLMError, match="local_proxy_invalid_decision"):
+        call(LocalProxyReplyLLM(config, "deepseek"))
+    assert len(state["requests"]) == 1
