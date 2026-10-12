@@ -32,3 +32,11 @@ native_transport/*.obj
 *-bootstrap.local.json
 
 *-migration.local.json
+
+# Experimental GLM account/session data stay local.
+experiments/glm_web_trial/auth/
+experiments/glm_web_trial/state/
+experiments/glm_web_trial/local-key.txt
+experiments/glm_web_trial/chrome-profile/
+experiments/glm_web_trial/runs/
+experiments/glm_web_trial/reports/
