@@ -83,10 +83,12 @@ function harness(options={}){
   calls.requests.push({kind,...request,body,bodyText:request.body});
   const reply={ok:true,window_id:body.window_id,host_tab_id:body.host_tab_id,title,manual_reveal:options.manualReveal===true};
   if(kind==='register'&&options.platform==='macos')reply.capabilities={platform:'macos',mode:'extension_minimized',native_hide:false,extension_minimize:true,fully_hidden:false};
+  if(kind==='register'&&!options.omitEligibility)reply.eligible_web=structuredClone(options.eligibleWeb===undefined?['chatgpt','deepseek','doubao']:options.eligibleWeb);
   if(kind==='next')return {ok:true,async json(){return {job:null};}};
-  if(kind==='register'&&options.recoveryNonce!==undefined)reply.recovery_requested={nonce:options.recoveryNonce};
+  if(kind==='register'&&options.recoveryNonce!==undefined)reply.recovery_requested={nonce:options.recoveryNonce,...(options.recoveryVersion===2?{version:2,providers:structuredClone(options.recoveryProviders||options.eligibleWeb)}:{})};
   if(kind==='recovered')reply.nonce=body.nonce;
   if(kind==='retire-for-recovery')Object.assign(reply,{retired:true,visible:true,verified:true,manual_reveal:false,nonce:body.nonce});
+  if(['retire-for-recovery','recovered'].includes(kind)&&body.version===2)Object.assign(reply,{version:2,providers:structuredClone(body.providers)});
   if(kind==='hide'){
    if(options.manualReveal){Object.assign(reply,{ok:false,hidden:false,visible:null,verified:false,error:'background_window_manual_reveal'});}
    else Object.assign(reply,{hidden:true,visible:false,verified:true});
@@ -96,7 +98,7 @@ function harness(options={}){
   if(kind==='visibility')Object.assign(reply,{window_mode:'extension_minimized',hidden:false,visible:body.state==='normal',minimized:body.state==='minimized',verified:true,verification_source:'chrome_extension'});
   options.reply?.(kind,reply,body);
   if(kind==='retire-for-recovery'&&reply.ok===true&&reply.retired===true&&reply.visible===true&&reply.verified===true&&reply.manual_reveal===false&&reply.nonce===body.nonce)windows.get(body.window_id).visible=true;
-  if(kind==='recovered'&&reply.ok===true&&reply.nonce===body.nonce&&reply.window_id===body.window_id&&reply.host_tab_id===body.host_tab_id)delete options.recoveryNonce;
+  if(kind==='recovered'&&reply.ok===true&&reply.nonce===body.nonce&&reply.window_id===body.window_id&&reply.host_tab_id===body.host_tab_id&&reply.version===body.version&&JSON.stringify(reply.providers)===JSON.stringify(body.providers))delete options.recoveryNonce;
   return {ok:options.httpOk!==false,async json(){return structuredClone(reply);}};
  }
  const context=vm.createContext({chrome,fetch,URL,Date,AbortController,crypto:webcrypto,setTimeout:options.setTimeout||setTimeout,clearTimeout:options.clearTimeout||clearTimeout,console:{warn(){}},WebSocket:class{constructor(){}},
@@ -485,7 +487,7 @@ test('manual reveal prevents saved '+blankUrl+' controller restoration and keeps
  fixture.options.manualReveal=true;fixture.load();
  const requests=fixture.calls.requests.length,updates=fixture.calls.updates.length,hides=fixture.calls.requests.filter(call=>call.kind==='hide').length;
  await assert.rejects(fixture.api().ensure(),/background_window_manual_reveal/);
- assert.equal(fixture.calls.requests[requests].kind,'register');assert.deepEqual(fixture.calls.requests[requests].body,{window_id:state.windowId,host_tab_id:state.hostTabId});diagnosticOnly(fixture,requests+1,'background_window_manual_reveal');
+  assert.equal(fixture.calls.requests[requests].kind,'register');assert.deepEqual(fixture.calls.requests[requests].body,{window_id:state.windowId,host_tab_id:state.hostTabId,recovery_version:2});diagnosticOnly(fixture,requests+1,'background_window_manual_reveal');
  assert.equal(fixture.calls.updates.length,updates);assert.equal(fixture.calls.requests.filter(call=>call.kind==='hide').length,hides);
  assert.equal(fixture.tabs.get(state.hostTabId).url,blankUrl);assert.equal(fixture.tabs.get(11).active,true);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);
 });
@@ -496,7 +498,7 @@ test('only the saved proven about:blank controller is restored; an unrelated bla
  const before=fixture.calls.updates.length,requests=fixture.calls.requests.length,moves=fixture.calls.moves.length;
  const maps=structuredClone({pool:fixture.local.bridgePool,deepseek:fixture.local.deepseekConversations,doubao:fixture.local.doubaoConversations});
  fixture.tabs.get(state.hostTabId).url='about:blank';fixture.tabs.get(99).url='about:blank';delete fixture.session.bridgePool;
- fixture.options.onUpdate=(tab,properties,{calls})=>{if(properties.url){assert.equal(tab.id,state.hostTabId);assert.equal(calls.requests[requests].kind,'register');assert.deepEqual(calls.requests[requests].body,{window_id:state.windowId,host_tab_id:state.hostTabId});}};
+ fixture.options.onUpdate=(tab,properties,{calls})=>{if(properties.url){assert.equal(tab.id,state.hostTabId);assert.equal(calls.requests[requests].kind,'register');assert.deepEqual(calls.requests[requests].body,{window_id:state.windowId,host_tab_id:state.hostTabId,recovery_version:2});}};
  fixture.load();await fixture.api().ensure();
  assert.deepEqual(fixture.calls.updates.slice(before).filter(call=>call.url),[{tabId:state.hostTabId,url:hostUrl}]);
  assert.equal(fixture.tabs.get(99).url,'about:blank');assert.equal(fixture.tabs.get(99).windowId,1);
@@ -506,12 +508,12 @@ test('only the saved proven about:blank controller is restored; an unrelated bla
 });
 
 for(const blankUrl of ['chrome://newtab/','about:blank']){
-test(blankUrl+' controller recovery rejects a window containing an unclaimed personal tab before registration',async()=>{
+test(blankUrl+' controller recovery negotiates scope then rejects an unclaimed personal tab before page mutation',async()=>{
  const fixture=harness(ownedOptions());const state=await fixture.api().ensure();
  fixture.tabs.get(state.hostTabId).url=blankUrl;fixture.tabs.set(999,{id:999,windowId:state.windowId,url:'https://example.org/',active:true});fixture.load();
  const requests=fixture.calls.requests.length,updates=fixture.calls.updates.length;
  await assert.rejects(fixture.api().ensure(),/background_window_mixed_tabs/);
- diagnosticOnly(fixture,requests,'background_window_mixed_tabs');assert.equal(fixture.calls.updates.length,updates);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);
+ assert.equal(fixture.calls.requests[requests].kind,'register');diagnosticOnly(fixture,requests+1,'background_window_mixed_tabs');assert.equal(fixture.calls.updates.length,updates);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.calls.creates.length,0);
  assert.equal(fixture.tabs.get(999).url,'https://example.org/');
 });
 }
@@ -1075,4 +1077,119 @@ test('all three provider entry points recover before they capture stored ownersh
   assert.notEqual(fixture.local.deepseekOwnedTab,11);assert.notEqual(fixture.local.doubaoOwnedTab,12);assert.notEqual(fixture.local.bridgePool[0].tabId,20);
   assert.equal(fixture.calls.creates.length,3);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
  }
+});
+
+test('selective recovery restores only closed eligible GPT IDs and preserves dormant claims, pending proof and contact maps',async()=>{
+ const dormantPending=[{provider:'deepseek',tabId:61,windowId:7,url:'old invalid deepseek proof'},{provider:'doubao',tabId:62,windowId:7,url:duoUrl}];
+ const options=ownedOptions();Object.assign(options,{eligibleWeb:['chatgpt'],recoveryVersion:2,recoveryNonce});
+ options.local.bridgeBackgroundPendingTabs=dormantPending;options.tabs=options.tabs.filter(tab=>![11,12,20,21,22].includes(tab.id));
+ const fixture=harness(options),preserved=structuredClone({deepseekOwnedTab:fixture.local.deepseekOwnedTab,deepseekOwnedUrl:fixture.local.deepseekOwnedUrl,deepseekConversations:fixture.local.deepseekConversations,doubaoOwnedTab:fixture.local.doubaoOwnedTab,doubaoOwnedUrl:fixture.local.doubaoOwnedUrl,doubaoConversations:fixture.local.doubaoConversations});
+ await fixture.api().ensure('chatgpt');
+ assert.equal(fixture.calls.creates.length,3);assert.ok(fixture.calls.creates.every(call=>call.url===gptHome));
+ for(const [key,value] of Object.entries(preserved))assert.deepEqual(fixture.local[key],value);
+ assert.deepEqual(fixture.local.bridgeBackgroundPendingTabs,dormantPending);assert.deepEqual(fixture.session.bridgeBackgroundPendingTabs,dormantPending);
+ assert.equal(fixture.local.bridgeBackgroundWindowHealth.managed_tabs,3);assert.deepEqual(fixture.local.bridgeBackgroundWindowHealth.missing_tab_ids,[]);assert.deepEqual(fixture.local.bridgeBackgroundWindowHealth.model_errors,{});
+ assert.deepEqual(fixture.local.bridgeBackgroundWindowHealth.eligible_web,['chatgpt']);assert.equal(fixture.local.bridgeBackgroundWindowHealth.recovery_pending,false);
+ const ack=fixture.calls.requests.find(call=>call.kind==='recovered').body;
+ assert.deepEqual(ack,{nonce:recoveryNonce,version:2,providers:['chatgpt'],window_id:fixture.local.bridgeBackgroundWindow.windowId,host_tab_id:fixture.local.bridgeBackgroundWindow.hostTabId});
+ assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);assert.equal(fixture.tabs.get(98).windowId,1);
+});
+
+test('selective mixed-window recovery moves only the controller and proven GPT IDs while dormant provider and personal pages stay visible',async()=>{
+ const options=mixedRecoveryOptions();Object.assign(options,{eligibleWeb:['chatgpt'],recoveryVersion:2});
+ options.tabs.push({id:97,windowId:1,url:gptHome,active:false,editorDraft:'personal GPT draft'});
+ const fixture=harness(options),preserved=structuredClone([...fixture.tabs.values()].filter(tab=>[11,12,97,98,99].includes(tab.id)));
+ await fixture.api().ensure('chatgpt');
+ assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[20,21,22]);assert.equal(fixture.calls.creates.length,0);
+ assert.deepEqual([...fixture.tabs.values()].filter(tab=>[11,12,97,98,99].includes(tab.id)),preserved);assert.equal(fixture.windows.get(1).visible,true);
+ assert.ok(fixture.calls.updates.every(call=>call.tabId===50));assert.ok(fixture.calls.scripts.every(call=>call.target.tabId===50));
+ assert.deepEqual(fixture.calls.requests.find(call=>call.kind==='retire-for-recovery').body,{window_id:1,host_tab_id:50,nonce:recoveryNonce,version:2,providers:['chatgpt']});
+ assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+ const moves=fixture.calls.moves.length;fixture.load();await fixture.api().ensure('chatgpt');assert.equal(fixture.calls.moves.length,moves);
+});
+
+test('normal selective preparation ignores dormant missing ownership and blocks every dormant-provider entry point',async()=>{
+ const options=ownedOptions();options.eligibleWeb=['chatgpt'];options.tabs=options.tabs.filter(tab=>![11,12].includes(tab.id));
+ const fixture=harness(options);await fixture.api().ensure();
+ assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[20,21,22]);assert.equal(fixture.calls.creates.length,0);assert.deepEqual(fixture.local.bridgeBackgroundWindowHealth.model_errors,{});
+ for(const provider of ['deepseek','doubao']){
+  await assert.rejects(fixture.api().ensure(provider),/background_window_provider_ineligible/);
+  await assert.rejects(fixture.api().ensureOwnedTab(provider==='deepseek'?11:12,provider),/background_window_provider_ineligible/);
+  await assert.rejects(fixture.api().createModelTab({url:provider==='deepseek'?dsHome:duoHome}),/background_window_provider_ineligible/);
+ }
+ await assert.rejects(fixture.api().acquireRendering(12,'doubao','dormant-turn'),/background_window_provider_ineligible/);
+ assert.equal(fixture.calls.creates.length,0);assert.equal(fixture.calls.requests.filter(call=>call.kind==='heartbeat'&&call.headers['X-Wechat-Bridge-Provider']!=='chatgpt').length,0);
+});
+
+for(const entry of ['ensure','ensureOwnedTab','createModelTab','acquireRendering','isRenderingIdle'])test('ineligible '+entry+' cannot trigger another provider recovery or relocate the mixed host',async()=>{
+ const fixture=harness({...mixedRecoveryOptions(),eligibleWeb:['chatgpt'],recoveryVersion:2});let migrations=0;fixture.context.migrateChatgptPool=async()=>{migrations++;};
+ const calls={ensure:()=>fixture.api().ensure('doubao'),ensureOwnedTab:()=>fixture.api().ensureOwnedTab(12,'doubao'),createModelTab:()=>fixture.api().createModelTab({url:duoHome}),acquireRendering:()=>fixture.api().acquireRendering(12,'doubao','dormant-turn'),isRenderingIdle:()=>fixture.api().isRenderingIdle('doubao')};
+ await assert.rejects(calls[entry](),/background_window_provider_ineligible/);assert.equal(migrations,0);assert.equal(fixture.calls.creates.length+fixture.calls.moves.length+fixture.calls.windows.length+fixture.calls.scripts.length+fixture.calls.updates.length,0);assert.equal(fixture.calls.requests.some(call=>['retire-for-recovery','hide','recovered'].includes(call.kind)),false);
+});
+
+test('a disabled worker cannot prevent simultaneous eligible GPT startup from recovering its own selected scope',async()=>{
+ const fixture=harness({...mixedRecoveryOptions(),eligibleWeb:['chatgpt'],recoveryVersion:2});
+ const disabled=fixture.api().ensure('doubao'),selected=fixture.api().ensure('chatgpt');
+ await assert.rejects(disabled,/background_window_provider_ineligible/);await selected;
+ assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[20,21,22]);assert.equal(fixture.calls.windows.length,1);assert.equal(fixture.tabs.get(12).windowId,1);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+});
+
+test('a dormant GPT pool is not migrated or validated and contributes no model error to another eligible provider',async()=>{
+ const fixture=harness({eligibleWeb:['deepseek'],recoveryVersion:2,recoveryNonce,local:{deepseekOwnedTab:11,deepseekOwnedUrl:dsUrl,bridgePool:{stale:'dormant record'}}});
+ let migrations=0;fixture.context.migrateChatgptPool=async()=>{migrations++;throw Error('chatgpt_migration_failed');};
+ await fixture.api().ensure('deepseek');
+ assert.equal(migrations,0);assert.deepEqual(fixture.local.bridgePool,{stale:'dormant record'});assert.equal(fixture.calls.creates.length,1);assert.equal(fixture.calls.creates[0].url,dsUrl);assert.deepEqual(fixture.local.bridgeBackgroundWindowHealth.model_errors,{});assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+});
+
+test('a dormant Doubao rendering record cannot reactivate or reserve the selective GPT window',async()=>{
+ const options=mixedRecoveryOptions();Object.assign(options,{eligibleWeb:['chatgpt'],recoveryVersion:2});
+ const lease={id:'b'.repeat(36),provider:'doubao',tabId:12,jobId:'dormant-turn',windowId:1,hostTabId:50};options.local.bridgeBackgroundRenderingLease=lease;
+ const fixture=harness(options);await fixture.api().ensure('chatgpt');
+ assert.deepEqual(fixture.local.bridgeBackgroundRenderingLease,lease);assert.deepEqual(fixture.calls.moves.map(call=>call.tabId),[20,21,22]);assert.ok(fixture.calls.scripts.every(call=>call.target.tabId===50));assert.equal(fixture.tabs.get(12).windowId,1);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+});
+
+for(const eligibleWeb of [['chatgpt'],[]])test('a v1 nonce cannot authorize a selective scope '+JSON.stringify(eligibleWeb),async()=>{
+ const options=mixedRecoveryOptions();options.eligibleWeb=eligibleWeb;const fixture=harness(options),before=structuredClone([...fixture.tabs.values()]);let migrations=0;fixture.context.migrateChatgptPool=async()=>{migrations++;};
+ await assert.rejects(fixture.api().ensure(),/background_window_recovery_rejected/);
+ assert.equal(migrations,0);assert.deepEqual([...fixture.tabs.values()],before);assert.equal(fixture.calls.creates.length+fixture.calls.moves.length+fixture.calls.windows.length+fixture.calls.scripts.length,0);
+ assert.deepEqual(fixture.calls.requests.map(call=>call.kind),['register','diagnostic']);
+});
+
+for(const eligibleWeb of [null,'chatgpt',['chatgpt','chatgpt'],['deepseek','chatgpt'],['glm'],[42]])test('invalid explicit eligibility fails before model migration '+JSON.stringify(eligibleWeb),async()=>{
+ const fixture=harness({...mixedRecoveryOptions(),eligibleWeb});let migrations=0;fixture.context.migrateChatgptPool=async()=>{migrations++;};
+ await assert.rejects(fixture.api().ensure(),/background_window_recovery_rejected/);
+ assert.equal(migrations,0);assert.equal(fixture.calls.creates.length+fixture.calls.moves.length+fixture.calls.windows.length+fixture.calls.scripts.length,0);
+});
+
+test('a backend without explicit eligibility cannot authorize any model operation',async()=>{
+ const fixture=harness({...mixedRecoveryOptions(),omitEligibility:true});let migrations=0;fixture.context.migrateChatgptPool=async()=>{migrations++;};
+ await assert.rejects(fixture.api().ensure(),/background_window_recovery_rejected/);
+ assert.equal(migrations,0);assert.equal(fixture.calls.creates.length+fixture.calls.moves.length+fixture.calls.windows.length+fixture.calls.scripts.length,0);
+});
+
+for(const requested of [
+ {nonce:recoveryNonce,version:2,providers:['deepseek']},{nonce:recoveryNonce,version:2,providers:['chatgpt','doubao']},{nonce:recoveryNonce,version:2,providers:[]},
+ {nonce:recoveryNonce,version:2,providers:['chatgpt','chatgpt']},{nonce:recoveryNonce,version:2},{nonce:recoveryNonce,version:'2',providers:['chatgpt']}
+])test('a recovery request cannot widen or omit the negotiated scope '+JSON.stringify(requested),async()=>{
+ const fixture=harness({...mixedRecoveryOptions(),eligibleWeb:['chatgpt'],reply(kind,reply){if(kind==='register')reply.recovery_requested=requested;}});
+ await assert.rejects(fixture.api().ensure(),/background_window_recovery_rejected/);assert.equal(fixture.calls.creates.length+fixture.calls.moves.length+fixture.calls.windows.length+fixture.calls.scripts.length,0);
+});
+
+for(const change of [{version:undefined,providers:undefined},{providers:['chatgpt','deepseek']},{version:'2'}])test('selective retirement requires the exact version and scope '+JSON.stringify(change),async()=>{
+ const options={...mixedRecoveryOptions(),eligibleWeb:['chatgpt'],recoveryVersion:2,reply(kind,reply){if(kind==='retire-for-recovery')Object.assign(reply,change);}};
+ const fixture=harness(options);await assert.rejects(fixture.api().ensure(),/background_window_retirement_rejected/);
+ assert.equal(fixture.calls.creates.length+fixture.calls.moves.length+fixture.calls.windows.length+fixture.calls.scripts.length,0);assert.equal(fixture.local.bridgeBackgroundRecoveryRelocation,undefined);
+});
+
+for(const change of [{version:undefined,providers:undefined},{providers:['chatgpt','deepseek']},{version:'2'}])test('selective acknowledgement must match scope and can retry without restoring duplicate pages '+JSON.stringify(change),async()=>{
+ let reject=true;const fixture=harness({eligibleWeb:['chatgpt'],recoveryVersion:2,recoveryNonce,local:{bridgePool:[{tabId:20,slotId:0,url:gptHome,key:'expired',turns:1}]},reply(kind,reply){if(kind==='recovered'&&reject)Object.assign(reply,change);}});
+ await fixture.api().ensure();assert.equal(fixture.calls.creates.length,1);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,undefined);assert.equal(fixture.local.bridgeBackgroundWindowHealth.recovery_pending,true);assert.equal(fixture.local.bridgeBackgroundWindowHealth.recovery_error,'background_window_recovery_acknowledgement_rejected');
+ reject=false;fixture.load();await fixture.api().ensure();assert.equal(fixture.calls.creates.length,1);assert.equal(fixture.local.bridgeBackgroundRecoveryApplied,recoveryNonce);
+});
+
+for(const change of [{nonce:'d'.repeat(32)}, {version:undefined,providers:undefined}, {providers:['chatgpt','deepseek']}])test('an interrupted selective relocation rejects a stale nonce or scope before moving its controller '+JSON.stringify(change),async()=>{
+ let fail=true;const options={...mixedRecoveryOptions(),eligibleWeb:['chatgpt'],recoveryVersion:2,beforeWindowCreate(){if(fail){fail=false;throw Error('interrupted create');}}};
+ const fixture=harness(options);await assert.rejects(fixture.api().ensure(),/interrupted create/);const before=fixture.calls.requests.filter(call=>call.kind==='retire-for-recovery').length;
+ Object.assign(fixture.local.bridgeBackgroundRecoveryRelocation,change);fixture.load();let migrations=0;fixture.context.migrateChatgptPool=async()=>{migrations++;};
+ await assert.rejects(fixture.api().ensure(),/background_window_recovery_rejected/);assert.equal(migrations,0);assert.equal(fixture.calls.requests.filter(call=>call.kind==='retire-for-recovery').length,before);assert.equal(fixture.tabs.get(50).windowId,1);assert.equal(fixture.calls.moves.length+fixture.calls.creates.length,0);
 });

@@ -20,6 +20,65 @@ from app.config import AppConfig
 from app.db import Database
 
 
+_WEB_PROVIDER_ORDER = ('chatgpt', 'deepseek', 'doubao')
+
+
+def _eligible_web_providers(config: AppConfig) -> list[str]:
+    required = set(config.openai.required_lanes())
+    return [provider for provider in _WEB_PROVIDER_ORDER
+            if provider in required and provider not in config.openai.disabled_lanes
+            and not (config.openai.local_proxies.get(provider)
+                     and config.openai.local_proxies[provider].enabled)]
+
+
+def _legacy_model_recovery_allowed(config: AppConfig) -> bool:
+    return not config.openai.disabled_lanes and _eligible_web_providers(config) == list(_WEB_PROVIDER_ORDER)
+
+
+def _scoped_model_recovery(recovery) -> bool:
+    return isinstance(recovery, dict) and ('version' in recovery or 'providers' in recovery)
+
+
+def _pending_selective_model_recovery(recovery, eligible: list[str]) -> bool:
+    return (isinstance(recovery, dict) and type(recovery.get('version')) is int
+            and recovery['version'] == 2 and bool(eligible)
+            and isinstance(recovery.get('providers'), list) and recovery['providers'] == eligible
+            and isinstance(recovery.get('nonce'), str)
+            and re.fullmatch(r'[0-9a-f]{32}', recovery['nonce']) is not None
+            and recovery.get('completed') is False and recovery.get('invalidated') is not True
+            and ((recovery.get('registration_pending') is True
+                  and recovery.get('window_id') is None and recovery.get('host_tab_id') is None)
+                 or (recovery.get('registration_pending') is False
+                     and _recovery_window_matches(recovery, recovery))))
+
+
+def _recovery_window_matches(body: dict, window) -> bool:
+    return (isinstance(window, dict)
+            and all(type(window.get(key)) is int and window[key] > 0
+                    and type(body.get(key)) is int and body[key] == window[key]
+                    for key in ('window_id', 'host_tab_id')))
+
+
+def _selective_recovery_matches(body: dict, recovery, window, eligible: list[str]) -> bool:
+    return (_pending_selective_model_recovery(recovery, eligible)
+            and recovery.get('registration_pending') is False
+            and type(body.get('version')) is int and body['version'] == 2
+            and isinstance(body.get('providers'), list) and body['providers'] == recovery['providers']
+            and body.get('nonce') == recovery['nonce'] and _recovery_window_matches(body, window)
+            and _recovery_window_matches(recovery, window))
+
+
+def _selective_recovery_relocation_matches(recovery: dict, previous_window, registration: dict) -> bool:
+    proof = previous_window.get('recovery_retirement') if isinstance(previous_window, dict) else None
+    return (recovery.get('registration_pending') is False
+            and _recovery_window_matches(recovery, previous_window)
+            and isinstance(proof, dict) and proof.get('nonce') == recovery['nonce']
+            and _recovery_window_matches(recovery, proof)
+            and _recovery_window_matches(registration, registration)
+            and registration['host_tab_id'] == recovery['host_tab_id']
+            and registration['window_id'] != recovery['window_id'])
+
+
 def _verified_owner_voice_stats(config: AppConfig, db: Database, contacts: list[str]) -> dict:
     from app.voice_reply_habits import load_owner_voice_habits
     return load_owner_voice_habits(
@@ -242,6 +301,7 @@ setInterval(function(){{
 def create_app(config: AppConfig, db: Database) -> FastAPI:
     app = FastAPI(title="微信聊天分身")
     app.state.csrf_token = secrets.token_urlsafe(32)
+    model_recovery_lock = asyncio.Lock()
     if config.openai.provider in {'web','deepseek_web','doubao_web','hybrid_web'}:
         from app.web_llm import WebReplyLLM
         queue = WebReplyLLM(config)
@@ -281,39 +341,90 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         async def register_browser_window(request: Request):
             bridge_auth(request)
             body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(400, '窗口登记参数无效')
             from app.browser_window import register, capabilities
-            result = await asyncio.to_thread(register, db, body.get('window_id'), body.get('host_tab_id'))
-            result['capabilities'] = capabilities()
-            recovery = db.get_state('browser_model_recovery') or {}
-            if not config.openai.disabled_lanes and result.get('ok') and recovery.get('nonce') and not recovery.get('completed'):
-                result['recovery_requested'] = {'nonce': recovery['nonce']}
-            return result
+            async with model_recovery_lock:
+                previous_window = db.get_state('browser_bridge_window')
+                result = await asyncio.to_thread(register, db, body.get('window_id'), body.get('host_tab_id'))
+                result['capabilities'] = capabilities()
+                eligible = _eligible_web_providers(config)
+                result['eligible_web'] = eligible
+                recovery = db.get_state('browser_model_recovery') or {}
+                if result.get('ok') and _pending_selective_model_recovery(recovery, eligible):
+                    version_two = type(body.get('recovery_version')) is int and body['recovery_version'] == 2
+                    bound = _recovery_window_matches(recovery, result)
+                    if version_two and _recovery_window_matches(result, result) and (
+                            recovery.get('registration_pending') is True
+                            or _selective_recovery_relocation_matches(recovery, previous_window, result)):
+                        recovery = {**recovery, 'window_id': result['window_id'],
+                                    'host_tab_id': result['host_tab_id'], 'registration_pending': False}
+                        db.set_state('browser_model_recovery', recovery)
+                        bound = True
+                    elif recovery.get('registration_pending') is False and not bound:
+                        # An unrelated re-registration cannot transfer an owner
+                        # request to another host, even if the old IDs return.
+                        db.set_state('browser_model_recovery', {
+                            **recovery, 'invalidated': True, 'invalidated_at': time.time()})
+                    if version_two and bound:
+                        result['recovery_requested'] = {
+                            'nonce': recovery['nonce'], 'version': 2, 'providers': recovery['providers']}
+                elif (result.get('ok') and _legacy_model_recovery_allowed(config)
+                      and not _scoped_model_recovery(recovery) and isinstance(recovery, dict)
+                      and recovery.get('nonce') and not recovery.get('completed')):
+                    result['recovery_requested'] = {'nonce': recovery['nonce']}
+                return result
 
         @app.post('/browser-bridge/window/retire-for-recovery')
         async def retire_browser_window_for_recovery(request: Request):
             bridge_auth(request)
-            if config.openai.disabled_lanes:
-                raise HTTPException(409, '已停用的模型不会恢复')
             body = await request.json()
             if not isinstance(body, dict):
                 raise HTTPException(400, '恢复参数无效')
             from app.browser_window import retire_for_recovery
-            return await asyncio.to_thread(retire_for_recovery, db,
-                                           body.get('window_id'), body.get('host_tab_id'),
-                                           body.get('nonce'))
+            async with model_recovery_lock:
+                recovery = db.get_state('browser_model_recovery') or {}
+                selective = _scoped_model_recovery(body) or _scoped_model_recovery(recovery)
+                if selective:
+                    if not _selective_recovery_matches(body, recovery, db.get_state('browser_bridge_window'),
+                                                       _eligible_web_providers(config)):
+                        raise HTTPException(409, '恢复范围或窗口登记不匹配')
+                elif not _legacy_model_recovery_allowed(config):
+                    raise HTTPException(409, '当前模型配置需要选择性恢复')
+                result = await asyncio.to_thread(retire_for_recovery, db,
+                                                body.get('window_id'), body.get('host_tab_id'),
+                                                body.get('nonce'))
+                if selective and result.get('ok') and result.get('retired'):
+                    if not _selective_recovery_matches(body, db.get_state('browser_model_recovery'),
+                                                       db.get_state('browser_bridge_window'),
+                                                       _eligible_web_providers(config)):
+                        raise HTTPException(409, '恢复范围或窗口登记已改变')
+                    result = {**result, 'version': 2, 'providers': recovery['providers']}
+                return result
 
         @app.post('/browser-bridge/window/recovered')
         async def browser_models_recovered(request: Request):
             bridge_auth(request)
-            if config.openai.disabled_lanes:
-                raise HTTPException(409, '已停用的模型不会恢复')
             body = await request.json()
-            recovery = db.get_state('browser_model_recovery') or {}
-            window = db.get_state('browser_bridge_window') or {}
-            if not recovery.get('nonce') or body.get('nonce') != recovery.get('nonce') or any(type(window.get(key)) is not int or window[key] <= 0 or type(body.get(key)) is not int or body[key] != window[key] for key in ('window_id','host_tab_id')):
-                raise HTTPException(409, '恢复登记不匹配')
-            db.set_state('browser_model_recovery', {**recovery, 'completed': True, 'completed_at': time.time()})
-            return {'ok': True, 'nonce':body['nonce'], 'window_id':body['window_id'], 'host_tab_id':body['host_tab_id']}
+            if not isinstance(body, dict):
+                raise HTTPException(400, '恢复参数无效')
+            async with model_recovery_lock:
+                recovery = db.get_state('browser_model_recovery') or {}
+                window = db.get_state('browser_bridge_window') or {}
+                selective = _scoped_model_recovery(body) or _scoped_model_recovery(recovery)
+                if selective:
+                    if not _selective_recovery_matches(body, recovery, window, _eligible_web_providers(config)):
+                        raise HTTPException(409, '恢复范围或窗口登记不匹配')
+                elif not _legacy_model_recovery_allowed(config):
+                    raise HTTPException(409, '当前模型配置需要选择性恢复')
+                elif (not isinstance(recovery, dict) or not recovery.get('nonce')
+                      or body.get('nonce') != recovery.get('nonce') or not _recovery_window_matches(body, window)):
+                    raise HTTPException(409, '恢复登记不匹配')
+                db.set_state('browser_model_recovery', {**recovery, 'completed': True, 'completed_at': time.time()})
+                result = {'ok': True, 'nonce': body['nonce'], 'window_id': body['window_id'], 'host_tab_id': body['host_tab_id']}
+                if selective:
+                    result.update(version=2, providers=recovery['providers'])
+                return result
 
         @app.post('/browser-bridge/window/hide')
         async def hide_browser_window(request: Request):
@@ -531,21 +642,50 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
 
     @app.get('/browser-window/host', response_class=HTMLResponse)
     async def browser_http_host():
+        eligible = _eligible_web_providers(config)
+        legacy = _legacy_model_recovery_allowed(config)
+        recovery_action = 'recover-models' if legacy else 'recover-selected-models'
+        recovery_label = '一起恢复三路模型连接' if legacy else '恢复当前网页模型连接'
+        model_names = {'chatgpt': 'GPT', 'deepseek': 'DeepSeek', 'doubao': '豆包'}
+        model_description = '、'.join(model_names[provider] for provider in eligible) or '当前无需网页模型'
         return HTMLResponse(f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>微信模型后台控制台</title></head>
 <body style="font:16px/1.6 system-ui;max-width:720px;margin:40px auto;padding:24px"><h1>微信模型后台控制台</h1>
-<p>这是本机控制页。三路模型页与日常浏览器分开运行，不需要进入扩展特殊协议页面。</p>
-<form method="post" action="/browser-window/recover-models"><input type="hidden" name="_csrf" value="{app.state.csrf_token}"><button style="min-height:44px;padding:12px 20px">一起恢复三路模型连接</button></form>
+<p>这是本机控制页。当前网页模型：{model_description}。专用模型页与日常浏览器分开运行。</p>
+<form method="post" action="/browser-window/{recovery_action}"><input type="hidden" name="_csrf" value="{app.state.csrf_token}"><button style="min-height:44px;padding:12px 20px" {'disabled' if not eligible else ''}>{recovery_label}</button></form>
 <p><a href="/" target="_blank" rel="noopener">打开本机审核台</a></p></body></html>''', headers={'Cache-Control':'no-store','X-Frame-Options':'DENY'})
 
     @app.post('/browser-window/recover-models')
     async def request_models_recovery(request: Request):
         await owner_action(request)
-        if config.openai.disabled_lanes:
-            raise HTTPException(409, '已停用的模型不会恢复；当前接口仅支持完整三路恢复。')
         from app.browser_window import resume
-        await asyncio.to_thread(resume, db)
-        db.set_state('browser_model_recovery', {'nonce': secrets.token_hex(16), 'requested_at': time.time(), 'completed': False})
-        db.set_state('browser_window_feedback', {'ok': True, 'message':'已请求一起恢复三路模型，正在等待连接器执行。'})
+        async with model_recovery_lock:
+            if not _legacy_model_recovery_allowed(config):
+                raise HTTPException(409, '当前配置仅允许恢复所需的网页模型，请使用当前网页模型恢复入口。')
+            await asyncio.to_thread(resume, db)
+            db.set_state('browser_model_recovery', {'nonce': secrets.token_hex(16), 'requested_at': time.time(), 'completed': False})
+            db.set_state('browser_window_feedback', {'ok': True, 'message':'已请求一起恢复三路模型，正在等待连接器执行。'})
+        return RedirectResponse('/browser-window/host',status_code=303)
+
+    @app.post('/browser-window/recover-selected-models')
+    async def request_selected_models_recovery(request: Request):
+        await owner_action(request)
+        from app.browser_window import resume
+        async with model_recovery_lock:
+            eligible = _eligible_web_providers(config)
+            if not eligible:
+                raise HTTPException(409, '当前配置无需网页模型恢复')
+            # Scope comes from the live routing configuration. Owner input cannot
+            # add a disabled lane or replace an enabled local proxy with a tab.
+            await asyncio.to_thread(resume, db)
+            window = db.get_state('browser_bridge_window')
+            bound = _recovery_window_matches(window, window) if isinstance(window, dict) else False
+            db.set_state('browser_model_recovery', {
+                'nonce': secrets.token_hex(16), 'version': 2, 'providers': eligible,
+                'requested_at': time.time(), 'completed': False,
+                'window_id': window['window_id'] if bound else None,
+                'host_tab_id': window['host_tab_id'] if bound else None,
+                'registration_pending': not bound})
+            db.set_state('browser_window_feedback', {'ok': True, 'message':'已请求恢复当前网页模型，正在等待连接器执行。'})
         return RedirectResponse('/browser-window/host',status_code=303)
 
     @app.post('/browser-window/resume')
