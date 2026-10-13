@@ -32,6 +32,7 @@ import time
 import unicodedata
 import uuid
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,6 +77,7 @@ class PreviewFailure(Exception):
         self.native_exit_code = native_exit_code
         self.journal_failed = False
         self.child_stop_failed = False
+        self.timings_seconds: dict[str, float] | None = None
 
     def fields(self) -> dict:
         data = {"error_code": str(self)}
@@ -87,7 +89,37 @@ class PreviewFailure(Exception):
             data["journal_failed"] = True
         if self.child_stop_failed:
             data["child_stop_failed"] = True
+        if self.timings_seconds is not None:
+            data["timings_seconds"] = self.timings_seconds
         return data
+
+
+class _PreviewTimings:
+    """Monotonic wall time, including partial stages when an operation fails.
+
+    Stages are disjoint; absent stages were not reached. ``native_run`` includes
+    the fresh resource check, process launch/cold model load, inference, output
+    writing and the supervisor's completion polling/cleanup. It is not the
+    native log's prompt/generation/vocoder-only total. ``conversion`` measures
+    only WAV-to-MP3 conversion; the two output validations are separate.
+    ``total`` ends when the success/failure report is ready, before its final
+    journal writes and CLI serialization. It is not a WeChat reply/send latency.
+    """
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.seconds: dict[str, float] = {}
+
+    @contextmanager
+    def measure(self, stage: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.seconds[stage] = round(time.monotonic() - started, 6)
+
+    def snapshot(self) -> dict[str, float]:
+        return {**self.seconds, "total": round(time.monotonic() - self.started, 6)}
 
 
 @dataclass(frozen=True)
@@ -456,6 +488,23 @@ def convert_wav_to_mp3(wav: Path, destination: Path) -> None:
 def generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
                      text_file: Path, assets_dir: Path, request_id: str,
                      output_dir: Path | None = None) -> dict:
+    timings = _PreviewTimings()
+    try:
+        return _generate_preview(reference_audio=reference_audio,
+                                 i_own_this_voice=i_own_this_voice, text_file=text_file,
+                                 assets_dir=assets_dir, request_id=request_id,
+                                 output_dir=output_dir, timings=timings)
+    except PreviewFailure as failure:
+        # Pre-claim rejections have no journal. Include the same safe timing
+        # metadata in their CLI error, without creating/consuming a request ID.
+        if failure.timings_seconds is None:
+            failure.timings_seconds = timings.snapshot()
+        raise
+
+
+def _generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
+                      text_file: Path, assets_dir: Path, request_id: str,
+                      output_dir: Path | None, timings: _PreviewTimings) -> dict:
     if i_own_this_voice is not True:
         raise PreviewFailure("owned_voice_confirmation_required")
     request_id = _request_id(request_id)
@@ -467,11 +516,15 @@ def generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
     if any(path.exists() for path in paths.values()):
         raise PreviewFailure("request_already_recorded")
     text = load_text(text_file)
-    assets = verify_assets(assets_dir)
-    resources = resource_snapshot()
-    _require_resources(resources)
-    verify_cli(assets)
-    probe_audio(reference, expected="reference")
+    with timings.measure("asset_verification"):
+        assets = verify_assets(assets_dir)
+    with timings.measure("resource_check"):
+        resources = resource_snapshot()
+        _require_resources(resources)
+    with timings.measure("cli_verification"):
+        verify_cli(assets)
+    with timings.measure("reference_validation"):
+        probe_audio(reference, expected="reference")
     output.mkdir(parents=True, exist_ok=True)
     claim = paths[".attempt.json"]
     try:
@@ -494,22 +547,26 @@ def generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
 
     try:
         checkpoint("claimed")
-        exit_code = run_tts(assets, reference, text, paths[".raw.wav"],
-                            paths[".private.log"], resources, checkpoint)
+        with timings.measure("native_run"):
+            exit_code = run_tts(assets, reference, text, paths[".raw.wav"],
+                                paths[".private.log"], resources, checkpoint)
         native_exit_code = exit_code
         if type(exit_code) is not int or exit_code != 0:
             raise PreviewFailure("tts_process_failed", native_exit_code=exit_code)
         checkpoint("tts_result", native_exit_code=exit_code)
-        frames_generated = parse_generated_wav(paths[".private.log"], paths[".raw.wav"])
-        checkpoint("wav_validation", native_exit_code=exit_code)
-        wav_duration = probe_audio(paths[".raw.wav"], expected="wav")
+        with timings.measure("wav_validation"):
+            frames_generated = parse_generated_wav(paths[".private.log"], paths[".raw.wav"])
+            checkpoint("wav_validation", native_exit_code=exit_code)
+            wav_duration = probe_audio(paths[".raw.wav"], expected="wav")
         checkpoint("conversion", native_exit_code=exit_code)
-        convert_wav_to_mp3(paths[".raw.wav"], paths[".mp3.part"])
+        with timings.measure("conversion"):
+            convert_wav_to_mp3(paths[".raw.wav"], paths[".mp3.part"])
         checkpoint("mp3_validation", native_exit_code=exit_code)
-        mp3_duration = probe_audio(paths[".mp3.part"], expected="mp3")
-        if (not 0 < paths[".mp3.part"].stat().st_size <= MAX_MP3_BYTES
-                or abs(mp3_duration - wav_duration) > max(.25, wav_duration * .05)):
-            raise PreviewFailure("converted_audio_invalid")
+        with timings.measure("mp3_validation"):
+            mp3_duration = probe_audio(paths[".mp3.part"], expected="mp3")
+            if (not 0 < paths[".mp3.part"].stat().st_size <= MAX_MP3_BYTES
+                    or abs(mp3_duration - wav_duration) > max(.25, wav_duration * .05)):
+                raise PreviewFailure("converted_audio_invalid")
         checkpoint("publishing", native_exit_code=exit_code)
         os.replace(paths[".mp3.part"], paths[".mp3"])
         result = {"ok": True, "request_id": request_id, "audio_path": str(paths[".mp3"]),
@@ -526,6 +583,7 @@ def generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
                   "commit_free_mib_before_load": load_resources.get("commit_free_mib", resources.commit_free_mib),
                   "gpu_free_mib_before_load": load_resources.get("gpu_free_mib", resources.gpu_free_mib)}
         checkpoint("complete", native_exit_code=exit_code)
+        result["timings_seconds"] = timings.snapshot()
         _save_json(paths[".report.json"], result)
         _save_json(claim, {"request_id": request_id, "status": "done"})
         return result
@@ -535,6 +593,7 @@ def generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
         failure.phase = failure.phase or phase
         if failure.native_exit_code is None:
             failure.native_exit_code = native_exit_code
+        failure.timings_seconds = timings.snapshot()
         diagnostic = {"ok": False, "request_id": request_id, **failure.fields(),
                       "wechat_sent": False, "uploaded": False}
         try:

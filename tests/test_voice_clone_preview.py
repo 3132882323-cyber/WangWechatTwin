@@ -71,6 +71,109 @@ def test_complete_preview_is_private_no_upload_or_sender_and_id_never_reused(har
     assert harness.calls == ["run"]
 
 
+def test_preview_timings_are_separate_monotonic_stages_and_exclude_final_journal(harness, monkeypatch):
+    clock = [100.0]
+    # No wall-clock API is available: changes to the calendar clock cannot
+    # change the measured stages. Native inference is still fully mocked.
+    monkeypatch.setattr(voice, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def spend(name, seconds):
+        original = getattr(voice, name)
+
+        def wrapped(*args, **kwargs):
+            clock[0] += seconds
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(voice, name, wrapped)
+
+    for name, seconds in [("verify_assets", 1.25), ("resource_snapshot", .25),
+                          ("verify_cli", .5), ("run_tts", 4.75),
+                          ("convert_wav_to_mp3", .25)]:
+        spend(name, seconds)
+    original_probe = voice.probe_audio
+
+    def probe(path, *, expected):
+        clock[0] += {"reference": .75, "wav": .5, "mp3": .625}[expected]
+        return original_probe(path, expected=expected)
+
+    original_save = voice._save_json
+
+    def save(path, payload):
+        original_save(path, payload)
+        if path.name.endswith(".report.json") or payload.get("status") == "done":
+            clock[0] += 30
+
+    monkeypatch.setattr(voice, "probe_audio", probe)
+    monkeypatch.setattr(voice, "_save_json", save)
+    result = voice.generate_preview(**harness.args)
+    expected = {"asset_verification": 1.25, "resource_check": .25,
+                "cli_verification": .5, "reference_validation": .75,
+                "native_run": 4.75, "wav_validation": .5,
+                "conversion": .25, "mp3_validation": .625, "total": 8.875}
+    assert result["timings_seconds"] == expected
+    report = json.loads((harness.output / "preview_01.report.json").read_text())
+    assert report["timings_seconds"] == expected
+    assert clock[0] == 168.875
+    assert result["duration_seconds"] == 1.12  # Playback duration is separate.
+    assert harness.calls == ["run"]
+
+
+@pytest.mark.parametrize("failed_stage", ["native_run", "conversion"])
+def test_failed_stage_has_partial_timings_without_fabricating_later_stages(harness, monkeypatch, failed_stage):
+    clock = [10.0]
+    monkeypatch.setattr(voice, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    original_run = voice.run_tts
+
+    def run(*args):
+        clock[0] += 2.5
+        if failed_stage == "native_run":
+            args[-1]("running", child_pid=42)
+            raise voice.PreviewFailure("tts_timeout", phase="running")
+        return original_run(*args)
+
+    def conversion(*args):
+        clock[0] += .75
+        raise RuntimeError(SECRET)
+
+    monkeypatch.setattr(voice, "run_tts", run)
+    monkeypatch.setattr(voice, "convert_wav_to_mp3", conversion)
+    with pytest.raises(voice.PreviewFailure) as failed:
+        voice.generate_preview(**harness.args)
+    report = json.loads((harness.output / "preview_01.report.json").read_text())
+    timing = report["timings_seconds"]
+    assert timing == failed.value.fields()["timings_seconds"]
+    assert timing["native_run"] == 2.5
+    assert timing["total"] == (2.5 if failed_stage == "native_run" else 3.25)
+    assert "mp3_validation" not in timing
+    if failed_stage == "native_run":
+        assert "conversion" not in timing and "wav_validation" not in timing
+        assert report["phase"] == "running"
+        assert "native_exit_code" not in report
+    else:
+        assert timing["conversion"] == .75
+        assert report["phase"] == "conversion" and report["native_exit_code"] == 0
+    assert not report["ok"] and SECRET not in json.dumps(report)
+    assert json.loads((harness.output / "preview_01.attempt.json").read_text())["status"] == "unknown"
+    assert not (harness.output / "preview_01.mp3").exists()
+    with pytest.raises(voice.PreviewFailure, match="request_already_recorded"):
+        voice.generate_preview(**harness.args)
+
+
+def test_preclaim_asset_failure_has_only_attempted_stage_timings_and_no_claim(harness, monkeypatch):
+    clock = [20.0]
+    monkeypatch.setattr(voice, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def invalid_assets(*args):
+        clock[0] += .125
+        raise voice.PreviewFailure("pinned_model_invalid")
+
+    monkeypatch.setattr(voice, "verify_assets", invalid_assets)
+    with pytest.raises(voice.PreviewFailure, match="pinned_model_invalid") as failed:
+        voice.generate_preview(**harness.args)
+    assert failed.value.fields()["timings_seconds"] == {"asset_verification": .125, "total": .125}
+    assert not harness.output.exists() and not harness.calls
+
+
 @pytest.mark.parametrize("confirmed", [False, None, "true", 1])
 def test_explicit_owned_voice_confirmation_precedes_any_file_or_resource(harness, monkeypatch, confirmed):
     monkeypatch.setattr(voice, "load_text", lambda _: pytest.fail("must not read"))

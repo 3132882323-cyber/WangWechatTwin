@@ -10,6 +10,7 @@ import asyncio
 from urllib.parse import parse_qs
 from pathlib import Path
 import re
+import math
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
@@ -17,6 +18,61 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, File
 
 from app.config import AppConfig
 from app.db import Database
+
+
+def _verified_owner_voice_stats(config: AppConfig, db: Database, contacts: list[str]) -> dict:
+    from app.voice_reply_habits import load_owner_voice_habits
+    return load_owner_voice_habits(
+        config.resolve(config.paths.personal_database), config.resolve(config.paths.history_reader),
+        contacts, confirmation=db.get_state('voice_habit_confirmation'))
+
+
+def _voice_reply_advice(config: AppConfig, draft, source_metadata: dict | None = None, owner_voice_stats=None) -> str:
+    if draft.kind != 'reply':
+        return ''
+    from app.voice_reply_policy import suggest_reply_medium
+    profile = config.contact_map().get(draft.contact)
+    origin = source_metadata if isinstance(source_metadata, dict) else {}
+    incoming_type = draft.original_type or origin.get('original_type') or origin.get('message_type', 'text')
+    established_voice_history = bool(
+        owner_voice_stats and owner_voice_stats.source == 'owner_confirmed_wechat_history'
+        and owner_voice_stats.same_contact is True and owner_voice_stats.verified_human_only is True
+        and owner_voice_stats.sample_count >= 5 and owner_voice_stats.voice_count >= 3)
+    advice = suggest_reply_medium(
+        incoming_text=draft.incoming_content or '',
+        incoming_type=incoming_type,
+        chat_type='group' if draft.contact.endswith('@chatroom') else 'friend',
+        reply_text=draft.edited_reply or draft.reply,
+        risk=draft.risk, confidence=draft.confidence,
+        review_required=(draft.action == 'hold' or origin.get('owner_corrected_input') is True
+                         or origin.get('resume_incomplete') is True),
+        asr_uncertain=(origin.get('asr_uncertain') is not False if incoming_type == 'voice'
+                       else origin.get('asr_uncertain') is True),
+        local_hour=datetime.now(timezone(timedelta(hours=8))).hour,
+        # Past confirmed exchanges establish a modality habit, not a claim of
+        # friendship or personal closeness. The policy rechecks all thresholds.
+        familiar_contact=(bool(profile and profile.relationship in {'friend', 'family', 'close_friend'})
+                          or established_voice_history),
+        # A media observation or model transcription does not prove that the
+        # owner hand-recorded it. Unknown/AI history cannot teach voice habits.
+        owner_voice_stats=owner_voice_stats,
+    )
+    title = '建议短语音，先试听并逐条确认' if advice.medium == 'voice_review' else '建议文字回复'
+    return (f'<div class="reason voice-reply-advice"><strong>{title}：</strong>'
+            f'{html.escape(advice.reason.rstrip("。"))}。本条尚未生成语音，按现有文字审核流程处理。</div>')
+
+
+def _voice_timing_summary(db: Database) -> str:
+    state = db.get_state('voice_generation_benchmark')
+    if not isinstance(state, dict) or state.get('source') != 'local_single_sample':
+        return '还没有完整生成耗时记录。语音朗读时长与生成耗时会分别显示。'
+    keys = ('audio_seconds', 'native_core_seconds', 'process_to_wav_seconds')
+    values = [state.get(key) for key in keys]
+    if not all(type(value) in (int, float) and math.isfinite(value) and 0 < value <= 3600 for value in values):
+        return '生成耗时记录暂不可用。'
+    audio, core, process = values
+    return (f'最近一次本机测试：{audio:g} 秒音频，核心合成约 {core:g} 秒，'
+            f'启动到写出音频约 {process:g} 秒。单次样本；不包含回复起草、文件检查、格式转换和微信发送。')
 
 
 def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
@@ -31,6 +87,24 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
                    '已最小化（Mac，未完全隐藏）' if window_state.get('window_mode') == 'extension_minimized' and window_state.get('minimized') and window_state.get('verified') else
                    '已真正隐藏' if window_state.get('hidden') and window_state.get('verified') and window_state.get('visible') is False else '等待后台窗口连接')
     drafts = db.list_drafts(status="pending", limit=60)
+    owner_voice_stats = _verified_owner_voice_stats(config, db, [draft.contact for draft in drafts])
+    # Read only these pending inputs once; preserve the ASR uncertainty gate
+    # even though voice transcription has normalized message_type to text.
+    source_metadata = {}
+    inbound_ids = [draft.inbound_message_id for draft in drafts if draft.inbound_message_id]
+    if inbound_ids:
+        with db.connect() as connection:
+            inputs = connection.execute(
+                'SELECT id,source_metadata,message_type FROM messages WHERE id IN ('
+                + ','.join('?' for _ in inbound_ids) + ')', inbound_ids).fetchall()
+        for item in inputs:
+            try:
+                value = json.loads(item['source_metadata'] or '{}') if len(item['source_metadata'] or '') <= 16384 else {}
+            except (ValueError, TypeError):
+                value = {}
+            if not isinstance(value, dict):
+                value = {}
+            source_metadata[item['id']] = {**value, 'message_type': item['message_type']}
     events = db.recent_events(limit=60)
     rows = []
     test_labels={'__web_self_test__voice':'语音识别自检（测试草稿，不发送）',
@@ -55,6 +129,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
                     previews.append(f'<img alt="本条消息的图片预览" style="max-width:240px;max-height:280px" src="/media-preview/{kind}/{html.escape(path.name)}">')
         description=f'<div class="incoming"><strong>识别内容：</strong>{html.escape(draft.media_description)}</div>' if draft.media_description else ''
         source_label='<div class="reason">语音自动听写：请核对含糊词、人名和数字。</div>' if draft.original_type=='voice' else ''
+        voice_advice = _voice_reply_advice(config, draft, source_metadata.get(draft.inbound_message_id), owner_voice_stats.get(draft.contact))
         rows.append(
             f"""
             <section class="card">
@@ -62,6 +137,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
               <div class="incoming"><strong>对方：</strong>{incoming}</div>
               {source_label}{description}<div class="media-previews">{''.join(previews)}</div>
               <div class="reason"><strong>系统判断：</strong>{html.escape(draft.reason)}</div>
+              {voice_advice}
               {'<img alt="拟发送的表情图片" style="max-width:240px;max-height:240px" src="/sticker-preview/'+html.escape(draft.sticker_id)+'">' if draft.kind=='sticker' else ''}
               {f'<form method="post" action="/draft/{draft.id}/correct-input"><input type="hidden" name="_csrf" value="{csrf_token}"><label for="input-correction-{draft.id}">听写或理解有误？改正原文后重新生成草稿</label><textarea id="input-correction-{draft.id}" name="corrected_input">{html.escape(draft.incoming_content or "")}</textarea><button type="submit">保存识别纠正并重新起草</button></form>' if draft.inbound_message_id and draft.kind=='reply' else ''}
               <form method="post" action="/draft/{draft.id}/{approve_action}">
@@ -134,6 +210,7 @@ small{{color:#9ca3af}}
 <section class="card"><strong>主动聊天：{'已开启建议' if config.proactive.enabled else '未开启'}</strong><p>问候与话题跟进均先生成草稿，你批准后才联系对方。每天最多 {config.proactive.max_drafts_per_day} 条；同一联系人至少间隔 {config.proactive.cooldown_hours:g} 小时；北京时间 {config.proactive.active_start_hour}:00—{config.proactive.active_end_hour}:00 生成建议。已有未回复消息时不再催聊。</p></section>
 <section class="card"><strong>表情图片：{'已启用审核建议' if config.stickers.enabled else '未启用'}</strong><p>对方明确分享好消息时，建议使用已批准的表情图片。预览后批准才发送；通过本机接口发送原图，每个联系人每天最多 {config.stickers.max_per_contact_per_day} 条建议。</p></section>
 <section class="card"><strong>语音、图片和表情识别</strong><p>语音在本机转文字：{'已启用' if config.media.voice_enabled else '未启用'}，处理中 {(db.get_state('media_worker_voice') or {}).get('pending_count',0)} 条。图片和表情取图：{'已启用' if config.media.images_enabled else '未启用'}，处理中 {(db.get_state('media_worker_visual') or {}).get('pending_count',0)} 条。普通图片回复先审核；识别不清楚的表情和语音不会自动发送。</p></section>
+<section class="card"><strong>回复方式：文字优先，语音先试听确认</strong><p>参考本人对当前联系人的真实语音习惯及对方的要求；没有可靠习惯记录时保持文字。群聊、深夜、不方便听、数字地址及专业内容优先文字，不因收到语音就机械用语音回复。</p><p>{_voice_timing_summary(db)}</p></section>
 <h2>待审核草稿（{len(drafts)}）</h2>
 {''.join(rows) if rows else '<div class="card">当前没有待审核草稿。</div>'}
 <h2>最近事件</h2>

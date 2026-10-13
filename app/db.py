@@ -168,7 +168,7 @@ class Database:
                     message.received_at.isoformat(),
                     json.dumps(message.media_paths[:3]),
                     str(origin.get('original_type',''))[:20],
-                    json.dumps({key:origin[key] for key in ['source','local_id','server_id','created_at','audio_sha256','asr_uncertain','original_type','member_external_ids','owner_corrected_input'] if key in origin}),
+                    json.dumps({key:origin[key] for key in ['source','local_id','server_id','created_at','audio_sha256','asr_uncertain','original_type','member_external_ids','owner_corrected_input','resume_incomplete'] if key in origin}),
                 ),
             )
             if cur.rowcount:
