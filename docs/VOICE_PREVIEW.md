@@ -32,4 +32,20 @@ Windows 已有一份真实本机试听：使用本人确认的约 6 秒参考录
 
 本项目没有声纹身份验证，也不承诺克隆效果与真人完全相同。当前原生接口尚未验收语音发送，生成的本机试听不自动发给任何联系人。
 
+## 微信语音封装与解码试听
+
+`app.outbound_voice` 将已核验的本机单声道 PCM16 WAV 编为 Tencent SILK，并完整解析每个 20ms 帧、再解码核对时长和非静音。使用已安装的 `silk-python==0.2.8`（导入名 `pysilk`），不下载模型、不读取聊天记录、不调用微信发送接口。
+
+```text
+python -m app.outbound_voice --source-wav "<私有试听.wav>" --output-dir "<私有本机输出目录>" --request-id "<全新唯一编号>" --expected-source-sha256 "<WAV的SHA256>"
+```
+
+源音频和输出必须位于公开源码目录之外的私有本机路径；网络共享以及解析后指向网络共享的链接均拒绝。调用者还应避免其他公开或云同步目录。默认限 1–30 秒，支持 8/12/16/24kHz。短于完整帧的尾部仅补零到下一帧；原音频哈希、补零数量和最终时长分别记录，不把有损解码误称为原始 PCM。
+
+产物为 `voice.silk`、`roundtrip.wav`、`manifest.json` 与持久请求记录。读取产物时重新核验哈希、每帧长度和解码时长；pending、unknown、done 或未完成目录均阻止同编号再次编码。Manifest 的 `send_authorized`、`native_send_verified` 和 `voice_sent` 均为 false，不能用修改 JSON 的方式授予发送权限。
+
+本机实际测试已将一份 2.96 秒本人试听编成 148 个完整语音帧，并解码回 2.96 秒可听 WAV。此结果只证明封装链路通过；微信原生 type34 的构造参数、逐条批准和服务器回执仍须独立验证。文件附件发送不能替代真正的语音消息。
+
+编解码 API 参考：[pysilk 固定版本源码](https://github.com/synodriver/pysilk/tree/b0fbba74506bb8be23ef5e120b983bbb2f70ac19)。本项目没有复制或分发其编解码源码和二进制；其包元数据声明 BSD，底层 Skype SDK 有独立许可及不授予专利权的声明，分发依赖时须另核对。
+
 协议参考：[豆包 TTS 连接实现](https://github.com/ljheee/tts-extension)。该仓库未提供许可证，本项目只参考协议行为，未复制其源码。
