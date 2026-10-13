@@ -17,6 +17,8 @@ class PersonalMemory:
                 CREATE TABLE IF NOT EXISTS corrections(target_id TEXT PRIMARY KEY,contact_key TEXT NOT NULL,original TEXT,corrected TEXT,at REAL);
                 CREATE TABLE IF NOT EXISTS ai_receipts(source TEXT,local_id INTEGER,contact_key TEXT,body_hash TEXT,PRIMARY KEY(source,local_id));
                 CREATE TABLE IF NOT EXISTS ai_intents(context TEXT PRIMARY KEY,contact_key TEXT,body_hash TEXT,created REAL);
+                CREATE TABLE IF NOT EXISTS ai_voice_payloads(audio_sha256 TEXT,contact_key TEXT,request_id TEXT,created REAL,
+                    PRIMARY KEY(audio_sha256,contact_key));
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE IF NOT EXISTS model_notes(target_id TEXT,contact_key TEXT,provider TEXT,content TEXT,at REAL,PRIMARY KEY(target_id,provider));
             ''')
@@ -36,7 +38,11 @@ class PersonalMemory:
         with closing(self.connect()) as db:
             receipt=db.execute('SELECT 1 FROM ai_receipts WHERE source=? AND local_id=?',(source,local_id)).fetchone()
             intent=db.execute('SELECT 1 FROM ai_intents WHERE contact_key=? AND body_hash=? AND created BETWEEN ? AND ?',(key,hashlib.sha256(message.content.encode()).hexdigest(),message.received_at.timestamp()-120,message.received_at.timestamp()+30)).fetchone()
-            if direction=='out' and (receipt or intent):provenance='ai_generated'
+            generated_voice = ((message.message_type=='voice' or origin.get('original_type')=='voice')
+                and isinstance(origin.get('audio_sha256'),str) and db.execute(
+                    'SELECT 1 FROM ai_voice_payloads WHERE contact_key=? AND audio_sha256=?',
+                    (key,origin['audio_sha256'])).fetchone())
+            if direction=='out' and (receipt or intent or generated_voice):provenance='ai_generated'
             db.execute('INSERT OR REPLACE INTO observations VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                 (message.external_id,key,direction,'本人' if direction=='out' else message.sender,message.content,message.message_type,
                  int(message.received_at.timestamp()),provenance,source,local_id,json.dumps(safe_meta)))
@@ -46,6 +52,21 @@ class PersonalMemory:
         with closing(self.connect()) as db:
             db.execute('INSERT OR REPLACE INTO ai_receipts VALUES(?,?,?,?)',(source,local_id,self.contact_key(contact),hashlib.sha256(text.encode()).hexdigest()))
             db.execute("UPDATE observations SET provenance='ai_generated' WHERE source=? AND local_id=?",(source,local_id))
+
+    def register_generated_voice(self,contact,audio_sha256,request_id):
+        if not all(isinstance(value,str) and re.fullmatch(r'[0-9a-f]{64}',value)
+                   for value in (audio_sha256,request_id)):
+            raise ValueError('invalid generated voice identity')
+        with closing(self.connect()) as db:
+            db.execute('INSERT OR IGNORE INTO ai_voice_payloads VALUES(?,?,?,?)',
+                (audio_sha256,self.contact_key(contact),request_id,time.time()))
+
+    def is_generated_voice(self,contact,audio_sha256):
+        if not isinstance(audio_sha256,str) or not re.fullmatch(r'[0-9a-f]{64}',audio_sha256):
+            return False
+        with closing(self.connect()) as db:
+            return db.execute('SELECT 1 FROM ai_voice_payloads WHERE contact_key=? AND audio_sha256=?',
+                              (self.contact_key(contact),audio_sha256)).fetchone() is not None
 
     def import_history(self,path):
         if not Path(path).exists():return 0

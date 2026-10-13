@@ -50,6 +50,38 @@ def test_explicit_clear_voice_is_advice_not_a_voice_sender(tmp_path, monkeypatch
     assert db.list_drafts()[0].status == 'pending'
 
 
+def test_standing_owner_authorization_removes_preview_wording_not_draft_review(tmp_path, monkeypatch):
+    config, db = desk(tmp_path, monkeypatch, uncertain=False)
+    db.set_state('voice_auto_reply_authorization', {
+        'source':'owner_instruction','ordinary_low_risk':True,'skip_previews':True})
+    page = webui._page(config, db)
+    assert '日常语音已授权免试听' in page
+    assert '适合短语音，已授权免试听' in page
+    assert '此条已进入审核台，仍按本条审核状态处理' in page
+    assert '建议短语音，先试听并逐条确认' not in page
+    assert db.list_drafts()[0].status == 'pending'
+    db.set_state('voice_auto_reply_authorization', {
+        'source':'owner_instruction','ordinary_low_risk':'true','skip_previews':True})
+    assert webui._voice_auto_authorized(db) is False
+
+
+def test_unknown_voice_has_no_ordinary_approve_button_or_post(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    config, db = desk(tmp_path, monkeypatch, uncertain=False)
+    config=config.model_copy(update={'mode':'low_risk_auto'})
+    draft=db.list_drafts()[0]
+    with db.connect() as connection:
+        connection.execute("UPDATE drafts SET kind='voice_unknown' WHERE id=?",(draft.id,))
+    page=webui._page(config,db)
+    assert f'action="/draft/{draft.id}/approve"' not in page
+    assert '语音发送结果待核' in page
+    app=webui.create_app(config,db)
+    response=TestClient(app).post(f'/draft/{draft.id}/approve',data={
+        '_csrf':app.state.csrf_token,'reply':'不能重复发送'})
+    assert response.status_code==409
+    assert db.list_drafts()[0].status=='pending'
+
+
 def test_interrupted_resume_preserves_text_and_review(tmp_path, monkeypatch):
     config, db = desk(tmp_path, monkeypatch, uncertain=False, resume=True)
     page = webui._page(config, db)

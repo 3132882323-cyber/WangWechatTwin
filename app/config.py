@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 from typing import Literal
 
 import yaml
@@ -134,6 +135,32 @@ class MediaSettings(BaseModel):
     max_pending_voice: int=20
 
 
+class OutboundVoiceSettings(BaseModel):
+    # Private local paths are configured only after an owner opts in. No
+    # reference recording or native transport is shipped with public defaults.
+    enabled: bool = False
+    owned_voice_confirmed: bool = False
+    reference_audio: str = ""
+    assets_dir: str = ""
+    output_dir: str = ""
+    runtime_manifest: str = ""
+    runtime_manifest_sha256: str = ""
+    synthesis_timeout_seconds: float = Field(default=60, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def require_configured_local_voice(self):
+        if self.enabled:
+            if self.owned_voice_confirmed is not True:
+                raise ValueError("outbound voice requires a confirmed owner voice")
+            if not all(value.strip() for value in (
+                self.reference_audio, self.assets_dir, self.output_dir, self.runtime_manifest,
+            )):
+                raise ValueError("outbound voice requires private local paths")
+            if not re.fullmatch(r"[0-9a-f]{64}", self.runtime_manifest_sha256):
+                raise ValueError("outbound voice requires a pinned runtime manifest")
+        return self
+
+
 class LocalAPISettings(BaseModel):
     auto_load: bool = False
     bootstrap_manifest: str = ".runtime/local_api/v2/manifest.json"
@@ -177,6 +204,7 @@ class AppConfig(BaseModel):
     proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
     stickers: StickerSettings = Field(default_factory=StickerSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
+    outbound_voice: OutboundVoiceSettings = Field(default_factory=OutboundVoiceSettings)
     local_api: LocalAPISettings = Field(default_factory=LocalAPISettings)
     web: WebSettings = Field(default_factory=WebSettings)
     paths: PathSettings = Field(default_factory=PathSettings)

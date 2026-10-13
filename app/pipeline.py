@@ -38,6 +38,27 @@ class ReplyPipeline:
         self.llm_init_lock=Lock()
         self.contact_map = config.contact_map()
 
+    def _try_auto_voice(self, message, decision, adapter):
+        from app.auto_voice_reply import AutoVoiceReplyResult, plan_pipeline_auto_voice
+        if not self.config.outbound_voice.enabled or not callable(getattr(adapter, 'send_voice', None)):
+            return None
+        try:
+            plan = plan_pipeline_auto_voice(self.config, self.db, message, decision)
+        except Exception:
+            self.db.add_event('voice_selection_unavailable', '语音习惯依据暂不可用，沿用文字', contact=message.contact)
+            return None
+        if not plan.eligible:
+            return None
+        try:
+            result = adapter.send_voice(message.contact, decision.reply, message.external_id, plan=plan)
+        except Exception:
+            # The adapter might already have dispatched. Never follow an
+            # exception or an ambiguous response with a second text message.
+            return AutoVoiceReplyResult('unknown', 'voice_adapter_result_unknown')
+        if not isinstance(result, AutoVoiceReplyResult) or result.status not in {'sent', 'not_attempted', 'unknown'}:
+            return AutoVoiceReplyResult('unknown', 'voice_adapter_result_unknown')
+        return result
+
     def _cache_sticker_observation(self, message, decision, provider):
         if message.message_type != 'sticker' or not message.media_paths:
             return
@@ -397,20 +418,38 @@ class ReplyPipeline:
                 decision.action = "review"
                 decision.reason = (decision.reason + "；达到每小时自动发送上限").strip("；")
             else:
-                try:
-                    ok = adapter.send_text(message.contact, decision.reply)
-                except Exception as exc:
-                    self.db.add_event("send_error", type(exc).__name__ + ": " + str(exc), level="error", contact=message.contact)
-                    ok = False
-                if ok:
-                    self.db.add_outgoing(message.contact, decision.reply, decision.risk.value)
-                    self.db.add_event("auto_sent", decision.reason or "低风险自动回复", contact=message.contact)
-                    self._sticker_suggestion(message,inbound_id)
-                    return ProcessResult(status="sent", decision=decision)
-                decision.action = "review"
-                skip=getattr(adapter,'last_send_skip_reason','微信发送未确认')
-                decision.reason = (decision.reason + "；"+skip).strip("；")
-                self.db.add_event('send_guard',skip,contact=message.contact)
+                voice_result = self._try_auto_voice(message, decision, adapter)
+                if voice_result is not None and voice_result.status == 'unknown':
+                    decision.action = 'review'
+                    decision.reason = (decision.reason + '；语音发送结果未知，保留审核，不补发文字或重试').strip('；')
+                    self.db.add_event('voice_send_unknown', json.dumps({
+                        'code': voice_result.code, 'request_id': voice_result.request_id,
+                        'inbound_message_id': inbound_id,
+                    }, ensure_ascii=True), contact=message.contact)
+                    draft_id = self.db.create_draft(message.contact, inbound_id, decision, kind='voice_unknown')
+                    return ProcessResult(status='draft', decision=decision, draft_id=draft_id)
+                else:
+                    medium = 'voice' if voice_result is not None and voice_result.status == 'sent' else 'text'
+                    if medium == 'voice':
+                        ok = True
+                    else:
+                        try:
+                            ok = adapter.send_text(message.contact, decision.reply)
+                        except Exception as exc:
+                            self.db.add_event("send_error", type(exc).__name__ + ": " + str(exc), level="error", contact=message.contact)
+                            ok = False
+                    if ok:
+                        self.db.add_outgoing(message.contact, decision.reply, decision.risk.value, message_type=medium)
+                        self.db.add_event("auto_sent", decision.reason or "低风险自动回复", contact=message.contact)
+                        if medium == 'voice':
+                            self.db.add_event('auto_voice_sent', '本人已授权的低风险语音回复，原生回执已核验', contact=message.contact)
+                        else:
+                            self._sticker_suggestion(message,inbound_id)
+                        return ProcessResult(status="sent", decision=decision)
+                    decision.action = "review"
+                    skip=getattr(adapter,'last_send_skip_reason','微信发送未确认')
+                    decision.reason = (decision.reason + "；"+skip).strip("；")
+                    self.db.add_event('send_guard',skip,contact=message.contact)
 
         if decision.action == "hold":
             holding = decision.holding_reply or risk.safe_holding_reply
@@ -452,7 +491,7 @@ class ReplyPipeline:
             return 0
         sent = 0
         for draft in self.db.approved_drafts():
-            if draft.kind=='deepseek_candidate':
+            if draft.kind in {'deepseek_candidate', 'voice_unknown'}:
                 self.db.update_draft(draft.id,'pending');continue
             text = (draft.edited_reply or draft.reply).strip()
             if not text:

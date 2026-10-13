@@ -21,6 +21,18 @@ def test_model_notes_are_only_optional_and_message_bound(tmp_path):
     assert memory.notes(['message'],'alice')[0]['provider']=='deepseek'
 
 
+def test_unknown_voice_payload_is_not_learned_as_manual_even_before_receipt(tmp_path):
+    import json
+    memory=PersonalMemory(tmp_path/'personal.sqlite3')
+    memory.register_generated_voice('alice','a'*64,'b'*64)
+    message=IncomingMessage(external_id='unknown-voice',contact='alice',sender='本人',
+        content='可能与原回复不同的听写',message_type='text',
+        raw_summary=json.dumps({'original_type':'voice','audio_sha256':'a'*64,'source':'db','local_id':11}))
+    assert memory.observe(message,'out','automatic_transcription')=='ai_generated'
+    assert memory.observe(message.model_copy(update={'external_id':'incoming'}),'in','automatic_transcription')=='automatic_transcription'
+    assert memory.observe(message.model_copy(update={'external_id':'other','contact':'bob'}),'out','automatic_transcription')=='automatic_transcription'
+
+
 def test_only_verified_human_style_is_used_and_receipts_remove_ai_samples(tmp_path):
     from datetime import datetime,timezone,timedelta
     memory=PersonalMemory(tmp_path/'personal.sqlite3');start=datetime.now(timezone.utc)

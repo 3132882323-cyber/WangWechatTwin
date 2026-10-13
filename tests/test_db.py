@@ -1,7 +1,30 @@
 from pathlib import Path
 
+import pytest
+
 from app.db import Database
 from app.models import IncomingMessage, ReplyDecision, RiskLevel
+
+
+def test_outgoing_voice_keeps_medium_and_counts_toward_auto_limit(tmp_path):
+    db = Database(tmp_path / 'voice.sqlite3')
+    db.add_outgoing('synthetic-peer', '普通文字。', 'low')
+    db.add_outgoing('synthetic-peer', '普通语音转写。', 'low', message_type='voice')
+    assert [row['message_type'] for row in db.recent_messages('synthetic-peer', 2)] == ['text', 'voice']
+    assert db.auto_sends_last_hour() == 2
+    with pytest.raises(ValueError, match='unsupported outgoing message type'):
+        db.add_outgoing('synthetic-peer', '错误媒介', message_type='image')
+    assert db.auto_sends_last_hour() == 2
+
+
+def test_unknown_voice_record_cannot_be_approved_as_text(tmp_path):
+    db = Database(tmp_path / 'unknown.sqlite3')
+    decision = ReplyDecision(action='review', risk=RiskLevel.low, reply='待核语音。', confidence=.95)
+    draft = db.create_draft('synthetic-peer', None, decision, kind='voice_unknown')
+    for status in ('approved', 'sending', 'sent'):
+        assert not db.update_draft(draft, status, '请勿补发的文字。')
+    assert db.list_drafts()[0].status == 'pending'
+    assert not db.approved_drafts()
 
 
 def test_message_and_draft(tmp_path: Path):

@@ -9,6 +9,140 @@ from app.models import IncomingMessage, ReplyDecision, RiskLevel
 from app.pipeline import ReplyPipeline
 
 
+def enable_auto_voice(cfg, db, monkeypatch):
+    from datetime import datetime
+    from app import auto_voice_reply as voice
+    from app.config import OutboundVoiceSettings
+
+    class Daytime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 13, 14, 0, tzinfo=tz)
+
+    monkeypatch.setattr(voice, 'datetime', Daytime)
+    cfg.outbound_voice = OutboundVoiceSettings(
+        enabled=True, owned_voice_confirmed=True, reference_audio='private/reference.wav',
+        assets_dir='private/assets', output_dir='private/output', runtime_manifest='private/runtime.json',
+        runtime_manifest_sha256='a' * 64,
+    )
+    db.set_state('voice_auto_reply_authorization', {
+        'source': 'owner_instruction', 'ordinary_low_risk': True, 'skip_previews': True,
+    })
+
+
+class VoiceAdapter(MockAdapter):
+    def __init__(self, result):
+        super().__init__()
+        self.voice_result = result
+        self.voice_calls = []
+
+    def send_voice(self, contact, text, event_id, *, plan):
+        assert plan.eligible and plan.reply_text == text
+        self.voice_calls.append((contact, text, event_id))
+        if isinstance(self.voice_result, Exception):
+            raise self.voice_result
+        return self.voice_result
+
+
+def voice_pipeline_case(tmp_path, monkeypatch, result):
+    cfg = make_config(tmp_path, 'low_risk_auto')
+    db = Database(cfg.resolve(cfg.paths.database))
+    enable_auto_voice(cfg, db, monkeypatch)
+    adapter = VoiceAdapter(result)
+    pipeline = ReplyPipeline(cfg, db, FakeLLM(ReplyDecision(
+        action='send', risk=RiskLevel.low, reply='外面有点凉，你出门记得多穿点。', confidence=.95,
+    )))
+    message = IncomingMessage(external_id='voice-ordinary', contact='张三', sender='张三', content='请发个语音吧')
+    return cfg, db, pipeline, adapter, message
+
+
+def test_ordinary_voice_auto_uses_existing_final_send_policy_and_records_medium(tmp_path, monkeypatch):
+    from app.auto_voice_reply import AutoVoiceReplyResult
+    cfg, db, pipeline, adapter, message = voice_pipeline_case(
+        tmp_path, monkeypatch, AutoVoiceReplyResult('sent', 'voice_receipt_verified', 'a' * 64),
+    )
+    result = pipeline.process(message, adapter)
+    assert result.status == 'sent' and len(adapter.voice_calls) == 1 and not adapter.sent
+    assert db.recent_messages('张三', 1)[0]['message_type'] == 'voice'
+    assert db.auto_sends_last_hour() == 1
+    assert not db.list_drafts()
+    assert any(event['event_type'] == 'auto_voice_sent' for event in db.recent_events())
+
+
+def test_unsupported_or_busy_voice_falls_back_to_one_normal_text_reply(tmp_path, monkeypatch):
+    from app.auto_voice_reply import AutoVoiceReplyResult
+    cfg, db, pipeline, adapter, message = voice_pipeline_case(
+        tmp_path, monkeypatch, AutoVoiceReplyResult('not_attempted', 'voice_busy'),
+    )
+    assert pipeline.process(message, adapter).status == 'sent'
+    assert len(adapter.voice_calls) == 1 and len(adapter.sent) == 1
+    assert db.recent_messages('张三', 1)[0]['message_type'] == 'text'
+    assert db.auto_sends_last_hour() == 1
+
+
+def test_unknown_voice_cannot_auto_or_manual_fallback_to_text(tmp_path, monkeypatch):
+    from app.auto_voice_reply import AutoVoiceReplyResult
+    cfg, db, pipeline, adapter, message = voice_pipeline_case(
+        tmp_path, monkeypatch, AutoVoiceReplyResult('unknown', 'voice_receipt_unknown', 'b' * 64),
+    )
+    result = pipeline.process(message, adapter)
+    assert result.status == 'draft' and not adapter.sent and len(adapter.voice_calls) == 1
+    assert db.auto_sends_last_hour() == 0
+    assert db.list_drafts()[0].kind == 'voice_unknown'
+    assert not db.update_draft(result.draft_id, 'approved', '禁止补发这段文字')
+    # Even an imported old approval must not reach the normal text sender.
+    with db.connect() as connection:
+        connection.execute("UPDATE drafts SET status='approved' WHERE id=?", (result.draft_id,))
+    assert pipeline.send_approved(adapter) == 0 and not adapter.sent
+    assert db.list_drafts()[0].status == 'pending'
+
+
+def test_voice_exception_or_ambiguous_adapter_return_never_falls_back(tmp_path, monkeypatch):
+    cfg, db, pipeline, adapter, message = voice_pipeline_case(tmp_path, monkeypatch, TimeoutError('native result unknown'))
+    assert pipeline.process(message, adapter).status == 'draft' and not adapter.sent
+    assert db.list_drafts()[0].kind == 'voice_unknown'
+    adapter.voice_result = True
+    message.external_id = 'another-ambiguous-voice'
+    assert pipeline.process(message, adapter).status == 'draft' and not adapter.sent
+
+
+def test_voice_config_does_not_grant_authority_by_itself(tmp_path, monkeypatch):
+    from app.auto_voice_reply import AutoVoiceReplyResult
+    cfg, db, pipeline, adapter, message = voice_pipeline_case(
+        tmp_path, monkeypatch, AutoVoiceReplyResult('sent', 'voice_receipt_verified'),
+    )
+    db.set_state('voice_auto_reply_authorization', {'ordinary_low_risk': True, 'skip_previews': True})
+    assert pipeline.process(message, adapter).status == 'sent'
+    assert not adapter.voice_calls and len(adapter.sent) == 1
+
+
+def test_voice_choice_preserves_quota_and_reply_confidence(tmp_path, monkeypatch):
+    from app.auto_voice_reply import AutoVoiceReplyResult
+    cfg, db, pipeline, adapter, message = voice_pipeline_case(
+        tmp_path, monkeypatch, AutoVoiceReplyResult('sent', 'voice_receipt_verified'),
+    )
+    pipeline.llm.decision.confidence = .75
+    assert pipeline.process(message, adapter).status == 'sent' and not adapter.voice_calls
+    pipeline.llm.decision.confidence = .95
+    cfg.wechat.max_auto_sends_per_hour = 1
+    message.external_id = 'voice-quota'
+    assert pipeline.process(message, adapter).status == 'draft' and not adapter.voice_calls
+
+
+def test_auto_voice_keeps_fact_and_local_manual_review_boundaries(tmp_path, monkeypatch):
+    from app.auto_voice_reply import AutoVoiceReplyResult
+    cfg, db, pipeline, adapter, message = voice_pipeline_case(
+        tmp_path, monkeypatch, AutoVoiceReplyResult('sent', 'voice_receipt_verified'),
+    )
+    cfg.wechat.send_holding_on_review = False
+    pipeline.llm.decision.facts_to_confirm = ['本人尚未确认具体安排']
+    assert pipeline.process(message, adapter).status == 'draft' and not adapter.voice_calls and not adapter.sent
+    pipeline.llm.decision.facts_to_confirm = []
+    pipeline.llm.decision._manual_review_required = True
+    message.external_id = 'manual-boundary'
+    assert pipeline.process(message, adapter).status == 'draft' and not adapter.voice_calls and not adapter.sent
+
+
 class FakeLLM:
     def __init__(self, decision: ReplyDecision):
         self.decision = decision

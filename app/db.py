@@ -187,16 +187,19 @@ class Database:
             conn.execute('COMMIT')
             return incoming_id
 
-    def add_outgoing(self, contact: str, content: str, risk: str | None = None) -> int:
+    def add_outgoing(self, contact: str, content: str, risk: str | None = None, *,
+                     message_type: str = "text") -> int:
+        if message_type not in {"text", "voice"}:
+            raise ValueError("unsupported outgoing message type")
         external_id = f"out:{contact}:{datetime.now(timezone.utc).timestamp()}"
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO messages
                 (external_id, contact, sender, direction, content, message_type, risk, created_at)
-                VALUES (?, ?, ?, 'out', ?, 'text', ?, ?)
+                VALUES (?, ?, ?, 'out', ?, ?, ?, ?)
                 """,
-                (external_id, contact, "owner", content, risk, utc_now()),
+                (external_id, contact, "owner", content, message_type, risk, utc_now()),
             )
             return int(cur.lastrowid)
 
@@ -309,6 +312,10 @@ class Database:
     ) -> bool:
         now = utc_now()
         with self.connect() as conn:
+            if status in {'approved', 'sending', 'sent'}:
+                existing = conn.execute('SELECT kind FROM drafts WHERE id=?', (draft_id,)).fetchone()
+                if existing is not None and existing['kind'] == 'voice_unknown':
+                    return False
             if edited_reply is None:
                 cur = conn.execute(
                     "UPDATE drafts SET status=?, updated_at=? WHERE id=?",

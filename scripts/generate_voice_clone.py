@@ -336,12 +336,15 @@ def _stop_child(child) -> None:
 
 def run_tts(assets: Assets, reference: Path, text: str, wav: Path, log_path: Path,
             resources: Resources, checkpoint, *, popen=None, commit_reader=None,
-            resource_reader=None, monotonic=None, sleep=None) -> int:
+            resource_reader=None, monotonic=None, sleep=None, timeout_seconds: float = 300) -> int:
     popen = popen or subprocess.Popen
     commit_reader = commit_reader or free_commit_mib
     resource_reader = resource_reader or resource_snapshot
     monotonic = monotonic or time.monotonic
     sleep = sleep or time.sleep
+    if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
+            or not 1 <= timeout_seconds <= 300):
+        raise PreviewFailure("invalid_tts_timeout")
     # This reading is after asset/reference checks and immediately before the
     # child is spawned; a stale earlier high reading never authorizes loading.
     try:
@@ -363,7 +366,7 @@ def run_tts(assets: Assets, reference: Path, text: str, wav: Path, log_path: Pat
             started = monotonic()
             checkpoint("running", child_pid=child.pid)
             while child.poll() is None:
-                if monotonic() - started > 300:
+                if monotonic() - started > timeout_seconds:
                     raise PreviewFailure("tts_timeout", phase="running")
                 if commit_reader() < STOP_COMMIT_MIB:
                     raise PreviewFailure("commit_watchdog_stop", phase="running")
@@ -487,13 +490,13 @@ def convert_wav_to_mp3(wav: Path, destination: Path) -> None:
 
 def generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
                      text_file: Path, assets_dir: Path, request_id: str,
-                     output_dir: Path | None = None) -> dict:
+                     output_dir: Path | None = None, timeout_seconds: float = 300) -> dict:
     timings = _PreviewTimings()
     try:
         return _generate_preview(reference_audio=reference_audio,
                                  i_own_this_voice=i_own_this_voice, text_file=text_file,
                                  assets_dir=assets_dir, request_id=request_id,
-                                 output_dir=output_dir, timings=timings)
+                                 output_dir=output_dir, timings=timings, timeout_seconds=timeout_seconds)
     except PreviewFailure as failure:
         # Pre-claim rejections have no journal. Include the same safe timing
         # metadata in their CLI error, without creating/consuming a request ID.
@@ -504,9 +507,13 @@ def generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
 
 def _generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
                       text_file: Path, assets_dir: Path, request_id: str,
-                      output_dir: Path | None, timings: _PreviewTimings) -> dict:
+                      output_dir: Path | None, timings: _PreviewTimings,
+                      timeout_seconds: float = 300) -> dict:
     if i_own_this_voice is not True:
         raise PreviewFailure("owned_voice_confirmation_required")
+    if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
+            or not 1 <= timeout_seconds <= 300):
+        raise PreviewFailure("invalid_tts_timeout")
     request_id = _request_id(request_id)
     output = _private_path(output_dir or DEFAULT_OUTPUT_DIR, code="output_must_be_private")
     reference = _private_path(reference_audio, code="reference_must_be_private")
@@ -548,8 +555,9 @@ def _generate_preview(*, reference_audio: Path, i_own_this_voice: bool,
     try:
         checkpoint("claimed")
         with timings.measure("native_run"):
+            options = {} if timeout_seconds == 300 else {"timeout_seconds": timeout_seconds}
             exit_code = run_tts(assets, reference, text, paths[".raw.wav"],
-                                paths[".private.log"], resources, checkpoint)
+                                paths[".private.log"], resources, checkpoint, **options)
         native_exit_code = exit_code
         if type(exit_code) is not int or exit_code != 0:
             raise PreviewFailure("tts_process_failed", native_exit_code=exit_code)

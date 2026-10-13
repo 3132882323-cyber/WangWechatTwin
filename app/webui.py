@@ -27,7 +27,13 @@ def _verified_owner_voice_stats(config: AppConfig, db: Database, contacts: list[
         contacts, confirmation=db.get_state('voice_habit_confirmation'))
 
 
-def _voice_reply_advice(config: AppConfig, draft, source_metadata: dict | None = None, owner_voice_stats=None) -> str:
+def _voice_auto_authorized(db: Database) -> bool:
+    policy = db.get_state('voice_auto_reply_authorization')
+    return bool(isinstance(policy, dict) and policy.get('source') == 'owner_instruction'
+                and policy.get('ordinary_low_risk') is True and policy.get('skip_previews') is True)
+
+
+def _voice_reply_advice(config: AppConfig, draft, source_metadata: dict | None = None, owner_voice_stats=None, auto_authorized=False) -> str:
     if draft.kind != 'reply':
         return ''
     from app.voice_reply_policy import suggest_reply_medium
@@ -57,6 +63,10 @@ def _voice_reply_advice(config: AppConfig, draft, source_metadata: dict | None =
         # owner hand-recorded it. Unknown/AI history cannot teach voice habits.
         owner_voice_stats=owner_voice_stats,
     )
+    if auto_authorized and advice.medium == 'voice_review':
+        reason = advice.reason.replace('需先试听并逐条批准', '可按已授权的自动语音流程处理').replace('需试听并批准', '可按已授权的自动语音流程处理')
+        return (f'<div class="reason voice-reply-advice"><strong>适合短语音，已授权免试听：</strong>'
+                f'{html.escape(reason.rstrip("。"))}。此条已进入审核台，仍按本条审核状态处理。</div>')
     title = '建议短语音，先试听并逐条确认' if advice.medium == 'voice_review' else '建议文字回复'
     return (f'<div class="reason voice-reply-advice"><strong>{title}：</strong>'
             f'{html.escape(advice.reason.rstrip("。"))}。本条尚未生成语音，按现有文字审核流程处理。</div>')
@@ -76,6 +86,7 @@ def _voice_timing_summary(db: Database) -> str:
 
 
 def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
+    voice_auto_authorized = _voice_auto_authorized(db)
     try:
         labels = json.loads((config.resolve(config.paths.history_reader) / "contact_labels.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -114,7 +125,7 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
     draft_only = config.mode in {"shadow", "off"}
     for draft in drafts:
         contact_label=test_labels.get(draft.contact,'网页连接自检（测试草稿，不发送）' if draft.contact.startswith('__web_self_test__') else labels.get(draft.contact,draft.contact))
-        allowed = (draft.kind!='deepseek_candidate' and not draft.contact.startswith('__web_self_test__') and not draft_only and (config.adapter != "history_verified_sender"
+        allowed = (draft.kind not in {'deepseek_candidate','voice_unknown'} and not draft.contact.startswith('__web_self_test__') and not draft_only and (config.adapter != "history_verified_sender"
                    or config.wechat.sender_all_existing_chats or draft.contact in config.wechat.sender_allowed_contacts))
         approve_action = "approve" if allowed else "save"
         approve_label = ("批准这次主动联系" if draft.kind=='proactive' else "批准发送并学习我的修改") if allowed else "保存我的修改"
@@ -129,7 +140,9 @@ def _page(config: AppConfig, db: Database, csrf_token: str = "") -> str:
                     previews.append(f'<img alt="本条消息的图片预览" style="max-width:240px;max-height:280px" src="/media-preview/{kind}/{html.escape(path.name)}">')
         description=f'<div class="incoming"><strong>识别内容：</strong>{html.escape(draft.media_description)}</div>' if draft.media_description else ''
         source_label='<div class="reason">语音自动听写：请核对含糊词、人名和数字。</div>' if draft.original_type=='voice' else ''
-        voice_advice = _voice_reply_advice(config, draft, source_metadata.get(draft.inbound_message_id), owner_voice_stats.get(draft.contact))
+        voice_advice = _voice_reply_advice(config, draft, source_metadata.get(draft.inbound_message_id), owner_voice_stats.get(draft.contact), voice_auto_authorized)
+        if draft.kind=='voice_unknown':
+            voice_advice='<div class="reason"><strong>语音发送结果待核：</strong>先核对这次语音是否已发出，不能直接批准同轮文字重复发送。</div>'
         rows.append(
             f"""
             <section class="card">
@@ -210,7 +223,7 @@ small{{color:#9ca3af}}
 <section class="card"><strong>主动聊天：{'已开启建议' if config.proactive.enabled else '未开启'}</strong><p>问候与话题跟进均先生成草稿，你批准后才联系对方。每天最多 {config.proactive.max_drafts_per_day} 条；同一联系人至少间隔 {config.proactive.cooldown_hours:g} 小时；北京时间 {config.proactive.active_start_hour}:00—{config.proactive.active_end_hour}:00 生成建议。已有未回复消息时不再催聊。</p></section>
 <section class="card"><strong>表情图片：{'已启用审核建议' if config.stickers.enabled else '未启用'}</strong><p>对方明确分享好消息时，建议使用已批准的表情图片。预览后批准才发送；通过本机接口发送原图，每个联系人每天最多 {config.stickers.max_per_contact_per_day} 条建议。</p></section>
 <section class="card"><strong>语音、图片和表情识别</strong><p>语音在本机转文字：{'已启用' if config.media.voice_enabled else '未启用'}，处理中 {(db.get_state('media_worker_voice') or {}).get('pending_count',0)} 条。图片和表情取图：{'已启用' if config.media.images_enabled else '未启用'}，处理中 {(db.get_state('media_worker_visual') or {}).get('pending_count',0)} 条。普通图片回复先审核；识别不清楚的表情和语音不会自动发送。</p></section>
-<section class="card"><strong>回复方式：文字优先，语音先试听确认</strong><p>参考本人对当前联系人的真实语音习惯及对方的要求；没有可靠习惯记录时保持文字。群聊、深夜、不方便听、数字地址及专业内容优先文字，不因收到语音就机械用语音回复。</p><p>{_voice_timing_summary(db)}</p></section>
+<section class="card"><strong>回复方式：{'日常语音已授权免试听' if voice_auto_authorized else '文字优先，语音先试听确认'}</strong><p>参考本人对当前联系人的真实语音习惯及对方的要求；没有可靠习惯记录时保持文字。群聊、深夜、不方便听、数字地址及专业内容优先文字，不因收到语音就机械用语音回复。</p><p>{'免试听授权已记录；自动语音还须本机声线和发送接口就绪。重要事项及识别不确定仍审核。' if voice_auto_authorized else '语音建议需先试听确认。'}</p><p>{_voice_timing_summary(db)}</p></section>
 <h2>待审核草稿（{len(drafts)}）</h2>
 {''.join(rows) if rows else '<div class="card">当前没有待审核草稿。</div>'}
 <h2>最近事件</h2>
@@ -563,6 +576,7 @@ def create_app(config: AppConfig, db: Database) -> FastAPI:
         await owner_action(request)
         candidate=next((draft for draft in db.list_drafts(status='pending',limit=1000) if draft.id==draft_id),None)
         if candidate and candidate.kind=='deepseek_candidate':raise HTTPException(403,'DeepSeek 对照草稿暂不允许直接发送')
+        if candidate and candidate.kind=='voice_unknown':raise HTTPException(409,'语音发送结果待核，不能重复批准同轮文字')
         if config.mode in {"shadow", "off"}:
             raise HTTPException(status_code=403, detail="当前只生成草稿，未开启发送")
         if config.adapter == "history_verified_sender":

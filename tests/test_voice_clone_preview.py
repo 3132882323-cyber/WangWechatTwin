@@ -71,6 +71,19 @@ def test_complete_preview_is_private_no_upload_or_sender_and_id_never_reused(har
     assert harness.calls == ["run"]
 
 
+def test_auto_budget_is_passed_through_the_complete_preview(harness, monkeypatch):
+    original = voice.run_tts
+    seen = []
+
+    def bounded(*args, timeout_seconds):
+        seen.append(timeout_seconds)
+        return original(*args)
+
+    monkeypatch.setattr(voice, 'run_tts', bounded)
+    assert voice.generate_preview(**harness.args, timeout_seconds=60)['ok'] is True
+    assert seen == [60]
+
+
 def test_preview_timings_are_separate_monotonic_stages_and_exclude_final_journal(harness, monkeypatch):
     clock = [100.0]
     # No wall-clock API is available: changes to the calendar clock cannot
@@ -304,7 +317,7 @@ class FakeChild:
 
 
 def run_fake(tmp_path, *, child, commits=(8192,), gpu_free_mib=5000,
-             clock=(0, 0), checkpoint=None):
+             clock=(0, 0), checkpoint=None, timeout_seconds=300):
     assets = assets_for(tmp_path)
     calls = []
     readings = iter(commits)
@@ -320,7 +333,8 @@ def run_fake(tmp_path, *, child, commits=(8192,), gpu_free_mib=5000,
                           tmp_path / "raw.wav", tmp_path / "private.log", voice.Resources(8192, 5000, 1),
                           callback, popen=popen, commit_reader=lambda: next(readings),
                           resource_reader=lambda: voice.Resources(next(readings), gpu_free_mib, 1),
-                          monotonic=lambda: next(times), sleep=lambda _: pytest.fail("no unmocked wait"))
+                          monotonic=lambda: next(times), sleep=lambda _: pytest.fail("no unmocked wait"),
+                          timeout_seconds=timeout_seconds)
     return result, calls, checkpoints
 
 
@@ -365,6 +379,23 @@ def test_timeout_stops_own_child(tmp_path):
     with pytest.raises(voice.PreviewFailure, match="tts_timeout"):
         run_fake(tmp_path, child=child, commits=(8192,), clock=(0, 301))
     assert child.operations == ["terminate", "wait"]
+
+
+@pytest.mark.parametrize("needs_kill", [False, True])
+def test_auto_voice_sixty_second_budget_stops_only_its_child(tmp_path, needs_kill):
+    child = FakeChild(terminate_timeout=needs_kill)
+    with pytest.raises(voice.PreviewFailure, match="tts_timeout") as failure:
+        run_fake(tmp_path, child=child, commits=(8192,), clock=(0, 61), timeout_seconds=60)
+    assert child.operations == (["terminate", "wait", "kill", "wait"] if needs_kill else ["terminate", "wait"])
+    assert failure.value.native_exit_code == (-9 if needs_kill else -15)
+
+
+@pytest.mark.parametrize("timeout", [0, True, float("nan"), float("inf"), 301])
+def test_invalid_native_time_budget_never_launches(tmp_path, timeout):
+    child = FakeChild(0)
+    with pytest.raises(voice.PreviewFailure, match="invalid_tts_timeout"):
+        run_fake(tmp_path, child=child, timeout_seconds=timeout)
+    assert child.operations == [] and not (tmp_path / "private.log").exists()
 
 
 def test_native_nonzero_is_never_masked_as_complete(tmp_path):

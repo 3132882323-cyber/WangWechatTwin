@@ -37,33 +37,80 @@ class _BoundedPCMWriter(io.RawIOBase):
 def resolve_voice(reader,message):
     origin=json.loads(message.raw_summary or '{}')
     server=int(origin.get('server_id') or 0);local=int(origin.get('local_id') or 0)
+    # Outgoing media can be written before the message receives its server ID.
+    # Link that zero-ID payload only to the original owned message_N source
+    # and corresponding media_N file, never to another shard's local ID.
+    binding=None
+    source=origin.get('source')
+    owner=getattr(reader,'self_username',None)
+    if isinstance(source,str) and isinstance(owner,str) and owner:
+        source=source.replace('\\','/')
+        shard=re.fullmatch(r'([^/]+)/message/message_([0-9]+)\.db',source)
+        originals=[info for name,info in getattr(reader,'files',{}).items()
+                   if isinstance(name,str) and name.replace('\\','/')==source]
+        if (shard and shard[1].rsplit('_',1)[0]==owner and len(originals)==1
+                and isinstance(originals[0],dict) and isinstance(originals[0].get('source'),str)):
+            physical=Path(originals[0]['source'])
+            try:
+                canonical=physical.resolve(strict=True)
+                if (physical.is_absolute() and canonical.is_file()
+                        and canonical.name=='message_'+shard[2]+'.db'
+                        and canonical.parent.name=='message'
+                        and canonical.parent.parent.name=='db_storage'
+                        and canonical.parent.parent.parent.name==shard[1]):
+                    binding=(shard[1]+'/message/media_'+shard[2]+'.db',canonical.parent,
+                             'media_'+shard[2]+'.db')
+            except (OSError,RuntimeError):pass
     keys_path=reader.root/'media_keys.json'
     if not keys_path.exists():raise ValueError('尚未连接经认证的语音媒体库')
     keys=json.loads(keys_path.read_text())
-    unique={}
+    found=[]
     max_voice_bytes=4*1024*1024
     for rel,info in keys.items():
+        same_shard=False
+        if binding and isinstance(rel,str) and isinstance(info,dict) and isinstance(info.get('source'),str):
+            physical=Path(info['source'])
+            try:
+                canonical=physical.resolve(strict=True)
+                same_shard=(physical.is_absolute() and canonical.is_file() and rel.replace('\\','/')==binding[0]
+                            and canonical.name==binding[2] and canonical.parent==binding[1])
+            except (OSError,RuntimeError):pass
+        zero_link=(server>0 and type(origin.get('server_id')) is int
+                   and local>0 and type(origin.get('local_id')) is int
+                   and origin.get('owner_message') is True and same_shard)
         with tempfile.TemporaryDirectory(dir=reader.root) as tmp:
             snapshot,_=authenticated_snapshot(info,Path(tmp))
             with closing(sqlite3.connect(snapshot.as_uri()+'?mode=ro&immutable=1',uri=True)) as db:
-                chat=db.execute('SELECT rowid FROM Name2Id WHERE user_name=?',(message.contact,)).fetchone()
-                if not chat:continue
+                chats=db.execute('SELECT rowid FROM Name2Id WHERE user_name=? LIMIT 2',(message.contact,)).fetchall()
+                if not chats:continue
+                if len(chats)!=1:raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
+                chat=chats[0]
                 if server:
-                    rows=db.execute('SELECT CASE WHEN length(voice_data)<=? THEN voice_data ELSE NULL END,length(voice_data) FROM VoiceInfo WHERE chat_name_id=? AND svr_id=?',(max_voice_bytes,chat[0],server))
+                    selector='(svr_id=? OR local_id=?)' if zero_link else 'svr_id=?'
+                    params=(max_voice_bytes,chat[0],server,local) if zero_link else (max_voice_bytes,chat[0],server)
+                    rows=db.execute('SELECT CASE WHEN length(voice_data)<=? THEN voice_data ELSE NULL END,'
+                                    'length(voice_data),svr_id,local_id FROM VoiceInfo WHERE chat_name_id=? AND '
+                                    +selector+' LIMIT 2',params).fetchall()
                 else:
                     # Local IDs are safe only in the media shard corresponding to this message shard.
-                    source=Path(origin.get('source','')).name
-                    if Path(info['source']).name!='media_'+source.removeprefix('message_'):continue
-                    rows=db.execute('SELECT CASE WHEN length(voice_data)<=? THEN voice_data ELSE NULL END,length(voice_data) FROM VoiceInfo WHERE chat_name_id=? AND local_id=?',(max_voice_bytes,chat[0],local))
-                for raw,size in rows:
+                    if not same_shard or local<=0:continue
+                    rows=db.execute('SELECT CASE WHEN length(voice_data)<=? THEN voice_data ELSE NULL END,'
+                                    'length(voice_data),svr_id,local_id FROM VoiceInfo WHERE chat_name_id=? AND local_id=? LIMIT 2',
+                                    (max_voice_bytes,chat[0],local)).fetchall()
+                if len(rows)>1:raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
+                for raw,size,media_server,media_local in rows:
+                    if server and (media_server not in (0,server) or (media_server==0 and not zero_link)
+                                   or (origin.get('owner_message') is True and local>0 and media_local!=local)):
+                        raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
+                    # Duplicate records are ambiguous even when their bytes
+                    # happen to hash identically, including across databases.
+                    if found:raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
                     if size and size>max_voice_bytes:raise ValueError('语音格式或大小不受支持')
                     if not raw:continue
                     data=bytes(raw);digest=hashlib.sha256(data).hexdigest()
-                    if unique and digest not in unique:raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
-                    unique[digest]=data
-    if not unique:raise VoiceNotReady('语音音频尚未写入本机媒体库')
-    if len(unique)!=1:raise ValueError('语音数据未能与该联系人和消息编号唯一对应')
-    digest,data=next(iter(unique.items()))
+                    found.append((digest,data))
+    if not found:raise VoiceNotReady('语音音频尚未写入本机媒体库')
+    digest,data=found[0]
     if len(data)>4*1024*1024 or not (data.startswith(b'#!SILK_V3') or data.startswith(b'\x02#!SILK_V3')):
         raise ValueError('语音格式或大小不受支持')
     root=reader.root/'voice_assets';root.mkdir(exist_ok=True);path=root/(digest+'.silk')
@@ -99,6 +146,14 @@ class OfflineVoiceProcessor:
                 if time.monotonic()>=deadline:raise
                 time.sleep(.4)
         if hasattr(self.reader,'personal'):
+            origin=json.loads(message.raw_summary or '{}')
+            if (origin.get('owner_message') is True
+                    and self.reader.personal.is_generated_voice(message.contact,digest)
+                    and isinstance(origin.get('source'),str)
+                    and type(origin.get('local_id')) is int and origin['local_id']>0):
+                # Provenance only, not a server receipt. Even failed ASR must
+                # not turn our own generated payload into a manual sample.
+                self.reader.personal.receipt(message.contact,message.content,origin['source'],origin['local_id'])
             correction=self.reader.personal.corrected(message.external_id,message.contact)
             if correction:return self._result(message,{'text':correction,'audio_sha256':digest,'uncertain':False,'duration_seconds':0},True)
         root=self.reader.root/'voice_transcripts';root.mkdir(exist_ok=True)

@@ -13,6 +13,8 @@ import json
 import sqlite3
 import tempfile
 import time
+import sys
+import types
 from contextvars import ContextVar
 from contextlib import contextmanager
 from xml.etree import ElementTree as ET
@@ -119,10 +121,11 @@ class HistoryHTTPSender(MessageAdapter):
             owner_message=json.loads(message.raw_summary or '{}').get('owner_message',False)
             if owner_message:
                 provenance='automatic_transcription' if json.loads(message.raw_summary or '{}').get('transcription_source') else 'wechat_media_observation'
-                self.reader.personal.observe(message,'out',provenance)
+                provenance=self.reader.personal.observe(message,'out',provenance)
                 if message.message_type=='text':
                     from app.chat_memory import remember
-                    remember(self.config.resolve(self.config.paths.chat_memory),[('own-media:'+message.external_id,message.contact,'out',int(message.received_at.timestamp()),message.content,'本人（语音听写需核实）')])
+                    speaker='本人（AI生成语音，仅作已发送上下文）' if provenance=='ai_generated' else '本人（语音听写需核实）'
+                    remember(self.config.resolve(self.config.paths.chat_memory),[('own-media:'+message.external_id,message.contact,'out',int(message.received_at.timestamp()),message.content,speaker)])
                 continue
             self.reader.personal.observe(message,'in','automatic_transcription' if json.loads(message.raw_summary or '{}').get('transcription_source') else 'wechat_original')
             if json.loads(message.raw_summary or '{}').get('transcription_source')=='offline_whisper':
@@ -230,6 +233,110 @@ class HistoryHTTPSender(MessageAdapter):
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(.2)
+
+    def _voice_context_current(self, contact, text, event_id):
+        """Recheck existing automatic-send boundaries after local synthesis."""
+        from app.db import Database
+        settings = self.config.outbound_voice
+        if not settings.enabled or sys.platform != 'win32' or self.config.mode not in {'low_risk_auto','full_auto'}:
+            return False
+        policy = Database(self.config.resolve(self.config.paths.database)).get_state('voice_auto_reply_authorization')
+        if not (isinstance(policy,dict) and policy.get('source')=='owner_instruction'
+                and policy.get('ordinary_low_risk') is True and policy.get('skip_previews') is True
+                and policy.get('owner_sha256')==hashlib.sha256(self.reader.self_username.encode()).hexdigest()):
+            return False
+        reference = self.config.resolve(settings.reference_audio)
+        if (not reference.is_file() or reference.stat().st_size>10*1024*1024
+                or hashlib.sha256(reference.read_bytes()).hexdigest()!=policy.get('reference_sha256')):
+            return False
+        from datetime import datetime, timezone, timedelta
+        hour=datetime.now(timezone(timedelta(hours=8))).hour
+        if not 8<=hour<22:
+            return False
+        if self.config.wechat.sender_all_existing_chats:
+            self.allowed.update(self._eligible_contacts())
+        if contact not in self.allowed or contact.endswith('@chatroom') or assess_risk(text).level != RiskLevel.low:
+            return False
+        if self.config.resolve(self.config.paths.pause_file).exists() or self._has_saved_human_draft(contact):
+            return False
+        bound = self.reply_context.get()
+        if not bound or bound[0] != contact or bound[1] != event_id or not bound[2]:
+            return False
+        origin = bound[2]
+        newest = self.latest_inbound.get(contact)
+        if newest and ((newest.get('source')==origin.get('source') and newest.get('local_id',0)>origin.get('local_id',0))
+                       or newest.get('created_at',0)>origin.get('created_at',0)):
+            return False
+        _, _, own = self._stable_outgoing_state(contact,text,time.monotonic()+3)
+        if any(lid>origin['local_id'] if source==origin['source'] else stamp>origin['created_at']
+               for source,(lid,stamp) in own.items()):
+            return False
+        db = Database(self.config.resolve(self.config.paths.database))
+        if db.auto_sends_last_hour() >= self.config.wechat.max_auto_sends_per_hour:
+            return False
+        self.client.verify_owner(self.reader.self_username)
+        return True
+
+    def send_voice(self, contact, text, event_id, *, plan=None):
+        """Opt-in local cloning plus a separately reviewed native voice client."""
+        from app.auto_voice_reply import AutoVoicePlan, AutoVoiceReplyResult, execute_auto_voice
+        settings = self.config.outbound_voice
+        if not isinstance(plan,AutoVoicePlan) or plan.eligible is not True or plan.reply_text!=text:
+            return AutoVoiceReplyResult('not_attempted','voice_plan_unverified')
+        try:
+            if not self._voice_context_current(contact,text,event_id):
+                return AutoVoiceReplyResult('not_attempted','voice_context_not_current')
+            manifest = self.config.resolve(settings.runtime_manifest).resolve(strict=True)
+            raw = manifest.read_bytes()
+            if len(raw)>65536 or hashlib.sha256(raw).hexdigest()!=settings.runtime_manifest_sha256:
+                raise ValueError('voice_runtime_manifest_mismatch')
+            data = json.loads(raw)
+            if (data.get('owner_sha256')!=hashlib.sha256(self.reader.self_username.encode()).hexdigest()
+                    or data.get('reference_sha256')!=hashlib.sha256(self.config.resolve(settings.reference_audio).read_bytes()).hexdigest()):
+                raise ValueError('voice_runtime_identity_mismatch')
+            helper = (manifest.parent / data['client_module']).resolve(strict=True)
+            helper_bytes=helper.read_bytes()
+            if helper.parent != manifest.parent or len(helper_bytes)>512*1024 or hashlib.sha256(helper_bytes).hexdigest()!=data['client_sha256']:
+                raise ValueError('voice_runtime_client_mismatch')
+            runtime = types.ModuleType('reviewed_local_voice_runtime')
+            runtime.__file__=str(helper)
+            sys.modules[runtime.__name__]=runtime
+            exec(compile(helper_bytes,str(helper),'exec'),runtime.__dict__)
+            if runtime.ready(self.config,self.reader,runtime_manifest=manifest) is not True:
+                return AutoVoiceReplyResult('not_attempted','voice_runtime_not_ready')
+        except Exception:
+            return AutoVoiceReplyResult('not_attempted','voice_transport_unavailable')
+        reply_key = hashlib.sha256((self.reader.self_username+'|'+contact+'|'+event_id).encode()).hexdigest()
+        def dispatch(peer, artifact, request_id):
+            self.reader.personal.register_generated_voice(peer,artifact.silk_sha256,request_id)
+            result = runtime.send_prepared(self.config,self.reader,peer,artifact,
+                reply_key=reply_key,request_id=request_id,text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+                runtime_manifest=manifest,before_dispatch=lambda:self._voice_context_current(contact,text,event_id))
+            verified = (isinstance(result,dict) and result.get('status')=='verified_sent'
+                        and result.get('verified_sent') is True)
+            if not verified:
+                return False
+            source=result.get('message_source')
+            local_id=result.get('local_id')
+            server_id=result.get('server_id')
+            if (source not in self.reader.keys or type(local_id) is not int or local_id<=0
+                    or type(server_id) is not int or server_id<=0):
+                return False
+            self.reader.personal.receipt(peer,text,source,local_id)
+            with closing(self.reader.personal.connect()) as personal:
+                identities=[row[0].removeprefix('local:') for row in personal.execute(
+                    'SELECT id FROM observations WHERE source=? AND local_id=?',(source,local_id))]
+            if identities:
+                with sqlite3.connect(self.config.resolve(self.config.paths.chat_memory)) as memory:
+                    memory.executemany("UPDATE history SET speaker='本人（AI生成语音，仅作已发送上下文）' WHERE id=?",
+                                       [(identity,) for identity in identities])
+            return True
+        return execute_auto_voice(plan,
+            contact=contact,event_id=event_id,reference_audio=self.config.resolve(settings.reference_audio),
+            assets_dir=self.config.resolve(settings.assets_dir),private_output_dir=self.config.resolve(settings.output_dir),
+            owned_voice_confirmed=settings.owned_voice_confirmed,transport_supported=True,
+            send_prepared=dispatch,recheck=lambda:self._voice_context_current(contact,text,event_id),
+            timeout_seconds=settings.synthesis_timeout_seconds)
 
     def send_text(self, contact, text):
         if self.config.wechat.sender_all_existing_chats:
