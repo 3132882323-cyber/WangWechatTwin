@@ -8,11 +8,15 @@ import urllib.request
 from pathlib import Path
 import pytest
 import yaml
+from scripts import macos
 
 
 @pytest.mark.skipif(sys.platform != 'darwin',reason='requires actual macOS runner')
 def test_macos_backend_starts_and_stops_without_windows_dependencies(tmp_path):
     root=Path(__file__).resolve().parents[1]
+    # This runs on the real CI interpreter; mocked architecture tests are not
+    # evidence that the release's Python is actually native on Apple Silicon.
+    macos.check_python(sys.executable, root)
     raw=yaml.safe_load((root/'config.macos.example.yaml').read_text(encoding='utf-8'))
     # No sender, input, model request, or public listener is introduced.
     raw['web']['port']=18791

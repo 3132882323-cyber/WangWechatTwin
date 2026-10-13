@@ -1,12 +1,12 @@
-# Mac 草稿版
+# Apple 芯片 Mac 草稿版
 
-Mac 版可运行本地审核台、导入消息 JSON，通过网页桥接生成草稿，再保存你的修改。默认 `adapter: mock`、`mode: shadow`，没有接入本机微信，不读取微信数据库，也不向微信发送消息。`mock` 是消息适配器名称，不是离线模型；实际起草仍需要你登录网页模型并配对扩展。没有连接模型时会留下明确的失败或审核占位，不能把它当作生成成功。
+Mac 版可运行本地审核台、导入消息 JSON，通过模型通道生成草稿，再保存你的修改。默认 `adapter: mock`、`mode: shadow`，没有接入本机微信，不读取微信数据库，也不向微信发送消息。`mock` 是消息适配器名称，不是离线模型；实际起草仍需要本机模型网关及 GPT 网页桥接。没有连接模型时会留下明确的失败或审核占位，不能把它当作生成成功。
 
-本版保留 WorkBuddy/Codex 的队列维护、故障恢复、联系人隔离与未知结果不盲重试规则。开发与本机回归在 Windows 完成；[GitHub Apple 芯片 Mac CI](https://github.com/3132882323-cyber/WangWechatTwin/actions/runs/38034287649) 已在 arm64、Python 3.10 和 3.12 验证核心依赖安装、后台实际启动与停止、526 项测试及启动脚本语法，浏览器扩展单元测试也通过。**尚未在你的 Mac 上验收网页登录生成、登录自启或微信实际收发**。CI 没有登录微信或模型账号，Windows 微信的成功记录不适用于 Mac。
+本版保留 WorkBuddy/Codex 的队列维护、故障恢复、联系人隔离与未知结果不盲重试规则。开发与本机回归在 Windows 完成；[此前的 Apple 芯片 Mac CI](https://github.com/3132882323-cyber/WangWechatTwin/actions/runs/38143161160) 在提交 `30b5117` 的 arm64、Python 3.10 和 3.12 环境各通过 632 项测试。这是该提交的核心回归证据，不能替代后续版本的 CI。当前工作流要求原生 arm64 Python，并检查实际后台启动与停止及启动脚本语法。**尚未在你的 Mac 上验收模型生成、登录自启或微信实际收发**。CI 没有登录微信或模型账号，Windows 微信的成功记录不适用于 Mac。
 
 ## 首次启动
 
-需要 Python **3.10–3.12**，推荐 [Python 3.12 的 Mac 安装包](https://www.python.org/downloads/macos/)。启动器会查找受支持的 Python，拒绝系统 Python 3.9 或 Python 3.13 及以上，且不覆盖已有虚拟环境。网页桥接需要 Chrome 116 及以上和各模型自己的登录账号。
+需要原生 **arm64 Python 3.10–3.12**，推荐 [Python 3.12 的 macOS universal2 安装包](https://www.python.org/downloads/macos/)。启动器会检查 Python 自身的运行架构，查找 PATH、Apple 芯片 Homebrew 和 Python.org 的常见安装位置。Intel/Rosetta 环境、系统 Python 3.9、Python 3.13 及以上均会被拒绝，已有虚拟环境保留。网页桥接需要 Chrome 116 及以上和模型自己的登录账号。
 
 将仓库保存在会长期保留、可由当前用户访问的目录，例如 `~/Applications/WangWechatTwin`。打开终端，进入该目录，运行：
 
@@ -20,11 +20,26 @@ bash START_HERE.command
 
 默认数据在 `.runtime/macos/`；这与 Windows 示例数据路径分开。`config.macos.local.yaml`、`.env`、`.runtime/` 和 `.venv/` 已在忽略规则中。不要将配对码、私聊导出或个人配置发布到仓库。
 
-## 连接网页模型
+若提示已有 `.venv` 是 Intel/Rosetta 环境，先停止该目录的后台；已安装自启时先用原环境卸载。保留原 `.venv` 的备份，将其移到另一个尚不存在的本地目录，再在未启用 Rosetta 的终端中运行 `bash START_HERE.command setup` 创建原生环境。不要删除 `.runtime`、个人配置或网关状态库。启动器不自动执行环境替换。
+
+## 连接模型通道
+
+新建的 Mac 配置使用 GLM 日常文字、豆包媒体、GPT 专业与明显激动情绪；DeepSeek 已停用。现有 `config.macos.local.yaml` 不会被升级覆盖，需要按新样例核对分工。Mac 消息导入目前仅支持文字，语音转写和图片导入仍需后续适配。
+
+GLM 和豆包连接的是**同一台 Mac** 上已独立部署的本机 HTTP 网关。公开包提供客户端配置和草稿处理，不包含这两个服务、账号登录凭据或启动脚本，也不把 Windows 上的进程当作 Mac 服务。
+
+| 通道 | 固定地址 | 私有网关 key 文件 |
+| --- | --- | --- |
+| GLM | `http://127.0.0.1:19659/v1` | `.runtime/macos/local_proxy/glm-api-key.txt` |
+| 豆包 | `http://127.0.0.1:19656/v1` | `.runtime/macos/local_proxy/doubao-api-key.txt` |
+
+key 文件只保存本机网关的 API key，上游登录信息留在网关自己的私有目录。两路共用 `.runtime/macos/local_proxy/sessions.sqlite3`，保留联系人会话归属、旧请求和未知结果记录；不要删库重试。未提供网关或 key 时，审核台仍可启动，但对应草稿不能完成生成。启动器不会自动拉起网关或尝试恢复 DeepSeek。
+
+GPT 网页桥接的配对步骤：
 
 1. 在 Chrome 扩展管理页打开开发者模式，选择“加载已解压的扩展程序”，选择本仓库的 `browser_extension/` 目录。
 2. 在扩展设置页填入本机 `.runtime/macos/browser_bridge/pairing_token.txt` 中的配对码。首次启动审核台后才会生成此文件；不要发送或上传配对码。
-3. 分别确认 DeepSeek、豆包、ChatGPT 网页已登录，再从审核台执行模型网页恢复。日常文字交给 DeepSeek（关闭深度思考和搜索），图片及表情交给豆包，专业问题与明显激动情绪交给 GPT。各模型自己的权限和额度仍然适用。
+3. 确认 ChatGPT 网页已登录，再从审核台执行模型网页恢复。GPT 的模型与思考档位仍需在网页核对；配置名称不证明网页实际采用了指定档位。各模型自己的权限和额度仍然适用。
 
 Mac 的网页桥接使用扩展创建的独立最小化窗口；这不等同于 Windows 的 Win32 隐藏窗口。只管理已登记的专用窗口，不隐藏其他窗口。专用窗口混入个人标签时会停住保护，需要先把个人标签移出去，再从审核台恢复。
 
@@ -56,7 +71,7 @@ bash START_HERE.command draft --input examples/macos_messages.json
 bash START_HERE.command doctor
 ```
 
-诊断会检查适配器和网页桥接心跳，并明确标记模型推理尚未验收；它不会主动生成回复。未配对或未登录时，诊断失败是预期行为，不能据此声称 Mac 微信已断线。
+诊断会检查配置、适配器和模型通道状态，不主动生成回复。`/health` 将本机端口可达与近期完整回复分别显示；`reachable_unverified` 表示端口可达、近期推理未验证。没有网关、未配对或未登录时，相应检查失败是预期行为，不能据此声称 Mac 微信已断线。
 
 ## 显式启用登录自启
 
@@ -90,6 +105,8 @@ bash START_HERE.command setup
 ## 现成方案检索与边界
 
 登录自启参考了 [watchnet 的 LaunchAgent 实现](https://github.com/zachsnow/watchnet/blob/bc84bd0491403665aa18edd7b5cf85cfa471639c/watchnet)，其 [许可证为 MIT](https://github.com/zachsnow/watchnet/blob/bc84bd0491403665aa18edd7b5cf85cfa471639c/LICENSE)。这里只采用 `plistlib`、`launchctl bootstrap/bootout` 和用户级 LaunchAgents 的标准做法，没有复制源码或增加上游依赖；项目依赖仍按 Python 3.10–3.12 验证。
+
+架构检查参考 [actions/setup-python 的架构讨论](https://github.com/actions/setup-python/issues/971) 及其 [v6.1.0 文档](https://github.com/actions/setup-python/blob/v6.1.0/docs/advanced-usage.md)，[许可证为 MIT](https://github.com/actions/setup-python/blob/v6.1.0/LICENSE)。本项目用 Python 标准库核对实际解释器，不复制上游实现或新增依赖；CI 显式请求 arm64，避免只看 runner 名称就误判架构。
 
 已检索 [wechat-use](https://github.com/leeguooooo/wechat-use)，其说明面向 Apple Silicon、微信 4.1.9，并使用非商业研究类许可，因此没有并入本 Apache-2.0 仓库。[Cybing521/wechat-mcp](https://github.com/Cybing521/wechat-mcp) 与 MIT 的 [WeChat-MCP](https://github.com/BiboyQG/WeChat-MCP) 使用 Accessibility 或截图等方式，与本项目独立本机端口收发目标不同。
 

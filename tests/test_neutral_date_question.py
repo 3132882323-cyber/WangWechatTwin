@@ -81,6 +81,17 @@ def test_action_requests_professional_work_money_and_quantities_stay_review(tmp_
     assert not adapter.sent
 
 
+@pytest.mark.parametrize('content,reply', [
+    ('手机突然坏了', '咋回事，突然开不了机了？'),
+    ('这东西真便宜', '你在哪买的？'),
+    ('周末有什么安排', '你想出去玩还是在家歇着？'),
+])
+def test_casual_topics_can_send_substantive_reply_without_new_owner_facts(tmp_path, content, reply):
+    result, adapter, _ = run_message(tmp_path, content=content, reply=reply)
+    assert result.status == 'sent'
+    assert adapter.sent == [('peer', reply)]
+
+
 @pytest.mark.parametrize("origin", [
     {"asr_uncertain": True, "original_type": "voice"},
     {"resume_incomplete": True}, {"owner_corrected_input": True},

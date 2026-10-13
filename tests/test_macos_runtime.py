@@ -49,6 +49,15 @@ def test_macos_sample_config_keeps_native_sending_and_proactive_disabled(tmp_pat
     assert not config.wechat.sender_all_existing_chats
     assert config.wechat.sender_allowed_contacts == []
     assert config.openai.provider == "hybrid_web"
+    assert config.openai.everyday_lane == "glm"
+    assert config.openai.disabled_lanes == ["deepseek"]
+    assert config.openai.required_lanes() == ("chatgpt", "glm", "doubao")
+    assert set(config.openai.local_proxies) == {"glm", "doubao"}
+    for lane, port in (("glm", 19659), ("doubao", 19656)):
+        proxy = config.openai.local_proxies[lane]
+        assert proxy.enabled and proxy.base_url == f"http://127.0.0.1:{port}/v1"
+        assert config.resolve(proxy.api_key_file) == tmp_path / ".runtime" / "macos" / "local_proxy" / f"{lane}-api-key.txt"
+        assert config.resolve(proxy.session_db) == tmp_path / ".runtime" / "macos" / "local_proxy" / "sessions.sqlite3"
     assert config.web.host == "127.0.0.1" and config.web.port == 18769
     assert config.resolve(config.paths.database) == tmp_path / ".runtime" / "macos" / "drafts.sqlite3"
 
@@ -97,9 +106,62 @@ def test_venv_python_path_is_not_resolved_to_the_base_interpreter(tmp_path):
 
 @pytest.mark.parametrize("version", [[3, 9], [3, 13], [3, 14]])
 def test_rejects_unsupported_existing_python_without_overwriting_it(monkeypatch, tmp_path, version):
-    monkeypatch.setattr(macos.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, json.dumps(version), ""))
+    info = {"version": version, "machine": "arm64", "platform": "darwin"}
+    monkeypatch.setattr(macos.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, json.dumps(info), ""))
     with pytest.raises(macos.MacSetupError, match="现有环境不会被覆盖"):
         macos.check_python("existing-python", tmp_path)
+
+
+@pytest.mark.parametrize("version", [[3, 10], [3, 11], [3, 12]])
+def test_accepts_supported_native_arm64_python(monkeypatch, tmp_path, version):
+    info = {"version": version, "machine": "arm64", "platform": "darwin"}
+    monkeypatch.setattr(macos.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, json.dumps(info), ""))
+    macos.check_python("native-python", tmp_path)
+
+
+@pytest.mark.parametrize("machine,target_platform", [
+    ("x86_64", "darwin"), ("AMD64", "darwin"), ("arm64", "linux"),
+    ("ARM64", "win32"), ("", "darwin"),
+])
+def test_rejects_rosetta_intel_and_foreign_interpreters_before_creating_venv(monkeypatch, tmp_path, machine, target_platform):
+    calls = []
+    info = {"version": [3, 12], "machine": machine, "platform": target_platform}
+
+    def run(arguments, **kwargs):
+        calls.append(arguments)
+        assert kwargs["timeout"] == 10
+        return subprocess.CompletedProcess([], 0, json.dumps(info), "")
+
+    monkeypatch.setattr(macos.subprocess, "run", run)
+    with pytest.raises(macos.MacSetupError, match="原生 arm64"):
+        macos.ensure_venv(tmp_path, "foreign-python")
+    assert len(calls) == 1 and calls[0][1] == "-c"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("info", [None, [], {}, {"version": [3, True]},
+                                  {"version": [3, 12, 1]}, {"version": "3.12"}])
+def test_malformed_interpreter_probe_fails_closed(monkeypatch, tmp_path, info):
+    monkeypatch.setattr(macos.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, json.dumps(info), ""))
+    with pytest.raises(macos.MacSetupError, match="无法核对"):
+        macos.check_python("bad-probe", tmp_path)
+
+
+def test_setup_preserves_existing_intel_venv_and_does_not_create_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(macos.sys, "platform", "darwin")
+    root, config = prepared_project(tmp_path)
+    # A fresh local configuration must not be copied on an incompatible venv.
+    destination = root / "fresh.local.yaml"
+    executable = root / ".venv" / "bin" / "python"
+    before = executable.read_bytes(), config.read_bytes()
+    info = {"version": [3, 12], "machine": "x86_64", "platform": "darwin"}
+    calls = []
+    monkeypatch.setattr(macos.subprocess, "run", lambda args, **kwargs: calls.append(args) or subprocess.CompletedProcess([], 0, json.dumps(info), ""))
+    with pytest.raises(macos.MacSetupError, match="原生 arm64"):
+        macos.setup(root, destination)
+    assert not destination.exists() and not (root / ".runtime").exists()
+    assert (executable.read_bytes(), config.read_bytes()) == before
+    assert len(calls) == 1 and calls[0][1] == "-c"
 
 
 @pytest.mark.parametrize("change", [

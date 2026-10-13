@@ -63,15 +63,29 @@ def project_python(root: Path) -> Path:
 
 def check_python(executable: str | Path, root: Path) -> None:
     result = subprocess.run(
-        [str(executable), "-c", "import json, sys; print(json.dumps(list(sys.version_info[:2])))"],
-        cwd=root, capture_output=True, text=True, check=True,
+        [str(executable), "-c", "import json, platform, sys; "
+         "print(json.dumps({'version':list(sys.version_info[:2]),"
+         "'platform':sys.platform,'machine':platform.machine()}))"],
+        cwd=root, capture_output=True, text=True, check=True, timeout=10,
     )
     try:
-        version = tuple(json.loads(result.stdout))
-    except (TypeError, ValueError):
-        raise MacSetupError("无法核对 Python 版本。") from None
+        info = json.loads(result.stdout)
+        version = info["version"]
+        if (not isinstance(version, list) or len(version) != 2
+                or any(type(part) is not int for part in version)):
+            raise ValueError
+        version = tuple(version)
+        machine = info["machine"]
+        target_platform = info["platform"]
+    except (KeyError, TypeError, ValueError):
+        raise MacSetupError("无法核对 Python 版本及运行架构。") from None
     if not (3, 10) <= version < (3, 13):
         raise MacSetupError(f"需要 {PYTHON_RANGE}；现有环境不会被覆盖。")
+    if target_platform != "darwin" or machine != "arm64":
+        raise MacSetupError(
+            "Apple 芯片版需要原生 arm64 macOS Python，不能使用 Intel/Rosetta 或其他系统的解释器；"
+            "现有环境不会被覆盖。请在未使用 Rosetta 的终端中运行，环境更换方法见 docs/MACOS.md。"
+        )
 
 
 def ensure_venv(root: Path, executable: str | Path) -> Path:
@@ -128,9 +142,11 @@ def runtime_settings(python: Path, root: Path, config: Path) -> dict:
 
 def setup(root: Path, config: Path, *, reinstall: bool = False) -> Path:
     require_macos()
+    # Check an existing venv before writing the initial configuration. A copied
+    # Intel/Windows environment is user-owned, not a request to replace it.
+    python = ensure_venv(root, sys.executable)
     created = initialize_config(root, config)
     print(f"{'已创建' if created else '保留已有'}配置：{config}")
-    python = ensure_venv(root, sys.executable)
     if reinstall or not dependencies_ready(python, root):
         # Core dependencies only: do not request the Windows extra or wxauto.
         subprocess.run([str(python), "-m", "pip", "install", "-e", "."], cwd=root, check=True)

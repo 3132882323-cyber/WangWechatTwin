@@ -519,11 +519,13 @@ class LocalProxyReplyLLM:
                 tool_metadata_seen = response.get("tool_metadata_seen")
                 if type(tool_metadata_seen) is not bool:
                     raise _fail("local_proxy_invalid_tool_metadata")
-                # Even ignore must contain ABC in this text-only GLM contract.
-                candidates = decision.candidates or []
-                normalized = {re.sub(r"[\s，,。.!！?？…~～]+", "", item.reply).casefold() for item in candidates}
-                if len(candidates) != 3 or {item.label for item in candidates} != {"A", "B", "C"} or len(normalized) != 3:
-                    raise _fail("local_proxy_invalid_decision")
+                # An ignored turn has no outward reply and may omit candidates,
+                # as the selection prompt instructs. Replies still need ABC.
+                if decision.action != "ignore":
+                    candidates = decision.candidates or []
+                    normalized = {re.sub(r"[\s，,。.!！?？…~～]+", "", item.reply).casefold() for item in candidates}
+                    if len(candidates) != 3 or {item.label for item in candidates} != {"A", "B", "C"} or len(normalized) != 3:
+                        raise _fail("local_proxy_invalid_decision")
                 if tool_metadata_seen:
                     decision = decision.model_copy(update={"action": "review", "confidence": 0.0,
                         "holding_reply": None, "reason": _TOOL_REVIEW_REASON})

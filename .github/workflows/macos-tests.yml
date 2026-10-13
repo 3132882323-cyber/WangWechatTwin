@@ -17,11 +17,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+          architecture: arm64
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Runner architecture
-        run: uname -m
+        run: python -c 'import platform, sys; assert sys.platform == "darwin" and platform.machine() == "arm64", "Apple Silicon native Python required"; print(platform.machine())'
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest tests -q
       - name: Chrome bridge unit tests

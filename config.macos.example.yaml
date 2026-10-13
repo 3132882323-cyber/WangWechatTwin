@@ -6,8 +6,24 @@ adapter: mock
 mode: shadow
 openai:
   provider: hybrid_web
+  everyday_lane: glm
+  disabled_lanes: [deepseek]
   deepseek_drafts: false
-  deepseek_fast: true
+  # 网关必须在这台 Mac 上独立提供；启动器不安装或启动网关。
+  # 这里只有私有 key 文件的路径，不包含上游账号凭据或 API key。
+  local_proxies:
+    glm:
+      enabled: true
+      base_url: http://127.0.0.1:19659/v1
+      api_key_file: .runtime/macos/local_proxy/glm-api-key.txt
+      session_db: .runtime/macos/local_proxy/sessions.sqlite3
+      timeout_seconds: 45
+    doubao:
+      enabled: true
+      base_url: http://127.0.0.1:19656/v1
+      api_key_file: .runtime/macos/local_proxy/doubao-api-key.txt
+      session_db: .runtime/macos/local_proxy/sessions.sqlite3
+      timeout_seconds: 60
   web_reply_timeout_seconds: 180
   primary_model: gpt-6
   high_risk_model: gpt-6

@@ -339,6 +339,37 @@ def test_real_pipeline_new_friend_can_auto_reply_through_mock_glm_without_scope_
     assert [lane for lane, _ in state["calls"]] == ["glm"]
 
 
+def test_glm_ignore_without_candidates_is_done_and_never_sends(glm, monkeypatch):
+    config, state = glm
+    ignored = {**decision(), "action": "ignore", "reply": "", "reason": "对方已经收尾",
+               "candidates": None, "selected_candidate": None}
+    state["raw_decision"] = json.dumps(ignored, ensure_ascii=False)
+    monkeypatch.setattr("app.web_llm.WebReplyLLM", lambda cfg: SimpleNamespace(decide=lambda *args: pytest.fail("wrong lane")))
+    db = Database(config.resolve(config.paths.database))
+    pipeline = ReplyPipeline(config, db, llm=ReplyLLM(config))
+    adapter = MockAdapter()
+
+    result = pipeline.process(IncomingMessage(external_id="glm-ignore-1", contact="synthetic-new-friend",
+                                               sender="synthetic-new-friend", content="晚安"), adapter)
+
+    assert result.status == "ignored" and result.decision.action == "ignore" and not adapter.sent
+    assert [lane for lane, _ in state["calls"]] == ["glm"]
+    with sqlite3.connect(config.resolve(config.openai.local_proxies["glm"].session_db)) as ledger:
+        assert ledger.execute("SELECT status FROM local_proxy_turns").fetchone()[0] == "done"
+
+
+def test_glm_non_ignore_still_requires_three_candidates(glm):
+    config, state = glm
+    incomplete = {**decision(), "candidates": None, "selected_candidate": None}
+    state["raw_decision"] = json.dumps(incomplete, ensure_ascii=False)
+
+    with pytest.raises(LLMError, match="local_proxy_invalid_decision"):
+        call(config)
+
+    with sqlite3.connect(config.resolve(config.openai.local_proxies["glm"].session_db)) as ledger:
+        assert ledger.execute("SELECT status FROM local_proxy_turns").fetchone()[0] == "unknown"
+
+
 def test_health_includes_three_actual_model_lanes_and_glm_requires_recent_done(glm, tmp_path, monkeypatch):
     import socket
     from app.webui import create_app
