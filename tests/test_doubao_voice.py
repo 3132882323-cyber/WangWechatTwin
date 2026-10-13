@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -15,6 +16,45 @@ from app import doubao_voice as voice
 
 
 SECRET = "SYNTHETIC_SESSION_SECRET_NEVER_PRINT_572"
+
+
+@pytest.mark.parametrize(("name", "codec"), [("aac", "aac"), ("mp3", "mp3")])
+def test_audio_probe_subprocess_is_windowless_without_changing_capture(tmp_path, monkeypatch, name, codec):
+    observed = []
+    monkeypatch.setattr(voice.shutil, "which", lambda tool: "ffprobe.exe" if tool == "ffprobe" else None)
+    def fake_run(command, **kwargs):
+        observed.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "format": {"format_name": name, "duration": "1.2"},
+            "streams": [{"codec_type": "audio", "codec_name": codec}]}))
+    monkeypatch.setattr(voice, "subprocess", SimpleNamespace(
+        run=fake_run, CREATE_NO_WINDOW=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        TimeoutExpired=subprocess.TimeoutExpired))
+    assert voice._probe_duration(tmp_path / "synthetic.aac", expected_format=name, expected_codec=codec) == 1.2
+    command, kwargs = observed[0]
+    assert command[0] == "ffprobe.exe"
+    assert kwargs["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert kwargs["capture_output"] is True and kwargs["text"] is True
+    assert kwargs["timeout"] == 8 and kwargs["check"] is False
+
+
+def test_aac_conversion_subprocess_is_windowless_without_changing_capture(tmp_path, monkeypatch):
+    observed = []
+    monkeypatch.setattr(voice.shutil, "which", lambda tool: "ffmpeg.exe" if tool == "ffmpeg" else None)
+    destination = tmp_path / "preview.mp3"
+    def fake_run(command, **kwargs):
+        observed.append((command, kwargs))
+        destination.write_bytes(b"synthetic-mp3")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(voice, "subprocess", SimpleNamespace(
+        run=fake_run, CREATE_NO_WINDOW=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        TimeoutExpired=subprocess.TimeoutExpired))
+    voice.convert_aac_to_mp3(tmp_path / "synthetic.aac", destination)
+    command, kwargs = observed[0]
+    assert command[0] == "ffmpeg.exe" and "-nostdin" in command
+    assert kwargs["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert kwargs["capture_output"] is True
+    assert kwargs["timeout"] == 15 and kwargs["check"] is False
 
 
 def session_file(tmp_path, *, missing=None, source="qr", count=1):

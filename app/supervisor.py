@@ -45,7 +45,8 @@ def supervise(command, root, *, launch=subprocess.Popen, wait=time.sleep, max_ru
         stamp = time.strftime('%Y%m%d-%H%M%S')
         with (root / ('backend-' + stamp + '.log')).open('ab') as log:
             child = launch(command, stdout=log, stderr=subprocess.STDOUT,
-                           env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
+                           env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             (root / 'supervisor.json').write_text(json.dumps({'pid': os.getpid(), 'child_pid': child.pid, 'started': time.time()}), encoding='utf-8')
             if healthy is None and not checks:
                 code = child.wait()

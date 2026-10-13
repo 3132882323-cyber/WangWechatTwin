@@ -335,7 +335,7 @@ def _probe_duration(path: Path, *, expected_format: str, expected_codec: str) ->
             [ffprobe, "-v", "error", "-show_entries",
              "format=format_name,duration:stream=codec_name,codec_type",
              "-of", "json", str(path)], capture_output=True, text=True, timeout=8,
-            check=False,
+            check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode != 0 or len(result.stdout) > 8192:
             raise VoiceFailure("invalid_" + expected_format)
@@ -374,6 +374,7 @@ def convert_aac_to_mp3(source: Path, destination: Path) -> None:
              "-i", str(source), "-map", "0:a:0", "-vn", "-c:a", "libmp3lame",
              "-q:a", "4", "-f", "mp3", str(destination)],
             capture_output=True, timeout=15, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode != 0 or not destination.is_file():
             raise VoiceFailure("aac_to_mp3_failed")

@@ -24,12 +24,15 @@ def test_optional_watchdog_checks_before_launch_and_on_timeout(tmp_path):
             return 0
 
     def launch(*args, **kwargs):
-        launches.append(args)
+        launches.append((args, kwargs))
         return Child()
 
     assert supervise(['fake-backend'], tmp_path, launch=launch, max_runs=1,
                      watchdog_check=lambda: checks.append('checked')) == 1
     assert len(launches) == 1
+    assert launches[0][1]['creationflags'] == getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    assert launches[0][1]['stderr'] is subprocess.STDOUT
+    assert launches[0][1]['env']['PYTHONIOENCODING'] == 'utf-8'
     assert checks == ['checked', 'checked']
 
 

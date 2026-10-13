@@ -201,14 +201,19 @@ def _environment(assets: Assets, gpu_index: int | None = None) -> dict:
     return environment
 
 
+def _no_window_kwargs() -> dict[str, int]:
+    """Background CLI tools must not flash a Windows console window."""
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
 def verify_cli(assets: Assets) -> None:
     try:
         version = subprocess.run([str(assets.executable), "--version"], cwd=assets.bin_dir,
                                  env=_environment(assets), capture_output=True, text=True,
-                                 timeout=8, check=False)
+                                 timeout=8, check=False, **_no_window_kwargs())
         help_result = subprocess.run([str(assets.executable), "--help"], cwd=assets.bin_dir,
                                      env=_environment(assets), capture_output=True, text=True,
-                                     timeout=8, check=False)
+                                     timeout=8, check=False, **_no_window_kwargs())
         version_text = version.stdout + version.stderr
         help_text = help_result.stdout + help_result.stderr
         if (version.returncode != 0 or not re.search(r"\bbuild\s*:?\s*10679\b", version_text)
@@ -245,7 +250,7 @@ def resource_snapshot() -> Resources:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5, check=False)
+            capture_output=True, text=True, timeout=5, check=False, **_no_window_kwargs())
         values = []
         for line in result.stdout.splitlines():
             if line.strip():
@@ -322,7 +327,7 @@ def run_tts(assets: Assets, reference: Path, text: str, wav: Path, log_path: Pat
             child = popen(build_command(assets, reference, text, wav), cwd=assets.bin_dir,
                           env=_environment(assets, fresh_resources.gpu_index),
                           stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                          **_no_window_kwargs())
             started = monotonic()
             checkpoint("running", child_pid=child.pid)
             while child.poll() is None:
@@ -393,7 +398,8 @@ def probe_audio(path: Path, *, expected: str) -> float:
         result = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries",
              "format=format_name,duration:stream=codec_name,codec_type,channels,sample_rate",
-             "-of", "json", str(path)], capture_output=True, text=True, timeout=10, check=False)
+            "-of", "json", str(path)], capture_output=True, text=True, timeout=10, check=False,
+            **_no_window_kwargs())
         data = json.loads(result.stdout)
         info = data.get("format", {})
         duration = float(info.get("duration"))
@@ -418,7 +424,7 @@ def probe_audio(path: Path, *, expected: str) -> float:
             [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1",
              "-i", str(path), "-t", str(MAX_SECONDS), "-map", "0:a:0", "-vn",
              "-ac", "1", "-ar", "24000", "-f", "s16le", "-"],
-            capture_output=True, timeout=15, check=False)
+            capture_output=True, timeout=15, check=False, **_no_window_kwargs())
         pcm = decoded.stdout
         if (decoded.returncode != 0 or not isinstance(pcm, bytes)
                 or not 9600 <= len(pcm) <= MAX_SECONDS * 24000 * 2
@@ -440,7 +446,7 @@ def convert_wav_to_mp3(wav: Path, destination: Path) -> None:
             [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-n",
              "-i", str(wav), "-map", "0:a:0", "-vn", "-c:a", "libmp3lame",
              "-q:a", "4", "-f", "mp3", str(destination)],
-            capture_output=True, timeout=25, check=False)
+            capture_output=True, timeout=25, check=False, **_no_window_kwargs())
     except (OSError, subprocess.TimeoutExpired):
         raise PreviewFailure("mp3_conversion_failed") from None
     if result.returncode != 0 or not destination.is_file():

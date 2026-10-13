@@ -446,6 +446,77 @@ def test_version_and_required_flags_are_checked_with_mocked_native_process(tmp_p
     voice.verify_cli(assets_for(tmp_path))
 
 
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_every_background_tool_preserves_io_and_uses_windows_only_no_window(tmp_path, monkeypatch, platform):
+    # Replace this module's os view rather than global os.name, so pathlib and
+    # pytest remain on the host platform. The POSIX branch has no Windows-only
+    # constant available and must never try to read or pass one.
+    platform_os = SimpleNamespace(name=platform, environ=voice.os.environ, pathsep=voice.os.pathsep)
+    monkeypatch.setattr(voice, "os", platform_os)
+    documented_flag = 0x08000000  # Windows CREATE_NO_WINDOW
+    if platform == "nt":
+        monkeypatch.setattr(voice.subprocess, "CREATE_NO_WINDOW", documented_flag, raising=False)
+    else:
+        monkeypatch.delattr(voice.subprocess, "CREATE_NO_WINDOW", raising=False)
+    monkeypatch.setattr(voice, "free_commit_mib", lambda: 8192)
+    monkeypatch.setattr(voice.shutil, "which", lambda tool: "synthetic-" + tool)
+    source = tmp_path / "synthetic.wav"
+    source.write_bytes(b"synthetic-container")
+    destination = tmp_path / "synthetic.mp3.part"
+    calls = []
+    def run(command, **options):
+        calls.append((command, options))
+        if command[-1] == "--version":
+            return SimpleNamespace(returncode=0, stdout="build: 10679\n", stderr="")
+        if command[-1] == "--help":
+            return SimpleNamespace(returncode=0, stdout="--tts-speaker-file --tts-lang --mmproj --ctx-size --threads --gpu-layers", stderr="")
+        if command[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="0, 6000\n", stderr="")
+        if command[0] == "synthetic-ffprobe":
+            data = {"format": {"format_name": "wav", "duration": "1.0"},
+                    "streams": [{"codec_name": "pcm_s16le", "codec_type": "audio",
+                                 "channels": 1, "sample_rate": "24000"}]}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
+        if command[0] == "synthetic-ffmpeg" and command[-1] == "-":
+            return SimpleNamespace(returncode=0, stdout=b"\x01\x00" * 24000, stderr=b"")
+        if command[0] == "synthetic-ffmpeg" and command[-1] == str(destination):
+            destination.write_bytes(b"synthetic-mp3")
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        pytest.fail("Unexpected command in background-tool contract")
+    monkeypatch.setattr(voice.subprocess, "run", run)
+    assets = assets_for(tmp_path)
+    voice.verify_cli(assets)
+    assert voice.resource_snapshot() == voice.Resources(8192, 6000, 0)
+    assert voice.probe_audio(source, expected="wav") == 1.0
+    voice.convert_wav_to_mp3(source, destination)
+    assert len(calls) == 6
+    assert [options["timeout"] for _, options in calls] == [8, 8, 5, 10, 15, 25]
+    for _, options in calls:
+        assert options["capture_output"] is True and options["check"] is False
+    for _, options in calls[:4]:
+        assert options["text"] is True
+    for _, options in calls[4:]:
+        assert "text" not in options
+    for _, options in calls[:2]:
+        assert options["cwd"] == assets.bin_dir
+        assert options["env"]["HF_HUB_OFFLINE"] == "1"
+    assert "-n" in calls[-1][0]
+    result, tts_calls, _ = run_fake(tmp_path, child=FakeChild(0))
+    assert result == 0 and len(tts_calls) == 1
+    _, tts_options = tts_calls[0]
+    assert tts_options["stdin"] == subprocess.DEVNULL
+    assert tts_options["stdout"] is tts_options["stderr"]
+    assert tts_options["stdout"].name == str(tmp_path / "private.log")
+    assert tts_options["cwd"] == assets.bin_dir
+    assert tts_options["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    for command, options in calls + tts_calls:
+        assert isinstance(command, list) and options.get("shell", False) is False
+        if platform == "nt":
+            assert options["creationflags"] == documented_flag
+        else:
+            assert "creationflags" not in options
+
+
 def test_cli_native_exit_is_reported_without_raw_native_body(tmp_path, monkeypatch, capsys):
     def failure(**kwargs):
         raise voice.PreviewFailure("tts_process_failed", phase="tts_exit", native_exit_code=1)
@@ -469,7 +540,8 @@ def test_local_sine_wav_mp3_and_silence_validation_without_models(tmp_path):
         result = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                                  "-f", "lavfi", "-i", source, "-t", "0.5", "-ar", "24000",
                                  "-ac", "1", "-c:a", "pcm_s16le", str(destination)],
-                                capture_output=True, timeout=10, check=False)
+                                capture_output=True, timeout=10, check=False,
+                                **voice._no_window_kwargs())
         assert result.returncode == 0
     assert .2 <= voice.probe_audio(wav, expected="reference") <= 1
     voice.convert_wav_to_mp3(wav, mp3)
